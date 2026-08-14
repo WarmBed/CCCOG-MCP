@@ -136,7 +136,10 @@ public sealed class OwnerDaemon : IDisposable
             var labeled = BuildTurnText(message);
             try
             {
-                var response = transport.RunTurnAsync(labeled).GetAwaiter().GetResult();
+                var response = transport.RunTurnAsync(
+                    labeled,
+                    model: message.Model,
+                    reasoningEffort: message.ReasoningEffort).GetAwaiter().GetResult();
                 consecutiveTransportFailures = 0;
                 RefreshSessionIdentity();
                 spool.WriteReceipt(new OwnerReceipt(

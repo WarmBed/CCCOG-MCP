@@ -517,7 +517,9 @@ public sealed class DispatchRunner
             FromSessionId: null,
             File.ReadAllText(
                 File.Exists(rawPromptPath) ? rawPromptPath : store.PromptPath(job.JobId)),
-            DateTimeOffset.UtcNow));
+            DateTimeOffset.UtcNow,
+            Model: job.Model,
+            ReasoningEffort: job.ReasoningEffort));
 
         job.Status = DispatchJobStatus.Running;
         job.OwnerPid = owner.OwnerPid;

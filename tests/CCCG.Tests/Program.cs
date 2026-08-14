@@ -71,6 +71,9 @@ var tests = new (string Name, Action Run)[]
     ("owner registry registers and detects a stale owner", OwnerRegistryDetectsStaleOwner),
     ("owner registry cleans stale registrations but keeps non-empty spools", OwnerRegistryCleansStaleRegistrations),
     ("owner daemon turns spooled messages into receipts", OwnerDaemonProcessesSpool),
+    ("owner message round-trips model and effort", OwnerMessageRoundTripsModelAndEffort),
+    ("owner daemon forwards per-message overrides", OwnerDaemonForwardsPerMessageOverrides),
+    ("Codex owner transport falls back to constructor defaults", CodexOwnerTurnTransportFallsBackToConstructorDefaults),
     ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
     ("owner spool preserves Chinese text byte-exactly through the turn roundtrip", OwnerSpoolPreservesChineseTextBytes),
     ("owner daemon fails abandoned processing turns as unknown outcome without re-running", OwnerDaemonFailsAbandonedProcessingTurns),
@@ -1628,7 +1631,13 @@ static void DispatchRunnerDeliversToLiveIdlePeer()
         owners: registry,
         writerPollInterval: TimeSpan.FromMilliseconds(20),
         deliverWaitTimeout: TimeSpan.FromSeconds(10));
-    var job = runner.Enqueue("grok", "hello owned peer", cwd: "D:\\code\\app", allowNew: false);
+    var job = runner.Enqueue(
+        "grok",
+        "hello owned peer",
+        cwd: "D:\\code\\app",
+        allowNew: false,
+        model: "grok-4.6",
+        reasoningEffort: "high");
     True(job.Reason?.Contains("CCCG-owned", StringComparison.Ordinal) == true);
     var done = runner.Run(job.JobId);
     Equal(DispatchJobStatus.Succeeded, done.Status);
@@ -1644,6 +1653,8 @@ static void DispatchRunnerDeliversToLiveIdlePeer()
     // not be wrapped a second time by the owner daemon.
     True(!transport.Turns[0].Contains("[CCCG dispatch from", StringComparison.Ordinal));
     Equal("[CCCG message from claude]\n\nhello owned peer", transport.Turns[0]);
+    Equal("grok-4.6", transport.LastModel);
+    Equal("high", transport.LastReasoningEffort);
 }
 
 static void DispatchRunnersSerializeManagedPeer()
@@ -1820,6 +1831,154 @@ static void OwnerDaemonProcessesSpool()
     Equal(0, spool.ReadIncoming().Count);
     Equal(0, daemon.ProcessPendingOnce());
     Equal("thread-real", registry.TryFind("codex", "thread-real", null)?.SessionId);
+}
+
+static void OwnerMessageRoundTripsModelAndEffort()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-message-{Guid.NewGuid():N}");
+    try
+    {
+        var spool = new OwnerSpool(root);
+        var now = DateTimeOffset.UtcNow;
+        spool.Post(new OwnerMessage(
+            "with-overrides",
+            "claude",
+            "sender-1",
+            "hello",
+            now,
+            Model: "gpt-5.6-luna",
+            ReasoningEffort: "xhigh"));
+        spool.Post(new OwnerMessage(
+            "old-shape",
+            "claude",
+            null,
+            "hello again",
+            now.AddMilliseconds(1)));
+
+        var messages = spool.ReadIncoming();
+        var withOverrides = messages.Single(item => item.Message.MessageId == "with-overrides").Message;
+        Equal("gpt-5.6-luna", withOverrides.Model);
+        Equal("xhigh", withOverrides.ReasoningEffort);
+
+        var oldShape = messages.Single(item => item.Message.MessageId == "old-shape").Message;
+        True(oldShape.Model is null);
+        True(oldShape.ReasoningEffort is null);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void OwnerDaemonForwardsPerMessageOverrides()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-overrides-{Guid.NewGuid():N}");
+    try
+    {
+        var registry = new OwnerRegistry(root);
+        var transport = new EchoTurnTransport(text => "ECHO::" + text);
+        using (var daemon = new OwnerDaemon(
+                   "codex", "D:\\code\\app", "thread-1", transport, registry))
+        {
+            var registration = daemon.Start();
+            var spool = new OwnerSpool(registration.SpoolDir);
+            var now = DateTimeOffset.UtcNow;
+            spool.Post(new OwnerMessage(
+                "override-turn",
+                "claude",
+                null,
+                "please review",
+                now,
+                Model: "gpt-5.6-luna",
+                ReasoningEffort: "xhigh"));
+
+            Equal(1, daemon.ProcessPendingOnce());
+            Equal("gpt-5.6-luna", transport.LastModel);
+            Equal("xhigh", transport.LastReasoningEffort);
+            Equal(
+                OwnerReceiptStatus.Delivered,
+                spool.TryReadReceipt("override-turn")!.Status);
+
+            spool.Post(new OwnerMessage(
+                "default-turn",
+                "claude",
+                null,
+                "use defaults",
+                now.AddMilliseconds(1)));
+            Equal(1, daemon.ProcessPendingOnce());
+            True(transport.LastModel is null);
+            True(transport.LastReasoningEffort is null);
+            Equal(
+                OwnerReceiptStatus.Delivered,
+                spool.TryReadReceipt("default-turn")!.Status);
+        }
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void CodexOwnerTurnTransportFallsBackToConstructorDefaults()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-codex-{Guid.NewGuid():N}");
+    var jsonTransport = new ScriptedJsonLineTransport(new[]
+    {
+        "{\"id\":1,\"result\":{}}",
+        "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}",
+        "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}",
+        "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"item\":{\"type\":\"agentMessage\",\"text\":\"DEFAULT\"}}}",
+        "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}",
+        "{\"id\":4,\"result\":{\"turn\":{\"id\":\"turn-2\"}}}",
+        "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thread-1\",\"turnId\":\"turn-2\",\"item\":{\"type\":\"agentMessage\",\"text\":\"OVERRIDE\"}}}",
+        "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-2\",\"status\":\"completed\"}}}"
+    });
+    var client = new PersistentCodexAppServerClient(
+        "owner-defaults",
+        new CodexThreadBindingStore(Path.Combine(root, "bindings")),
+        _ => Task.FromResult<IJsonLineTransport>(jsonTransport));
+    var transport = new CodexOwnerTurnTransport(
+        client,
+        "gpt-5.6-luna",
+        "medium",
+        "D:\\code\\app");
+    try
+    {
+        Equal("DEFAULT", transport.RunTurnAsync("first").GetAwaiter().GetResult());
+        Equal(
+            "OVERRIDE",
+            transport.RunTurnAsync(
+                "second",
+                model: "gpt-5.6-terra",
+                reasoningEffort: "high").GetAwaiter().GetResult());
+
+        Equal(5, jsonTransport.Writes.Count);
+        using var defaultTurn = System.Text.Json.JsonDocument.Parse(jsonTransport.Writes[3]);
+        var defaultParams = defaultTurn.RootElement.GetProperty("params");
+        Equal("turn/start", defaultTurn.RootElement.GetProperty("method").GetString());
+        Equal("gpt-5.6-luna", defaultParams.GetProperty("model").GetString());
+        Equal("medium", defaultParams.GetProperty("effort").GetString());
+
+        using var overrideTurn = System.Text.Json.JsonDocument.Parse(jsonTransport.Writes[4]);
+        var overrideParams = overrideTurn.RootElement.GetProperty("params");
+        Equal("turn/start", overrideTurn.RootElement.GetProperty("method").GetString());
+        Equal("gpt-5.6-terra", overrideParams.GetProperty("model").GetString());
+        Equal("high", overrideParams.GetProperty("effort").GetString());
+    }
+    finally
+    {
+        transport.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }
 
 static void OwnerDaemonRecordsFailedTurn()
@@ -2394,11 +2553,21 @@ sealed class EchoTurnTransport : IProviderTurnTransport
 
     public List<string> Turns { get; } = new();
 
+    public string? LastModel { get; private set; }
+
+    public string? LastReasoningEffort { get; private set; }
+
     public string? SessionId => sessionId;
 
-    public Task<string> RunTurnAsync(string text, CancellationToken cancellationToken = default)
+    public Task<string> RunTurnAsync(
+        string text,
+        CancellationToken cancellationToken = default,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         Turns.Add(text);
+        LastModel = model;
+        LastReasoningEffort = reasoningEffort;
         return Task.FromResult(reply(text));
     }
 

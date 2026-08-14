@@ -29,7 +29,11 @@ public interface IProviderTurnTransport : IAsyncDisposable
     /// </summary>
     string? SessionId { get; }
 
-    Task<string> RunTurnAsync(string text, CancellationToken cancellationToken = default);
+    Task<string> RunTurnAsync(
+        string text,
+        CancellationToken cancellationToken = default,
+        string? model = null,
+        string? reasoningEffort = null);
 }
 
 /// <summary>
@@ -63,14 +67,16 @@ public sealed class CodexOwnerTurnTransport : IProviderTurnTransport
 
     public async Task<string> RunTurnAsync(
         string text,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         try
         {
             var completion = await client.CompleteAsync(
                 text,
-                model,
-                reasoningEffort,
+                model ?? this.model,
+                reasoningEffort ?? this.reasoningEffort,
                 cwd,
                 outputSchema: null,
                 cancellationToken).ConfigureAwait(false);
@@ -109,7 +115,9 @@ public sealed class UnimplementedGrokTurnTransport : IProviderTurnTransport
 
     public Task<string> RunTurnAsync(
         string text,
-        CancellationToken cancellationToken = default) =>
+        CancellationToken cancellationToken = default,
+        string? model = null,
+        string? reasoningEffort = null) =>
         Task.FromException<string>(new NotSupportedException(Reason));
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
