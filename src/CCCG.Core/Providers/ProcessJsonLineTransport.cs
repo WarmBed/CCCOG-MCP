@@ -27,6 +27,10 @@ public sealed partial class ProcessJsonLineTransport : IJsonLineTransport
             executable = OperatingSystem.IsWindows() ? "codex.cmd" : "codex";
         }
 
+        // Explicit UTF-8 on every redirected stream: without this the console
+        // codepage (cp950 on zh-TW Windows) garbles Chinese text both ways.
+        // Mirrors the 0.4.6 FileProcessLauncher fix in DispatchRunner.cs.
+        var utf8 = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
         var startInfo = new ProcessStartInfo
         {
             FileName = executable,
@@ -34,6 +38,9 @@ public sealed partial class ProcessJsonLineTransport : IJsonLineTransport
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardInputEncoding = utf8,
+            StandardOutputEncoding = utf8,
+            StandardErrorEncoding = utf8,
             CreateNoWindow = true
         };
         startInfo.ArgumentList.Add("app-server");

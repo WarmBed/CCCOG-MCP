@@ -71,6 +71,7 @@ var tests = new (string Name, Action Run)[]
     ("owner registry registers and detects a stale owner", OwnerRegistryDetectsStaleOwner),
     ("owner daemon turns spooled messages into receipts", OwnerDaemonProcessesSpool),
     ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
+    ("owner spool preserves Chinese text byte-exactly through the turn roundtrip", OwnerSpoolPreservesChineseTextBytes),
     ("dispatch deliver fails when the owner dies mid-delivery", DispatchDeliverFailsWhenOwnerDies),
     ("dispatch deliver succeeds and posts a placeholder for an empty provider reply", DispatchDeliverEmptyReplySucceedsWithPlaceholder),
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
@@ -1464,6 +1465,28 @@ static void OwnerDaemonRecordsFailedTurn()
     True(receipt.DeliveredAt is null);
     True(receipt.Error!.Contains("PROVIDER-DOWN", StringComparison.Ordinal));
     Equal(0, spool.ReadIncoming().Count);
+}
+
+static void OwnerSpoolPreservesChineseTextBytes()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-zh-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    const string chinese = "繁體中文測試:收到訊息了嗎?請確認「編碼」沒有壞掉。";
+    var transport = new EchoTurnTransport(text => "回覆:" + text);
+    using var daemon = new OwnerDaemon("codex", "D:\\code\\app", "sess-zh", transport, registry);
+    var registration = daemon.Start();
+    var spool = new OwnerSpool(registration.SpoolDir);
+    spool.Post(new OwnerMessage("m-zh", "claude", null, chinese, DateTimeOffset.UtcNow));
+
+    Equal(1, daemon.ProcessPendingOnce());
+    Equal("[CCCG message from claude]\n\n" + chinese, transport.Turns[0]);
+
+    var receipt = spool.TryReadReceipt("m-zh")!;
+    Equal(OwnerReceiptStatus.Delivered, receipt.Status);
+    var expectedReply = "回覆:[CCCG message from claude]\n\n" + chinese;
+    Equal(expectedReply, receipt.ResponseText);
+    True(System.Text.Encoding.UTF8.GetBytes(expectedReply)
+        .SequenceEqual(System.Text.Encoding.UTF8.GetBytes(receipt.ResponseText!)));
 }
 
 static void DispatchDeliverFailsWhenOwnerDies()
