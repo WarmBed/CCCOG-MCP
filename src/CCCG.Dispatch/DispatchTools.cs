@@ -29,6 +29,13 @@ public sealed class DispatchTools
         [Description("Provider: grok, codex, claude, or all.")] string provider = "grok") =>
         Invoke("inspect", new { sessionId, provider });
 
+    [McpServerTool(Name = "cccg_watch_peers"),
+     Description("Snapshot online/writer state for a list of session ids and diff it against the previous snapshot.")]
+    public string WatchPeers(
+        [Description("Comma-separated session ids from cccg_list_peers.")] string sessionIds,
+        [Description("Provider: grok, codex, claude, or all.")] string provider = "all") =>
+        Invoke("watchPeers", new { sessionIds, provider });
+
     [McpServerTool(Name = "cccg_dispatch"),
      Description("Queue work and return a jobId immediately. Same-session work is serialized across all Claude Desktop sessions.")]
     public string Dispatch(
@@ -36,8 +43,21 @@ public sealed class DispatchTools
         [Description("Provider: grok, codex, or claude.")] string provider = "grok",
         [Description("Existing live, resumable, or CCCG-managed session id.")] string? sessionId = null,
         [Description("Workspace/cwd.")] string? cwd = null,
-        [Description("Create a new bound session if none matches.")] bool allowNew = true) =>
-        Invoke("dispatch", new { prompt, provider, sessionId, cwd, allowNew });
+        [Description("Create a new bound session if none matches.")] bool allowNew = true,
+        [Description("Optional backend model id for this turn only (codex/grok). Example: gpt-5.6-luna.")]
+        string? model = null,
+        [Description("Optional reasoning intensity for this turn only (codex/grok). Passed through to the provider. Example: medium, high, xhigh.")]
+        string? reasoningEffort = null) =>
+        Invoke("dispatch", new
+        {
+            prompt,
+            provider,
+            sessionId,
+            cwd,
+            allowNew,
+            model,
+            reasoningEffort
+        });
 
     [McpServerTool(Name = "cccg_dispatch_wait"),
      Description("Dispatch work and keep this tool call open until the peer finishes, so Claude receives the answer automatically without polling.")]
@@ -46,8 +66,21 @@ public sealed class DispatchTools
         [Description("Provider: grok, codex, or claude.")] string provider = "grok",
         [Description("Existing live, resumable, or CCCG-managed session id.")] string? sessionId = null,
         [Description("Workspace/cwd.")] string? cwd = null,
-        [Description("Create a new bound session if none matches.")] bool allowNew = true) =>
-        Invoke("dispatchWait", new { prompt, provider, sessionId, cwd, allowNew });
+        [Description("Create a new bound session if none matches.")] bool allowNew = true,
+        [Description("Optional backend model id for this turn only (codex/grok). Example: gpt-5.6-luna.")]
+        string? model = null,
+        [Description("Optional reasoning intensity for this turn only (codex/grok). Passed through to the provider. Example: medium, high, xhigh.")]
+        string? reasoningEffort = null) =>
+        Invoke("dispatchWait", new
+        {
+            prompt,
+            provider,
+            sessionId,
+            cwd,
+            allowNew,
+            model,
+            reasoningEffort
+        });
 
     [McpServerTool(Name = "cccg_job_status"), Description("Read queued/running/succeeded/failed status.")]
     public string JobStatus([Description("Dispatch job id.")] string jobId) =>

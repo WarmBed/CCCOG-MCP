@@ -60,6 +60,9 @@ var tests = new (string Name, Action Run)[]
     ("codex directory fills parent cwd from subagent rollouts", CodexDirectoryFillsParentFromSubagentOnly),
     ("claude directory lists transcripts and marks live Desktop writers", ClaudeDirectoryListsAndMarksLive),
     ("claude directory ignores dead session registry entries", ClaudeDirectoryIgnoresDeadRegistry),
+    ("watch peers diffs status change", WatchPeersDiffsStatusChange),
+    ("watch peers reports missing id", WatchPeersReportsMissingId),
+    ("watch peers rejects empty list", WatchPeersRejectsEmptyList),
     ("peer selector skips unowned live peers and delivers to owned ones", PeerSelectorPrefersIdle),
     ("peer selector rejects a working session", PeerSelectorRejectsWorking),
     ("peer selector delivers to an explicit owned live peer and fails closed otherwise", PeerSelectorInsertsExplicitLivePeer),
@@ -874,6 +877,95 @@ static void ClaudeDirectoryIgnoresDeadRegistry()
     var peer = new ClaudePeerDirectory(home.Root, _ => false).List().Peers.Single();
     Equal(PeerStatus.Resumable, peer.Status);
     True(peer.Pid is null);
+}
+
+static void WatchPeersDiffsStatusChange()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-watch-{Guid.NewGuid():N}");
+    try
+    {
+        var now = DateTimeOffset.Parse("2026-08-15T03:00:00Z");
+        var peer = new Peer(
+            "codex",
+            "thread-1",
+            PeerStatus.LiveWorking,
+            "D:\\code\\app",
+            "Worker",
+            null,
+            "gpt-5.6-luna",
+            4242,
+            null,
+            now,
+            4);
+        var watcher = new PeerWatcher(
+            (provider, sessionId) =>
+                provider == "codex" && sessionId == peer.SessionId ? peer : null,
+            root,
+            () => now);
+
+        var first = watcher.Watch("thread-1", "codex");
+        Equal(1, first.Peers.Count);
+        Equal(0, first.Changes.Count);
+        True(File.Exists(Path.Combine(root, "last.json")));
+
+        peer = peer with { Status = PeerStatus.LiveIdle };
+        now = now.AddSeconds(5);
+        var second = watcher.Watch("thread-1", "codex");
+        Equal(1, second.Changes.Count);
+        Equal("thread-1", second.Changes[0].SessionId);
+        Equal("status", second.Changes[0].Field);
+        Equal(PeerStatus.LiveWorking, second.Changes[0].From as string);
+        Equal(PeerStatus.LiveIdle, second.Changes[0].To as string);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void WatchPeersReportsMissingId()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-watch-missing-{Guid.NewGuid():N}");
+    try
+    {
+        var watcher = new PeerWatcher((_, _) => null, root);
+        var result = watcher.Watch("missing", "codex");
+
+        Equal(1, result.Peers.Count);
+        Equal("missing", result.Peers[0].SessionId);
+        Equal("codex", result.Peers[0].Provider);
+        True(!result.Peers[0].Found);
+        True(result.Peers[0].Status is null);
+        True(result.Peers[0].Pid is null);
+        Equal(0, result.Changes.Count);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void WatchPeersRejectsEmptyList()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-watch-empty-{Guid.NewGuid():N}");
+    try
+    {
+        var watcher = new PeerWatcher((_, _) => null, root);
+        Throws<ArgumentException>(() => watcher.Watch(" ,  , ", "all"));
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }
 
 static void PeerSelectorPrefersIdle()

@@ -229,6 +229,7 @@ sealed class WorkerRuntime
     private readonly ClaudePeerDirectory claude = new();
     private readonly DispatchBindingStore bindings = new();
     private readonly InboxLedger inbox = new();
+    private readonly PeerWatcher watcher;
 
     public WorkerRuntime()
     {
@@ -243,6 +244,7 @@ sealed class WorkerRuntime
             },
             bindings: bindings,
             inbox: inbox);
+        watcher = new PeerWatcher(TryInspect);
     }
 
     public DispatchRunner Runner { get; }
@@ -258,6 +260,9 @@ sealed class WorkerRuntime
             "inspect" => Serialize(Inspect(
                 Required(request.Arguments, "sessionId"),
                 String(request.Arguments, "provider") ?? "grok")),
+            "watchPeers" => Serialize(watcher.Watch(
+                Required(request.Arguments, "sessionIds"),
+                String(request.Arguments, "provider") ?? "all")),
             "dispatch" => Dispatch(request.Arguments, wait: false),
             "dispatchWait" => Dispatch(request.Arguments, wait: true),
             "jobStatus" => Serialize(Runner.Status(Required(request.Arguments, "jobId"))),
@@ -375,20 +380,37 @@ sealed class WorkerRuntime
     private object Inspect(string sessionId, string provider)
     {
         provider = provider.Trim().ToLowerInvariant();
-        var peer = provider switch
+        if (provider is not ("grok" or "codex" or "claude" or "all"))
         {
-            "grok" => grok.Inspect(sessionId),
-            "codex" => codex.Inspect(sessionId),
-            "claude" => claude.Inspect(sessionId),
-            "all" => grok.Inspect(sessionId) ?? codex.Inspect(sessionId) ?? claude.Inspect(sessionId),
-            _ => throw new ArgumentException("Provider must be grok, codex, claude, or all.")
-        };
+            throw new ArgumentException("Provider must be grok, codex, claude, or all.");
+        }
+
+        var peer = provider == "all"
+            ? TryInspect("grok", sessionId)
+                ?? TryInspect("codex", sessionId)
+                ?? TryInspect("claude", sessionId)
+            : TryInspect(provider, sessionId);
         if (peer is null)
         {
             throw new InvalidOperationException($"No {provider} session '{sessionId}'.");
         }
 
-        return peer with { Bound = bindings.IsManaged(peer.Provider, peer.SessionId) };
+        return peer;
+    }
+
+    private Peer? TryInspect(string provider, string sessionId)
+    {
+        var peer = provider switch
+        {
+            "grok" => grok.Inspect(sessionId),
+            "codex" => codex.Inspect(sessionId),
+            "claude" => claude.Inspect(sessionId),
+            _ => null
+        };
+
+        return peer is null
+            ? null
+            : peer with { Bound = bindings.IsManaged(peer.Provider, peer.SessionId) };
     }
 
     private PeerList Mark(PeerList list, string provider, string? cwd) =>
