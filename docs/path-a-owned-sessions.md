@@ -133,7 +133,7 @@ then the session is addressable by `cwd`.
 ### Spool and receipts
 
 - `<spoolDir>\incoming\<yyyyMMddTHHmmssfff>_<messageId>.json` =
-  `{messageId, fromRole, fromSessionId, text, createdAt}`
+  `{messageId, fromRole, fromSessionId, text, createdAt, model?, reasoningEffort?}`
 - `<spoolDir>\processing\` — the message currently (or last) being run; a
   leftover here after a crash means the turn outcome is unknown
 - `<spoolDir>\receipts\<messageId>.json` =
@@ -148,7 +148,7 @@ retried — the dispatcher surfaces the error and the sender decides). A crash
 between claim and receipt yields an unknown-outcome `failed` receipt at the
 next startup, never a replay.
 
-### Dispatch integration (Worker-only, zero MCP schema changes)
+### Dispatch integration
 
 - New `DispatchAction.Deliver` in `PeerSelector`.
 - `DispatchRunner.Select` consults the owner registry **first**: a live owner
@@ -160,8 +160,9 @@ next startup, never a replay.
   resume/create.
 - `Deliver` in `DispatchRunner`: posts the job's **raw** prompt
   (`prompt.raw.txt`, no dispatch header) into the spool (`messageId =
-  jobId`), then polls for the receipt (250 ms default, 2 h timeout like every
-  other wait). The owner is re-resolved by session id **and** by workspace so
+  jobId`) together with any per-turn `model` / `reasoningEffort`, then polls
+  for the receipt (250 ms default, 2 h timeout like every other wait). The
+  owner is re-resolved by session id **and** by workspace so
   a concurrent `RefreshSessionIdentity` swap cannot fake a
   "released its lease" failure. During the wait, owner liveness is the
   **lease** (`OwnerRegistry.LeaseIsHeld` on the entry's key), not the PID —
@@ -213,10 +214,13 @@ keep-stdin-open precedent, `ProcessJsonLineTransport`, sits underneath.
   previously-unused `PersistentCodexAppServerClient` (`codex app-server`
   JSON-RPC): turn/write gates, pending-message queue, thread start/resume,
   fail-closed on server-initiated approvals. `--session-id` pre-binds the
-  thread so the client resumes it. Model resolution:
-  `--model` → `CCCG_OWNER_CODEX_MODEL` → `gpt-5.6-luna` (the locally
-  verified backend in `config/routes.luna.json`). `CodexAppServerClient`
-  (live router code) is untouched.
+  thread so the client resumes it. Model resolution is per-turn spool
+  override → owner process default (`--model` → `CCCG_OWNER_CODEX_MODEL` →
+  `gpt-5.6-luna`, the locally verified backend in
+  `config/routes.luna.json`). Reasoning resolution is per-turn
+  `reasoningEffort` → owner process default (`--effort` →
+  `CCCG_OWNER_CODEX_EFFORT` → `medium`). Per-turn values do not mutate the
+  process defaults. `CodexAppServerClient` (live router code) is untouched.
 - **grok — cleanly stubbed.** `docs/provider-adapters.md` names
   `grok agent stdio` (ACP) as the entrypoint but does not document the ACP
   message schema, and CCCG does not guess wire protocols.
@@ -227,14 +231,16 @@ keep-stdin-open precedent, `ProcessJsonLineTransport`, sits underneath.
   `CodexOwnerTurnTransport`'s shape; nothing else changes — registry, spool,
   selection, and receipts are provider-agnostic.
 
-## Worker-only vs Host-schema (later batch)
+## Worker and Host schema boundary
 
-Everything above lives in `CCCG.Core` + `CCCG.Dispatch.Worker` and rides the
-existing worker hot-install; the MCP tool surface (`cccg_dispatch`,
-`cccg_job_status`, `cccg_job_collect`, …) is unchanged — `Deliver` shows up
-only as new `action`/`reason`/field values in existing JSON payloads.
+The owner registry, spool, transport, and receipt mechanics live in
+`CCCG.Core` + `CCCG.Dispatch.Worker` and ride the Worker hot-install. The
+per-dispatch model batch also changes the Host schema: `cccg_dispatch` /
+`cccg_dispatch_wait` expose `model` and `reasoningEffort`, and
+`cccg_watch_peers` exposes snapshot/diff state. Install Worker first, then
+Host, then reconnect the MCP server once.
 
-Would need Host/MCP schema work later:
+Still deferred:
 
 - a first-class `cccg_owner_*` tool family (start/stop/list owners) instead
   of launching `run-owner` by hand;
@@ -290,7 +296,7 @@ Would need Host/MCP schema work later:
 ```powershell
 dotnet build src/CCCG.Dispatch.Worker/CCCG.Dispatch.Worker.csproj -c Release
 dotnet build src/CCCG.Dispatch/CCCG.Dispatch.csproj -c Release
-dotnet run --project tests/CCCG.Tests/CCCG.Tests.csproj -c Release   # 69/69
+dotnet run --project tests/CCCG.Tests/CCCG.Tests.csproj -c Release   # 85/85
 
 # hot-install the worker (unchanged pipeline; bump the version)
 powershell -File scripts\install-dispatch-worker.ps1 -Version 0.6.0

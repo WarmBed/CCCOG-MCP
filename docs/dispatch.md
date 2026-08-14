@@ -12,14 +12,15 @@ There are three deliberately different peer states:
 |---|---|
 | CCCG-managed, currently busy | Accept immediately into CCCG's cross-process FIFO; resume the same provider session as soon as its writer is free |
 | Closed/resumable | Start the provider CLI with the existing session ID |
-| Named live-idle Grok/Codex | Type the prompt into the open CLI/GUI window and press Enter |
-| Named live-working Grok/Codex | Same: type into the open window so it becomes a queued or immediate new turn |
+| Named live-idle Grok/Codex | Deliver through the owner spool when a CCCG owner daemon holds the session lease; otherwise skip or fail closed |
+| Named live-working Grok/Codex | Queue through the same CCCG owner; unowned live sessions are never keystroke targets |
 | Active Claude Desktop session | Resolve by title with `mcp__ccd_session_mgmt__list_sessions`, then use `mcp__ccd_session_mgmt__send_message`; never CLI-resume it |
 
-Named live Grok/Codex work is typed into the existing window. CCCG does not
-start a second `grok -r` / `codex exec resume` against that live session.
-CCCG-managed resume/create still serialize on the workspace lease. Auto-pick
-(no `sessionId`) still skips unbound live-working peers.
+Named live Grok/Codex work uses the CCCG owner spool and requires a delivered
+receipt. CCCG neither types into the existing window nor starts a second
+`grok -r` / `codex exec resume` against an owned live session. CCCG-managed
+resume/create still serialize on the workspace lease. Auto-pick (no
+`sessionId`) skips unowned live peers.
 
 ## Tools
 
@@ -27,12 +28,34 @@ CCCG-managed resume/create still serialize on the workspace lease. Auto-pick
 |---|---|
 | `cccg_list_peers` | List Claude, Grok, and/or Codex sessions and bindings |
 | `cccg_inspect_peer` | Inspect title, model, cwd, and writer state |
-| `cccg_dispatch` | Queue a background job and return `jobId` immediately |
-| `cccg_dispatch_wait` | Keep the Claude tool call open and return the peer response automatically |
+| `cccg_watch_peers` | Snapshot comma-separated session IDs and report `found`, `status`, or `pid` changes since the same watch set's previous call |
+| `cccg_dispatch` | Queue a background job, optionally override model/reasoning for this turn, and return `jobId` immediately |
+| `cccg_dispatch_wait` | Dispatch with the same per-turn options and keep the tool call open until the peer responds |
 | `cccg_job_status` | Read queued/running/succeeded/failed status |
 | `cccg_job_collect` | Collect normalized response and real provider session ID |
 | `cccg_inbox_post/list/ack` | Shared cross-process mailbox |
 | `cccg_runtime_status` | Show the active versioned Worker and hot-update mode |
+
+## Per-dispatch model
+
+`cccg_dispatch` and `cccg_dispatch_wait` accept optional `model` and
+`reasoningEffort` strings. Omitted, empty, or whitespace-only values preserve
+the existing provider or owner defaults; non-empty values are trimmed and
+passed through without aliases or an allow-list.
+
+- Codex CLI create/resume adds `--model <id>` and
+  `-c model_reasoning_effort=<value>` as `codex exec` options before the
+  `resume` subcommand.
+- Grok CLI create/resume adds `--model <id>` and
+  `--reasoning-effort <value>`.
+- A Codex owner delivery stores the same values on the spool message and uses
+  them for that app-server turn only; later turns without overrides return to
+  the owner process defaults.
+- Claude rejects a job that sets either parameter before any provider launch
+  or owner delivery. CCCG does not silently ignore Claude overrides.
+
+`cccg_job_collect` keeps all existing field names and additively returns
+`model` and `reasoningEffort` from the job.
 
 ## Session identity
 
@@ -86,6 +109,17 @@ implementation does not require a Claude Session restart. Adding, removing, or
 changing an MCP tool schema still requires an MCP reconnect because
 `tools/list` is negotiated by the Host connection.
 
+This batch changes the Host schema by adding `model` / `reasoningEffort` to
+both dispatch tools and adding `cccg_watch_peers`. Deploy in this order:
+
+1. install and activate the new Worker;
+2. install the rebuilt Host at the stable `cccg-dispatch.exe` path;
+3. reconnect the `cccg-dispatch` MCP server (or restart Claude Desktop) so it
+   negotiates the new tool schema once.
+
+Worker-first avoids the install window where a new Host can send overrides to
+an older Worker that would ignore the unknown arguments.
+
 Claude support in 0.4.5 reuses the existing string-valued `provider` argument,
 so it is a Worker-only update and already-connected Hosts can call
 `provider="claude"`. Updated tool descriptions/foreman instructions become
@@ -97,15 +131,17 @@ restarted once. Future Worker-only updates are hot.
 ## Build and verification
 
 ```powershell
-dotnet restore .\CCCG.sln
-dotnet build .\src\CCCG.Dispatch.Worker\CCCG.Dispatch.Worker.csproj -c Release --no-restore
-dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release --no-restore -p:OutputPath=..\..\artifacts\build-validation\dispatch\
+dotnet build .\src\CCCG.Dispatch.Worker\CCCG.Dispatch.Worker.csproj -c Release
+dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release -p:OutputPath=..\..\artifacts\build-validation\dispatch\
 dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release
-.\scripts\install-dispatch-worker.ps1 -Version 0.5.5
+.\scripts\install-dispatch-worker.ps1 -Version <version>
 ```
 
 The alternate Host output path avoids overwriting the stable Host executable
 while Claude Desktop has it open.
+
+Do not build `CCCG.sln` in this checkout; it references an absent
+`experiments\` project.
 
 See [dispatch validation](dispatch-validation.md) for the Claude, Codex, and
 restored-quota Grok live evidence.
