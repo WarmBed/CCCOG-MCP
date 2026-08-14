@@ -3,6 +3,13 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CCCG.Core.Dispatch;
+using CCCG.Core.Providers;
+
+if (args.Length > 0 && args[0] == "run-owner")
+{
+    Environment.ExitCode = OwnerMode.Run(args.Skip(1).ToArray());
+    return;
+}
 
 var runtime = new WorkerRuntime();
 if (args is ["run-job", var jobId])
@@ -43,6 +50,154 @@ catch (Exception exception) when (exception is not OutOfMemoryException)
 }
 
 Console.WriteLine(JsonSerializer.Serialize(response, WorkerRuntime.JsonOptions));
+
+/// <summary>
+/// `cccg-dispatch-worker.exe run-owner --provider codex --cwd D:\code\x
+/// [--session-id thread-id] [--model gpt-5.6-luna] [--effort medium]`
+/// Long-lived owner daemon for one provider session: spawns the provider
+/// child with stdin kept open, holds the ownership lease, and turns spooled
+/// dispatch messages into provider turns with receipts.
+/// </summary>
+static class OwnerMode
+{
+    public static int Run(string[] arguments)
+    {
+        string? provider = null;
+        string? cwd = null;
+        string? sessionId = null;
+        string? model = null;
+        string? effort = null;
+        for (var index = 0; index < arguments.Length; index++)
+        {
+            switch (arguments[index])
+            {
+                case "--provider":
+                    provider = Next(arguments, ref index);
+                    break;
+                case "--cwd":
+                    cwd = Next(arguments, ref index);
+                    break;
+                case "--session-id":
+                    sessionId = Next(arguments, ref index);
+                    break;
+                case "--model":
+                    model = Next(arguments, ref index);
+                    break;
+                case "--effort":
+                    effort = Next(arguments, ref index);
+                    break;
+                default:
+                    Console.Error.WriteLine($"Unknown run-owner option '{arguments[index]}'.");
+                    return 2;
+            }
+        }
+
+        provider = (provider ?? string.Empty).Trim().ToLowerInvariant();
+        if (provider is not ("grok" or "codex"))
+        {
+            Console.Error.WriteLine("run-owner requires --provider grok|codex.");
+            return 2;
+        }
+
+        cwd = Path.GetFullPath(
+            string.IsNullOrWhiteSpace(cwd) ? Environment.CurrentDirectory : cwd);
+
+        IProviderTurnTransport transport;
+        if (provider == "codex")
+        {
+            model = FirstNonEmpty(
+                model,
+                Environment.GetEnvironmentVariable("CCCG_OWNER_CODEX_MODEL"),
+                "gpt-5.6-luna")!;
+            effort = FirstNonEmpty(
+                effort,
+                Environment.GetEnvironmentVariable("CCCG_OWNER_CODEX_EFFORT"),
+                "medium");
+            var sessionKey = "owner|codex|" + cwd.ToLowerInvariant() + "|"
+                + (sessionId ?? "workspace");
+            var bindingStore = new CodexThreadBindingStore();
+            if (!string.IsNullOrWhiteSpace(sessionId)
+                && bindingStore.Load(sessionKey) is null)
+            {
+                // A caller-provided session id is an existing Codex thread:
+                // pre-bind it so the persistent client resumes that thread.
+                var now = DateTimeOffset.UtcNow;
+                bindingStore.Save(sessionKey, new CodexThreadBinding(1, sessionId, model, now, now));
+            }
+
+            transport = new CodexOwnerTurnTransport(
+                new PersistentCodexAppServerClient(
+                    sessionKey,
+                    bindingStore,
+                    diagnostic: line => Console.Error.WriteLine("[codex] " + line)),
+                model,
+                effort,
+                cwd);
+        }
+        else
+        {
+            // Fail fast instead of accepting messages a stub cannot deliver.
+            Console.Error.WriteLine(UnimplementedGrokTurnTransport.Reason);
+            return 3;
+        }
+
+        using var daemon = new OwnerDaemon(provider, cwd, sessionId, transport);
+        OwnerRegistration registration;
+        try
+        {
+            registration = daemon.Start();
+        }
+        catch (InvalidOperationException exception)
+        {
+            Console.Error.WriteLine(exception.Message);
+            return 4;
+        }
+
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            ok = true,
+            mode = "run-owner",
+            provider,
+            sessionId = registration.SessionId,
+            cwd,
+            ownerPid = registration.OwnerPid,
+            spoolDir = registration.SpoolDir
+        }, WorkerRuntime.JsonOptions));
+
+        using var stop = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            stop.Cancel();
+        };
+        try
+        {
+            daemon.Run(stop.Token);
+        }
+        finally
+        {
+            transport.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
+        return 0;
+    }
+
+    private static string? Next(string[] arguments, ref int index) =>
+        index + 1 < arguments.Length ? arguments[++index] : null;
+
+    private static string? FirstNonEmpty(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+}
 
 sealed class WorkerRuntime
 {
@@ -203,7 +358,7 @@ sealed class WorkerRuntime
             merged,
             grokList.TotalCount + codexList.TotalCount + claudeList.TotalCount,
             true,
-            "Named live Grok/Codex peers are typed into the open window as a new turn. Live Claude Desktop still uses its native send_message tool.");
+            "Live Grok/Codex peers accept dispatch only when a CCCG owner daemon runs them (run-owner); unowned live sessions must be closed and resumed. Live Claude Desktop still uses its native send_message tool.");
     }
 
     private object Inspect(string sessionId, string provider)
