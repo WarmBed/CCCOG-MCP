@@ -80,21 +80,33 @@ public sealed class OwnerRegistry
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         Directory.CreateDirectory(root);
-        try
+        for (var attempt = 0; ; attempt++)
         {
-            return new FileStream(
-                LeasePath(key),
-                FileMode.OpenOrCreate,
-                FileAccess.ReadWrite,
-                FileShare.None,
-                bufferSize: 1,
-                FileOptions.DeleteOnClose);
-        }
-        catch (IOException exception)
-        {
-            throw new InvalidOperationException(
-                "Another CCCG owner daemon already owns this provider session.",
-                exception);
+            try
+            {
+                return new FileStream(
+                    LeasePath(key),
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.DeleteOnClose);
+            }
+            catch (IOException exception)
+            {
+                // A concurrent LeaseIsHeld probe holds a short-lived read
+                // handle; one retry rides out that transient conflict without
+                // letting a legitimate acquisition fail.
+                if (attempt == 0)
+                {
+                    Thread.Sleep(100);
+                    continue;
+                }
+
+                throw new InvalidOperationException(
+                    "Another CCCG owner daemon already owns this provider session.",
+                    exception);
+            }
         }
     }
 
@@ -128,11 +140,18 @@ public sealed class OwnerRegistry
 
         try
         {
+            // Least-intrusive probe: read access with a permissive share so a
+            // concurrent legitimate AcquireLease is disturbed as little as
+            // possible. A held lease (FileShare.None) still rejects this open.
             using var stream = new FileStream(
                 leasePath,
                 FileMode.Open,
-                FileAccess.ReadWrite,
-                FileShare.None);
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            return false;
+        }
+        catch (FileNotFoundException)
+        {
             return false;
         }
         catch (IOException)
