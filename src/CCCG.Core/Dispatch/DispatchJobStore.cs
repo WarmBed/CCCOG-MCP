@@ -43,6 +43,10 @@ public sealed class DispatchJobStore
         var directory = JobDirectory(job.JobId);
         Directory.CreateDirectory(directory);
         File.WriteAllText(PromptPath(job.JobId), WrapPrompt(selection.Provider, prompt));
+        // Raw copy without the dispatch header: the owner-daemon path adds its
+        // own single "[CCCG message from ...]" label, so Deliver must spool
+        // the unwrapped text or the provider sees two sender headers.
+        File.WriteAllText(RawPromptPath(job.JobId), prompt.Trim());
         Write(job);
         return job;
     }
@@ -87,6 +91,8 @@ public sealed class DispatchJobStore
     public string JobDirectory(string jobId) => Path.Combine(root, jobId);
 
     public string PromptPath(string jobId) => Path.Combine(JobDirectory(jobId), "prompt.txt");
+
+    public string RawPromptPath(string jobId) => Path.Combine(JobDirectory(jobId), "prompt.raw.txt");
 
     public string StdoutPath(string jobId) => Path.Combine(JobDirectory(jobId), "stdout.log");
 

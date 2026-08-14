@@ -472,11 +472,17 @@ public sealed class DispatchRunner
                 $"The CCCG owner for {selection.Provider} session '{selection.SessionId}' "
                 + "released its lease before delivery.");
         var spool = new OwnerSpool(owner.SpoolDir);
+        // Spool the RAW prompt: OwnerDaemon.BuildTurnText adds the single
+        // "[CCCG message from <role> <session>]" sender label, so the wrapped
+        // prompt.txt header must never reach the provider a second time.
+        // (Fallback covers jobs created before prompt.raw.txt existed.)
+        var rawPromptPath = store.RawPromptPath(job.JobId);
         spool.Post(new OwnerMessage(
             job.JobId,
             "claude",
             FromSessionId: null,
-            File.ReadAllText(store.PromptPath(job.JobId)),
+            File.ReadAllText(
+                File.Exists(rawPromptPath) ? rawPromptPath : store.PromptPath(job.JobId)),
             DateTimeOffset.UtcNow));
 
         job.Status = DispatchJobStatus.Running;

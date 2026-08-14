@@ -1303,6 +1303,10 @@ static void DispatchRunnerDeliversToLiveIdlePeer()
     Equal(1, transport.Turns.Count);
     True(transport.Turns[0].StartsWith("[CCCG message from claude]", StringComparison.Ordinal));
     True(transport.Turns[0].Contains("hello owned peer", StringComparison.Ordinal));
+    // Exactly ONE sender label: the DispatchJobStore prompt.txt header must
+    // not be wrapped a second time by the owner daemon.
+    True(!transport.Turns[0].Contains("[CCCG dispatch from", StringComparison.Ordinal));
+    Equal("[CCCG message from claude]\n\nhello owned peer", transport.Turns[0]);
 }
 
 static void DispatchRunnersSerializeManagedPeer()
