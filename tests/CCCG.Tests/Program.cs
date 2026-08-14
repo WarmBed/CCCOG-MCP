@@ -69,6 +69,7 @@ var tests = new (string Name, Action Run)[]
     ("live injector binds WriteConsoleInputW for unicode", LiveInjectorBindsWriteConsoleInputW),
     ("dispatch runner delivers through the owner daemon to a live-idle peer", DispatchRunnerDeliversToLiveIdlePeer),
     ("owner registry registers and detects a stale owner", OwnerRegistryDetectsStaleOwner),
+    ("owner registry cleans stale registrations but keeps non-empty spools", OwnerRegistryCleansStaleRegistrations),
     ("owner daemon turns spooled messages into receipts", OwnerDaemonProcessesSpool),
     ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
     ("owner spool preserves Chinese text byte-exactly through the turn roundtrip", OwnerSpoolPreservesChineseTextBytes),
@@ -1427,7 +1428,39 @@ static void OwnerRegistryDetectsStaleOwner()
 
     True(!registry.LeaseIsHeld(key));
     True(registry.TryFind("codex", "sess-1", null) is null);
-    True(File.Exists(registry.RegistrationPath(key)));
+    // F9: the stale registration is cleaned up by the failed lookup.
+    True(!File.Exists(registry.RegistrationPath(key)));
+}
+
+static void OwnerRegistryCleansStaleRegistrations()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owners-stale-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    var staleKey = OwnerRegistry.Key("codex", "D:\\code\\app", "gone");
+    var staleLease = registry.AcquireLease(staleKey);
+    registry.Register(staleKey, new OwnerRegistration(
+        1, "codex", "gone", "D:\\code\\app", Environment.ProcessId,
+        registry.SpoolDirectory(staleKey), DateTimeOffset.UtcNow));
+    Directory.CreateDirectory(registry.SpoolDirectory(staleKey)); // empty spool
+    staleLease.Dispose(); // the owner dies
+
+    // A stale registration with unconsumed spool files keeps its spool.
+    var busyKey = OwnerRegistry.Key("codex", "D:\\code\\busy", "kept");
+    var busyLease = registry.AcquireLease(busyKey);
+    registry.Register(busyKey, new OwnerRegistration(
+        1, "codex", "kept", "D:\\code\\busy", Environment.ProcessId,
+        registry.SpoolDirectory(busyKey), DateTimeOffset.UtcNow));
+    var busySpool = new OwnerSpool(registry.SpoolDirectory(busyKey));
+    busySpool.Post(new OwnerMessage("m-pending", "claude", null, "still queued", DateTimeOffset.UtcNow));
+    busyLease.Dispose();
+
+    True(registry.TryFind("codex", null, "D:\\code\\app") is null);
+    True(!File.Exists(registry.RegistrationPath(staleKey)));
+    True(!Directory.Exists(Path.Combine(registry.Root, staleKey)));
+    // The dead-but-nonempty spool survives (evidence is never destroyed) even
+    // though its registration JSON is gone.
+    True(!File.Exists(registry.RegistrationPath(busyKey)));
+    Equal(1, busySpool.ReadIncoming().Count);
 }
 
 static void OwnerDaemonProcessesSpool()

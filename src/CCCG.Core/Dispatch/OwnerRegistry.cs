@@ -167,7 +167,9 @@ public sealed class OwnerRegistry
     /// <summary>
     /// Finds the live owner for a provider session. Matches by session id when
     /// one is given, otherwise by workspace. Registrations whose lease is no
-    /// longer held are stale and never returned.
+    /// longer held are stale: they are never returned, and TryFind deletes
+    /// them (plus their spool directory when it holds no files) so dead
+    /// workspace-keyed owners do not accumulate orphaned state.
     /// </summary>
     public OwnerRegistration? TryFind(string provider, string? sessionId, string? cwd) =>
         TryFindEntry(provider, sessionId, cwd)?.Registration;
@@ -207,6 +209,13 @@ public sealed class OwnerRegistry
                 continue;
             }
 
+            var key = Path.GetFileNameWithoutExtension(path);
+            if (!LeaseIsHeld(key))
+            {
+                CleanupStaleRegistration(key, path);
+                continue;
+            }
+
             var matches = !string.IsNullOrWhiteSpace(sessionId)
                 ? string.Equals(registration.SessionId, sessionId, StringComparison.OrdinalIgnoreCase)
                 : PathsMatch(registration.Cwd, cwd);
@@ -215,16 +224,46 @@ public sealed class OwnerRegistry
                 continue;
             }
 
-            var key = Path.GetFileNameWithoutExtension(path);
-            if (!LeaseIsHeld(key))
-            {
-                continue;
-            }
-
             return new OwnerRegistryEntry(key, registration);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Best-effort removal of a dead owner's leftovers. The registration JSON
+    /// always goes; the per-key directory (spool) goes only when it contains
+    /// no files at all — pending incoming messages or receipts a dispatcher
+    /// may still be polling are never destroyed.
+    /// </summary>
+    private void CleanupStaleRegistration(string key, string registrationPath)
+    {
+        try
+        {
+            File.Delete(registrationPath);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        var keyDirectory = Path.Combine(root, key);
+        try
+        {
+            if (Directory.Exists(keyDirectory)
+                && !Directory.EnumerateFiles(keyDirectory, "*", SearchOption.AllDirectories).Any())
+            {
+                Directory.Delete(keyDirectory, recursive: true);
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static bool PathsMatch(string? left, string? right)
