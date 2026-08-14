@@ -50,6 +50,8 @@ public sealed class OwnerSpool
 
     public string IncomingDirectory => Path.Combine(spoolDir, "incoming");
 
+    public string ProcessingDirectory => Path.Combine(spoolDir, "processing");
+
     public string ReceiptsDirectory => Path.Combine(spoolDir, "receipts");
 
     public string Post(OwnerMessage message)
@@ -66,15 +68,40 @@ public sealed class OwnerSpool
         return path;
     }
 
-    public IReadOnlyList<(string Path, OwnerMessage Message)> ReadIncoming()
+    public IReadOnlyList<(string Path, OwnerMessage Message)> ReadIncoming() =>
+        ReadMessages(IncomingDirectory);
+
+    /// <summary>
+    /// Messages that a previous owner moved out of <c>incoming</c> but never
+    /// receipted: the owner died mid-turn, so their outcome is unknown.
+    /// </summary>
+    public IReadOnlyList<(string Path, OwnerMessage Message)> ReadProcessing() =>
+        ReadMessages(ProcessingDirectory);
+
+    /// <summary>
+    /// Claims an incoming message before the provider turn runs. A restart
+    /// then sees the file under <c>processing</c> and knows the turn outcome
+    /// is unknown instead of silently replaying it (at-least-once → at most
+    /// one provider execution per message).
+    /// </summary>
+    public string MoveToProcessing(string incomingPath)
     {
-        if (!Directory.Exists(IncomingDirectory))
+        Directory.CreateDirectory(ProcessingDirectory);
+        var target = Path.Combine(ProcessingDirectory, Path.GetFileName(incomingPath));
+        File.Move(incomingPath, target, overwrite: true);
+        return target;
+    }
+
+    private static IReadOnlyList<(string Path, OwnerMessage Message)> ReadMessages(
+        string directory)
+    {
+        if (!Directory.Exists(directory))
         {
             return Array.Empty<(string, OwnerMessage)>();
         }
 
         var items = new List<(string, OwnerMessage)>();
-        foreach (var path in Directory.EnumerateFiles(IncomingDirectory, "*.json")
+        foreach (var path in Directory.EnumerateFiles(directory, "*.json")
                      .OrderBy(name => name, StringComparer.Ordinal))
         {
             try

@@ -504,7 +504,9 @@ public sealed class DispatchRunner
                 {
                     throw new InvalidOperationException(
                         $"The CCCG owner daemon (pid {owner.OwnerPid}) exited before "
-                        + "confirming delivery; the message was not consumed.");
+                        + "writing a receipt; the turn outcome is unknown — the owner may "
+                        + "have died mid-turn after the provider consumed the message. "
+                        + "Inspect the provider session before retrying.");
                 }
 
                 break;

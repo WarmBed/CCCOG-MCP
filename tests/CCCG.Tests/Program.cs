@@ -72,6 +72,7 @@ var tests = new (string Name, Action Run)[]
     ("owner daemon turns spooled messages into receipts", OwnerDaemonProcessesSpool),
     ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
     ("owner spool preserves Chinese text byte-exactly through the turn roundtrip", OwnerSpoolPreservesChineseTextBytes),
+    ("owner daemon fails abandoned processing turns as unknown outcome without re-running", OwnerDaemonFailsAbandonedProcessingTurns),
     ("dispatch deliver fails when the owner dies mid-delivery", DispatchDeliverFailsWhenOwnerDies),
     ("dispatch deliver succeeds and posts a placeholder for an empty provider reply", DispatchDeliverEmptyReplySucceedsWithPlaceholder),
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
@@ -1491,6 +1492,31 @@ static void OwnerSpoolPreservesChineseTextBytes()
     Equal(expectedReply, receipt.ResponseText);
     True(System.Text.Encoding.UTF8.GetBytes(expectedReply)
         .SequenceEqual(System.Text.Encoding.UTF8.GetBytes(receipt.ResponseText!)));
+}
+
+static void OwnerDaemonFailsAbandonedProcessingTurns()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-abandoned-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    var key = OwnerRegistry.Key("codex", "D:\\code\\app", "sess-1");
+    var spool = new OwnerSpool(registry.SpoolDirectory(key));
+    // Simulate the previous owner: it claimed the message into processing\
+    // and died before writing a receipt.
+    var incomingPath = spool.Post(new OwnerMessage(
+        "m-lost", "claude", null, "half-finished turn", DateTimeOffset.UtcNow));
+    var processingPath = spool.MoveToProcessing(incomingPath);
+    True(File.Exists(processingPath));
+
+    var transport = new EchoTurnTransport(_ => "SHOULD-NOT-RUN");
+    using var daemon = new OwnerDaemon("codex", "D:\\code\\app", "sess-1", transport, registry);
+    daemon.Start();
+
+    var receipt = spool.TryReadReceipt("m-lost")!;
+    Equal(OwnerReceiptStatus.Failed, receipt.Status);
+    True(receipt.Error!.Contains("unknown outcome", StringComparison.Ordinal));
+    True(!File.Exists(processingPath));
+    Equal(0, daemon.ProcessPendingOnce());
+    Equal(0, transport.Turns.Count);
 }
 
 static void DispatchDeliverFailsWhenOwnerDies()

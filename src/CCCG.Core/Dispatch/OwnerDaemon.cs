@@ -56,6 +56,7 @@ public sealed class OwnerDaemon : IDisposable
         key = OwnerRegistry.Key(provider, cwd, sessionId);
         lease = registry.AcquireLease(key);
         spool = new OwnerSpool(registry.SpoolDirectory(key));
+        FailAbandonedTurns(spool);
         registration = new OwnerRegistration(
             1,
             provider,
@@ -89,6 +90,20 @@ public sealed class OwnerDaemon : IDisposable
                 continue;
             }
 
+            // Claim the message BEFORE the provider turn: if this process dies
+            // mid-turn, restart finds the file in processing\ and writes an
+            // unknown-outcome failure instead of re-running the turn.
+            string processingPath;
+            try
+            {
+                processingPath = spool.MoveToProcessing(path);
+            }
+            catch (IOException)
+            {
+                // A concurrent rename/enumeration race; retry on the next poll.
+                continue;
+            }
+
             var labeled = BuildTurnText(message);
             try
             {
@@ -111,11 +126,36 @@ public sealed class OwnerDaemon : IDisposable
                     exception.Message));
             }
 
-            spool.Remove(path);
+            spool.Remove(processingPath);
             handled++;
         }
 
         return handled;
+    }
+
+    /// <summary>
+    /// Startup sweep: any message left in <c>processing</c> was claimed by a
+    /// previous owner that died before writing a receipt. The provider may or
+    /// may not have run it, so the only honest receipt is an unknown-outcome
+    /// failure — never a silent replay.
+    /// </summary>
+    private static void FailAbandonedTurns(OwnerSpool spool)
+    {
+        foreach (var (path, message) in spool.ReadProcessing())
+        {
+            if (spool.TryReadReceipt(message.MessageId) is null)
+            {
+                spool.WriteReceipt(new OwnerReceipt(
+                    message.MessageId,
+                    OwnerReceiptStatus.Failed,
+                    DeliveredAt: null,
+                    ResponseText: null,
+                    "unknown outcome: the previous owner died mid-turn; the provider may or "
+                    + "may not have run this message. Inspect the session before resending."));
+            }
+
+            spool.Remove(path);
+        }
     }
 
     public void Run(CancellationToken cancellationToken)
