@@ -27,6 +27,12 @@ public sealed class DispatchJob
     [JsonPropertyName("cwd")]
     public string? Cwd { get; set; }
 
+    [JsonPropertyName("model")]
+    public string? Model { get; set; }
+
+    [JsonPropertyName("reasoningEffort")]
+    public string? ReasoningEffort { get; set; }
+
     [JsonPropertyName("action")]
     public string Action { get; set; } = "";
 

@@ -81,6 +81,12 @@ var tests = new (string Name, Action Run)[]
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
     ("grok resume read-back fails when no turn is recorded", GrokResumeReadBackFails),
     ("provider command resumes grok codex and claude", ProviderCommandResumesPeers),
+    ("provider command adds Codex model and effort", ProviderCommandAddsCodexModelAndEffort),
+    ("provider command omits Codex model flags when unset", ProviderCommandOmitsCodexModelFlagsWhenUnset),
+    ("provider command adds Grok model and effort", ProviderCommandAddsGrokModelAndEffort),
+    ("provider command omits Grok model flags when unset", ProviderCommandOmitsGrokModelFlagsWhenUnset),
+    ("dispatch job store round-trips model and effort", DispatchJobStoreRoundTripsModelAndEffort),
+    ("dispatch job store ignores missing model fields", DispatchJobStoreIgnoresMissingModelFields),
     ("provider command preassigns a new Grok session id", ProviderCommandPreassignsGrokId),
     ("provider output parses Claude session and normalized answer", ProviderOutputParsesClaude),
     ("provider output strips Grok thought and usage metadata", ProviderOutputNormalizesGrok),
@@ -693,6 +699,19 @@ static void True(bool value)
     }
 }
 
+static int IndexOf(IReadOnlyList<string> values, string value)
+{
+    for (var index = 0; index < values.Count; index++)
+    {
+        if (values[index] == value)
+        {
+            return index;
+        }
+    }
+
+    return -1;
+}
+
 static void GrokDirectoryRanksPeers()
 {
     var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
@@ -943,6 +962,143 @@ static void ProviderCommandResumesPeers()
     True(claude.Arguments.Contains("--tools="));
     True(claude.Arguments.Contains("--strict-mcp-config"));
     True(claude.Arguments.Contains("--setting-sources="));
+}
+
+static void ProviderCommandAddsCodexModelAndEffort()
+{
+    var cmd = ProviderCommand.BuildCodex(
+        DispatchAction.Resume,
+        "thread-1",
+        "D:\\code\\app",
+        "D:\\tmp\\prompt.txt",
+        "codex.cmd",
+        model: "gpt-5.6-luna",
+        reasoningEffort: "xhigh");
+    Equal("codex.cmd", cmd.FileName);
+    Equal("exec", cmd.Arguments[0]);
+    Equal("--json", cmd.Arguments[1]);
+    var modelAt = IndexOf(cmd.Arguments, "--model");
+    True(modelAt > 0);
+    Equal("gpt-5.6-luna", cmd.Arguments[modelAt + 1]);
+    True(modelAt < IndexOf(cmd.Arguments, "resume"));
+    var cAt = IndexOf(cmd.Arguments, "-c");
+    Equal("model_reasoning_effort=xhigh", cmd.Arguments[cAt + 1]);
+    True(cmd.Arguments.Contains("thread-1"));
+    True(cmd.Arguments.Contains("-"));
+}
+
+static void ProviderCommandOmitsCodexModelFlagsWhenUnset()
+{
+    var cmd = ProviderCommand.BuildCodex(
+        DispatchAction.Resume,
+        "thread-1",
+        "D:\\code\\app",
+        "D:\\tmp\\prompt.txt",
+        "codex.cmd");
+    True(!cmd.Arguments.Contains("--model"));
+    True(!cmd.Arguments.Contains("-c"));
+    Equal("exec", cmd.Arguments[0]);
+    Equal("--json", cmd.Arguments[1]);
+    True(cmd.Arguments.Contains("resume"));
+    True(cmd.Arguments.Contains("thread-1"));
+    True(cmd.Arguments.Contains("-"));
+}
+
+static void ProviderCommandAddsGrokModelAndEffort()
+{
+    var cmd = ProviderCommand.BuildGrok(
+        DispatchAction.Resume,
+        "sess-1",
+        "D:\\code\\app",
+        "D:\\tmp\\prompt.txt",
+        grokHome: "D:\\tmp\\grok-home",
+        model: "grok-4.6",
+        reasoningEffort: "high");
+    True(cmd.Arguments.Contains("--model"));
+    True(cmd.Arguments.Contains("grok-4.6"));
+    True(cmd.Arguments.Contains("--reasoning-effort"));
+    True(cmd.Arguments.Contains("high"));
+    True(cmd.Arguments.Contains("-r"));
+    True(cmd.Arguments.Contains("sess-1"));
+}
+
+static void ProviderCommandOmitsGrokModelFlagsWhenUnset()
+{
+    var cmd = ProviderCommand.BuildGrok(
+        DispatchAction.Resume,
+        "sess-1",
+        "D:\\code\\app",
+        "D:\\tmp\\prompt.txt",
+        grokHome: "D:\\tmp\\grok-home");
+    True(!cmd.Arguments.Contains("--model"));
+    True(!cmd.Arguments.Contains("--reasoning-effort"));
+    True(cmd.Arguments.Contains("-r"));
+    True(cmd.Arguments.Contains("sess-1"));
+    True(cmd.Arguments.Contains("--prompt-file"));
+}
+
+static void DispatchJobStoreRoundTripsModelAndEffort()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-job-model-{Guid.NewGuid():N}");
+    try
+    {
+        var store = new DispatchJobStore(root);
+        var selection = new DispatchSelection(
+            "codex",
+            "thread-1",
+            "D:\\code\\app",
+            null,
+            DispatchAction.Resume,
+            "test");
+        var job = store.Create(selection, "hello");
+        job.Model = "gpt-5.6-luna";
+        job.ReasoningEffort = "xhigh";
+        store.Write(job);
+
+        var loaded = store.Require(job.JobId);
+        Equal("gpt-5.6-luna", loaded.Model);
+        Equal("xhigh", loaded.ReasoningEffort);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void DispatchJobStoreIgnoresMissingModelFields()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-old-job-{Guid.NewGuid():N}");
+    const string jobId = "pre-change-job";
+    try
+    {
+        var directory = Path.Combine(root, jobId);
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, "status.json"), $$"""
+            {
+              "jobId": "{{jobId}}",
+              "provider": "codex",
+              "action": "resume",
+              "status": "queued",
+              "createdAt": "2026-08-15T00:00:00+00:00",
+              "promptChars": 5
+            }
+            """);
+
+        var loaded = new DispatchJobStore(root).Require(jobId);
+        True(loaded.Model is null);
+        True(loaded.ReasoningEffort is null);
+        Equal(DispatchJobStatus.Queued, loaded.Status);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }
 
 static void ProviderCommandPreassignsGrokId()

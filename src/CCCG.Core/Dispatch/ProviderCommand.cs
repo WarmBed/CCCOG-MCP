@@ -15,14 +15,24 @@ public static class ProviderCommand
         string promptPath,
         string? grokHome = null,
         string? codexCommand = null,
-        string? claudeCommand = null)
+        string? claudeCommand = null,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         var work = string.IsNullOrWhiteSpace(cwd) ? Environment.CurrentDirectory : cwd;
         return provider.ToLowerInvariant() switch
         {
-            "codex" => BuildCodex(action, sessionId, work, promptPath, codexCommand),
+            "codex" => BuildCodex(
+                action, sessionId, work, promptPath, codexCommand, model, reasoningEffort),
             "claude" => BuildClaude(action, sessionId, work, promptPath, claudeCommand),
-            _ => BuildGrok(action, sessionId, work, promptPath, grokHome)
+            _ => BuildGrok(
+                action,
+                sessionId,
+                work,
+                promptPath,
+                grokHome,
+                model: model,
+                reasoningEffort: reasoningEffort)
         };
     }
 
@@ -32,7 +42,9 @@ public static class ProviderCommand
         string cwd,
         string promptPath,
         string? grokHome,
-        string? newSessionId = null)
+        string? newSessionId = null,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         var file = ResolveGrok(grokHome);
         var args = new List<string>
@@ -43,6 +55,18 @@ public static class ProviderCommand
             "--permission-mode", "acceptEdits",
             "--no-auto-update"
         };
+        if (!string.IsNullOrWhiteSpace(model))
+        {
+            args.Add("--model");
+            args.Add(model);
+        }
+
+        if (!string.IsNullOrWhiteSpace(reasoningEffort))
+        {
+            args.Add("--reasoning-effort");
+            args.Add(reasoningEffort);
+        }
+
         if (action != DispatchAction.Create)
         {
             if (string.IsNullOrWhiteSpace(sessionId))
@@ -67,12 +91,26 @@ public static class ProviderCommand
         string? sessionId,
         string cwd,
         string promptPath,
-        string? codexCommand)
+        string? codexCommand,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         var file = string.IsNullOrWhiteSpace(codexCommand)
             ? ResolveCodex()
             : codexCommand;
         var args = new List<string> { "exec", "--json" };
+        if (!string.IsNullOrWhiteSpace(model))
+        {
+            args.Add("--model");
+            args.Add(model);
+        }
+
+        if (!string.IsNullOrWhiteSpace(reasoningEffort))
+        {
+            args.Add("-c");
+            args.Add("model_reasoning_effort=" + reasoningEffort);
+        }
+
         if (action == DispatchAction.Create)
         {
             args.AddRange(new[] { "--skip-git-repo-check", "-" });
