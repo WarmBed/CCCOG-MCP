@@ -1,6 +1,21 @@
 namespace CCCG.Core.Providers;
 
 /// <summary>
+/// The provider connection itself failed (child process died, pipe broke) —
+/// as opposed to the provider running the turn and reporting an error. The
+/// owner daemon counts consecutive occurrences and exits cleanly (releasing
+/// its lease and registration so resume fallback works) once the transport
+/// keeps failing after rebuilds.
+/// </summary>
+public sealed class ProviderTransportException : Exception
+{
+    public ProviderTransportException(string message, Exception? inner = null)
+        : base(message, inner)
+    {
+    }
+}
+
+/// <summary>
 /// A stateful, long-lived connection to one provider session. The transport
 /// keeps the provider child's stdin open across turns; each
 /// <see cref="RunTurnAsync"/> call is one full turn whose returned text is the
@@ -50,14 +65,27 @@ public sealed class CodexOwnerTurnTransport : IProviderTurnTransport
         string text,
         CancellationToken cancellationToken = default)
     {
-        var completion = await client.CompleteAsync(
-            text,
-            model,
-            reasoningEffort,
-            cwd,
-            outputSchema: null,
-            cancellationToken).ConfigureAwait(false);
-        return completion.Text;
+        try
+        {
+            var completion = await client.CompleteAsync(
+                text,
+                model,
+                reasoningEffort,
+                cwd,
+                outputSchema: null,
+                cancellationToken).ConfigureAwait(false);
+            return completion.Text;
+        }
+        catch (Exception exception) when (exception is EndOfStreamException or IOException)
+        {
+            // The persistent client already tore its broken transport down and
+            // will spawn a fresh codex app-server on the next turn; surface
+            // the failure typed so the owner daemon can count it.
+            throw new ProviderTransportException(
+                "The codex app-server connection failed: " + exception.Message
+                + " The transport was torn down and will be rebuilt on the next turn.",
+                exception);
+        }
     }
 
     public ValueTask DisposeAsync() => client.DisposeAsync();

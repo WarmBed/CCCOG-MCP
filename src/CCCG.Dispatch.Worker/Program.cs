@@ -174,6 +174,15 @@ static class OwnerMode
         {
             daemon.Run(stop.Token);
         }
+        catch (ProviderTransportException exception)
+        {
+            // The provider child kept dying across rebuilds. Exit cleanly:
+            // `using` disposes the daemon (unregister + lease release), so
+            // dispatch immediately falls back to the resume path instead of
+            // spooling into a lease-holding black hole.
+            Console.Error.WriteLine(exception.Message);
+            return 5;
+        }
         finally
         {
             transport.DisposeAsync().AsTask().GetAwaiter().GetResult();

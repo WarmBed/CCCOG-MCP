@@ -16,6 +16,8 @@ public sealed class OwnerDaemon : IDisposable
     private readonly string provider;
     private readonly string cwd;
     private readonly TimeSpan pollInterval;
+    private readonly int transportFailureLimit;
+    private int consecutiveTransportFailures;
     private string? sessionId;
     private string? key;
     private FileStream? workspaceLease;
@@ -30,17 +32,20 @@ public sealed class OwnerDaemon : IDisposable
         string? sessionId,
         IProviderTurnTransport transport,
         OwnerRegistry? registry = null,
-        TimeSpan? pollInterval = null)
+        TimeSpan? pollInterval = null,
+        int transportFailureLimit = 3)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(provider);
         ArgumentException.ThrowIfNullOrWhiteSpace(cwd);
         ArgumentNullException.ThrowIfNull(transport);
+        ArgumentOutOfRangeException.ThrowIfLessThan(transportFailureLimit, 1);
         this.provider = provider.Trim().ToLowerInvariant();
         this.cwd = Path.GetFullPath(cwd);
         this.sessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
         this.transport = transport;
         this.registry = registry ?? new OwnerRegistry();
         this.pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
+        this.transportFailureLimit = transportFailureLimit;
     }
 
     public OwnerRegistration? Registration => registration;
@@ -132,6 +137,7 @@ public sealed class OwnerDaemon : IDisposable
             try
             {
                 var response = transport.RunTurnAsync(labeled).GetAwaiter().GetResult();
+                consecutiveTransportFailures = 0;
                 RefreshSessionIdentity();
                 spool.WriteReceipt(new OwnerReceipt(
                     message.MessageId,
@@ -142,6 +148,13 @@ public sealed class OwnerDaemon : IDisposable
             }
             catch (Exception exception) when (exception is not OutOfMemoryException)
             {
+                // Transport-level deaths count toward the exit limit; provider
+                // errors on a healthy transport do not.
+                if (exception is ProviderTransportException)
+                {
+                    consecutiveTransportFailures++;
+                }
+
                 spool.WriteReceipt(new OwnerReceipt(
                     message.MessageId,
                     OwnerReceiptStatus.Failed,
@@ -182,12 +195,30 @@ public sealed class OwnerDaemon : IDisposable
         }
     }
 
+    /// <summary>
+    /// Consecutive transport-level turn failures since the last success.
+    /// Rebuild-with-retry: each failed turn already tore the transport down
+    /// and the next turn rebuilds it; once <c>transportFailureLimit</c>
+    /// rebuild attempts fail in a row, <see cref="Run"/> exits so the caller
+    /// disposes the daemon (releasing the leases and registration) and
+    /// dispatch falls back to the resume path instead of feeding a black hole.
+    /// </summary>
+    public int ConsecutiveTransportFailures => consecutiveTransportFailures;
+
     public void Run(CancellationToken cancellationToken)
     {
         Start();
         while (!cancellationToken.IsCancellationRequested)
         {
             ProcessPendingOnce();
+            if (consecutiveTransportFailures >= transportFailureLimit)
+            {
+                throw new ProviderTransportException(
+                    $"The {provider} transport failed {consecutiveTransportFailures} consecutive "
+                    + "turns despite rebuilds; the owner daemon is exiting so its lease and "
+                    + "registration are released and dispatch falls back to resume.");
+            }
+
             cancellationToken.WaitHandle.WaitOne(pollInterval);
         }
     }

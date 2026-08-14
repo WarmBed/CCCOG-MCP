@@ -56,6 +56,8 @@ public sealed class PersistentCodexAppServerClient : IAsyncDisposable
         await turnGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            try
+            {
             await EnsureSessionAsync(model, cwd, cancellationToken).ConfigureAwait(false);
             var currentThreadId = threadId!;
             var turnParameters = new Dictionary<string, object?>
@@ -191,12 +193,53 @@ public sealed class PersistentCodexAppServerClient : IAsyncDisposable
                     wasRerouted,
                     rerouteReason);
             }
+            }
+            catch (Exception exception) when (exception is EndOfStreamException or IOException)
+            {
+                // Transport-level death (app-server exited, pipe broke): the
+                // dead transport must not be kept — every later turn would
+                // fail against it forever. Tear it down so the next
+                // CompleteAsync spawns a fresh app-server and resumes the
+                // bound thread.
+                await TeardownTransportAsync().ConfigureAwait(false);
+                throw;
+            }
         }
         finally
         {
             activeTurnId = null;
             turnGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Discards a broken transport (and its lease, pending queue, and thread
+    /// identity) so the next turn rebuilds from the persisted thread binding.
+    /// Runs under <see cref="turnGate"/>.
+    /// </summary>
+    private async Task TeardownTransportAsync()
+    {
+        pending.Clear();
+        threadId = null;
+        activeTurnId = null;
+        var broken = transport;
+        transport = null;
+        if (broken is not null)
+        {
+            try
+            {
+                await broken.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+                when (exception is IOException or InvalidOperationException or OperationCanceledException)
+            {
+                // Disposing an already-dead process can fail; the rebuild is
+                // what matters.
+            }
+        }
+
+        lease?.Dispose();
+        lease = null;
     }
 
     public async Task<bool> InterruptAsync(CancellationToken cancellationToken = default)

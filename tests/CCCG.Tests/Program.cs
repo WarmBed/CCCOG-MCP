@@ -75,6 +75,7 @@ var tests = new (string Name, Action Run)[]
     ("owner spool preserves Chinese text byte-exactly through the turn roundtrip", OwnerSpoolPreservesChineseTextBytes),
     ("owner daemon fails abandoned processing turns as unknown outcome without re-running", OwnerDaemonFailsAbandonedProcessingTurns),
     ("second owner daemon in the same workspace fails fast", SecondOwnerInSameWorkspaceFailsFast),
+    ("owner daemon exits after repeated transport failures so the lease releases", OwnerDaemonExitsAfterRepeatedTransportFailures),
     ("dispatch deliver fails when the owner dies mid-delivery", DispatchDeliverFailsWhenOwnerDies),
     ("dispatch deliver succeeds and posts a placeholder for an empty provider reply", DispatchDeliverEmptyReplySucceedsWithPlaceholder),
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
@@ -1580,6 +1581,36 @@ static void SecondOwnerInSameWorkspaceFailsFast()
     using var elsewhere = new OwnerDaemon(
         "codex", "D:\\code\\other", "sess-3", new EchoTurnTransport(_ => "ok"), registry);
     elsewhere.Start();
+}
+
+static void OwnerDaemonExitsAfterRepeatedTransportFailures()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-transport-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    var transport = new EchoTurnTransport(_ =>
+        throw new ProviderTransportException("codex app-server died", new EndOfStreamException()));
+    using var daemon = new OwnerDaemon(
+        "codex", "D:\\code\\app", "sess-1", transport, registry,
+        TimeSpan.FromMilliseconds(10), transportFailureLimit: 2);
+    var registration = daemon.Start();
+    var spool = new OwnerSpool(registration.SpoolDir);
+    spool.Post(new OwnerMessage("t1", "claude", null, "first", DateTimeOffset.UtcNow));
+    spool.Post(new OwnerMessage("t2", "claude", null, "second", DateTimeOffset.UtcNow.AddMilliseconds(1)));
+
+    using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    Throws<ProviderTransportException>(() => daemon.Run(stop.Token));
+    True(!stop.IsCancellationRequested); // exited by policy, not by the timeout
+    Equal(2, daemon.ConsecutiveTransportFailures);
+    Equal(OwnerReceiptStatus.Failed, spool.TryReadReceipt("t1")!.Status);
+    Equal(OwnerReceiptStatus.Failed, spool.TryReadReceipt("t2")!.Status);
+
+    // Disposing (what run-owner does on exit) releases the lease so TryFind
+    // no longer routes to this dead owner and resume fallback works.
+    var key = OwnerRegistry.Key("codex", "D:\\code\\app", "sess-1");
+    True(registry.LeaseIsHeld(key));
+    daemon.Dispose();
+    True(!registry.LeaseIsHeld(key));
+    True(registry.TryFind("codex", "sess-1", null) is null);
 }
 
 static void DispatchDeliverFailsWhenOwnerDies()
