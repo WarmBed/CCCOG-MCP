@@ -72,6 +72,7 @@ var tests = new (string Name, Action Run)[]
     ("owner daemon turns spooled messages into receipts", OwnerDaemonProcessesSpool),
     ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
     ("dispatch deliver fails when the owner dies mid-delivery", DispatchDeliverFailsWhenOwnerDies),
+    ("dispatch deliver succeeds and posts a placeholder for an empty provider reply", DispatchDeliverEmptyReplySucceedsWithPlaceholder),
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
     ("grok resume read-back fails when no turn is recorded", GrokResumeReadBackFails),
     ("provider command resumes grok codex and claude", ProviderCommandResumesPeers),
@@ -1490,6 +1491,34 @@ static void DispatchDeliverFailsWhenOwnerDies()
     var done = runner.Run(job.JobId);
     Equal(DispatchJobStatus.Failed, done.Status);
     True(done.Error?.Contains("exited before", StringComparison.Ordinal) == true);
+}
+
+static void DispatchDeliverEmptyReplySucceedsWithPlaceholder()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-empty-reply-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(Path.Combine(root, "owners"));
+    var transport = new EchoTurnTransport(_ => "   ");
+    using var owner = new BackgroundOwner(new OwnerDaemon(
+        "codex", "D:\\code\\app", "sess-1", transport, registry, TimeSpan.FromMilliseconds(20)));
+    var inbox = new InboxLedger(Path.Combine(root, "inbox"));
+    var runner = new DispatchRunner(
+        new DispatchJobStore(Path.Combine(root, "jobs")),
+        _ =>
+        [
+            new Peer("codex", "sess-1", PeerStatus.LiveIdle, "D:\\code\\app", "Idle", null, null, 9, null, null, null)
+        ],
+        new FakeProcessLauncher("SHOULD-NOT-LAUNCH"),
+        inbox: inbox,
+        owners: registry,
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        deliverWaitTimeout: TimeSpan.FromSeconds(10));
+    var job = runner.Enqueue("codex", "hello", "sess-1", "D:\\code\\app", allowNew: false);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    Equal("delivered", done.ReceiptStatus);
+    Equal(DispatchJobStatus.Succeeded, runner.Status(job.JobId).Status);
+    var posted = inbox.List().Single(message => message.FromRole == "codex");
+    Equal("(empty response)", posted.Content);
 }
 
 static void GrokResumeReadBackPasses()

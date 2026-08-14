@@ -292,18 +292,21 @@ public sealed class DispatchRunner
                 bindings?.Save(selection.Provider, resolvedSessionId, selection.Cwd, managedByCccg: true);
             }
 
+            // Persist the terminal status BEFORE the inbox post: the provider
+            // turn already ran, so a post-success bookkeeping failure must not
+            // relabel the job Failed (the caller would retry a consumed turn).
+            store.Write(job);
             inbox?.Post(
                 selection.Provider,
                 "claude",
-                ProviderOutputParser.CollectResponse(
+                NonEmptyContent(ProviderOutputParser.CollectResponse(
                     selection.Provider,
                     store.StdoutPath(job.JobId),
-                    2000),
+                    2000)),
                 fromProvider: selection.Provider,
                 fromSessionId: resolvedSessionId,
                 toProvider: "claude",
                 jobId: job.JobId);
-            store.Write(job);
             return job;
             }
             finally
@@ -314,6 +317,14 @@ public sealed class DispatchRunner
         catch (Exception exception)
         {
             job = store.Require(jobId);
+            if (job.Status == DispatchJobStatus.Succeeded)
+            {
+                // The provider turn completed and Succeeded was persisted; a
+                // failure after that point (e.g. inbox bookkeeping) must not
+                // relabel a delivered turn as Failed.
+                return job;
+            }
+
             job.Status = DispatchJobStatus.Failed;
             job.Error = exception.Message;
             job.FinishedAt = DateTimeOffset.UtcNow;
@@ -524,20 +535,31 @@ public sealed class DispatchRunner
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         job.Status = DispatchJobStatus.Succeeded;
         job.ExitCode = 0;
+        // Persist Succeeded BEFORE the inbox post: the receipt proves the
+        // provider ran the turn and the spool message is consumed, so nothing
+        // after this point may downgrade the job to Failed.
+        store.Write(job);
         inbox?.Post(
             selection.Provider,
             "claude",
-            ProviderOutputParser.CollectResponse(
+            NonEmptyContent(ProviderOutputParser.CollectResponse(
                 selection.Provider,
                 store.StdoutPath(job.JobId),
-                2000),
+                2000)),
             fromProvider: selection.Provider,
             fromSessionId: selection.SessionId,
             toProvider: "claude",
             jobId: job.JobId);
-        store.Write(job);
         return job;
     }
+
+    /// <summary>
+    /// Inbox content guard: <see cref="InboxLedger.Post"/> rejects null or
+    /// whitespace, but a provider turn can legitimately produce an empty
+    /// reply. The delivered turn must never be mislabeled Failed over it.
+    /// </summary>
+    private static string NonEmptyContent(string? content) =>
+        string.IsNullOrWhiteSpace(content) ? "(empty response)" : content;
 
     private int? FindGrokMessageCount(string sessionId) =>
         listPeers("grok").FirstOrDefault(peer =>
