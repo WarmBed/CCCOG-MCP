@@ -1,7 +1,7 @@
 # PATH A — CCCG-owned provider sessions
 
-Status: implemented (Worker-only). Baseline `7cfddcf` (57 tests) → this branch
-(63 tests, all green).
+Status: implemented (Worker-only). Baseline `7cfddcf` (57 tests) → PATH A
+(63 tests) → post-review hardening (69 tests, all green).
 
 ## Why
 
@@ -13,8 +13,16 @@ peers was keystroke injection (`DispatchAction.Inject`,
 never "the provider consumed them", and it fought focus, IME, and window
 state. PATH A replaces routing to it entirely.
 
-**Delivery semantics:** a job is `succeeded` only when the provider actually
-ran the message as a turn and produced a reply. Anything less is `failed`.
+**Delivery semantics: exactly-once-or-known-failure.** A job is `succeeded`
+only when the provider actually ran the message as a turn and produced a
+reply; `succeeded` is persisted the moment the delivered receipt is recorded,
+before any inbox bookkeeping, so a delivered turn can never be relabeled
+`failed` afterwards (empty replies post the placeholder `(empty response)`).
+A message is executed by the provider **at most once**: the owner claims it
+into `processing\` before the turn, so an owner that dies mid-turn produces a
+`failed` receipt with *unknown outcome* on restart instead of replaying the
+turn. Every other outcome is `failed` with a diagnostic that says whether the
+message was consumed or its outcome is unknown.
 
 ## Architecture
 
@@ -46,19 +54,40 @@ cccg-dispatch-worker.exe run-owner --provider codex --cwd D:\code\x
 On start it prints one JSON line: `{ok, mode, provider, sessionId, cwd,
 ownerPid, spoolDir}`. It then:
 
-1. acquires a **DeleteOnClose ownership lease** (same pattern as
-   `CodexThreadBindingStore.AcquireLease`) — process death releases it
-   automatically, so a dead owner can never look alive;
-2. registers itself in the **owner registry** (below);
-3. keeps a stateful provider transport with **stdin kept open**
-   (`IProviderTurnTransport`);
-4. tails its spool (~250 ms poll), runs each message as a provider turn
-   prefixed with `[CCCG message from <fromRole> <fromSessionId>]`, and writes
-   a **receipt only after the turn completed**.
+1. acquires a **workspace lease** (`key = sha256(provider|cwd|_)`) — one
+   workspace gets exactly one owner, so a second `run-owner` on the same
+   provider+cwd fails fast with a clear message even when the per-session
+   keys differ (workspace mode uses a synthetic GUID session id);
+2. acquires the **per-session DeleteOnClose ownership lease** (same pattern
+   as `CodexThreadBindingStore.AcquireLease`) — process death releases both
+   leases automatically, so a dead owner can never look alive;
+3. sweeps its spool's `processing\` directory: messages a previous owner
+   claimed but never receipted get a `failed` receipt with
+   `unknown outcome: the previous owner died mid-turn` and are **not**
+   re-run;
+4. registers itself in the **owner registry** (below);
+5. keeps a stateful provider transport with **stdin kept open**
+   (`IProviderTurnTransport`); the provider child sits in a best-effort
+   Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so a
+   hard-killed owner takes the child down instead of orphaning it;
+6. tails its spool (~250 ms poll), claims each message into `processing\`,
+   runs it as a provider turn prefixed with the **single** sender label
+   `[CCCG message from <fromRole> <fromSessionId>]` (Deliver spools the raw
+   prompt — the legacy `[CCCG dispatch from ...]` header never reaches an
+   owned provider), and writes a **receipt only after the turn completed**.
 
-`Ctrl+C` stops it cleanly (unregisters + releases the lease); a hard kill
-releases the lease via DeleteOnClose and leaves a stale registration file
-that the registry ignores.
+**Transport rebuild + exit policy.** A transport-level failure (codex
+app-server death, broken pipe) tears the transport down; the next spooled
+turn spawns a fresh app-server and resumes the bound thread. After 3
+consecutive transport failures (`OwnerDaemon` `transportFailureLimit`,
+counter resets on success) the daemon exits with code 5, releasing both
+leases and the registration so dispatch immediately falls back to the resume
+path instead of spooling into a lease-holding black hole. Provider errors on
+a healthy transport write `failed` receipts but never trigger the exit.
+
+`Ctrl+C` stops it cleanly (unregisters + releases the leases); a hard kill
+releases the leases via DeleteOnClose and leaves a stale registration file
+that the registry ignores and deletes on the next lookup.
 
 ### Owner registry
 
@@ -68,6 +97,7 @@ that the registry ignores.
 |---|---|
 | `<key>.json` | registration, written via `CrossProcessFileGate.AtomicWriteAllText` |
 | `<key>.lock` | DeleteOnClose ownership lease; held ⇔ owner alive |
+| `<workspace-key>.lock` | workspace lease (`sessionId = "_"`); enforces one owner per provider+cwd |
 | `<key>\spool\` | that owner's delivery queue |
 
 `key = sha256(provider \| normalized-cwd \| sessionId)` (lowercase hex).
@@ -87,9 +117,13 @@ Registration schema (schemaVersion 1):
 ```
 
 Stale detection mirrors `CodexPeerDirectory.LockIsHeld`: a registration
-counts only while its lease file exists **and** cannot be opened exclusively.
+counts only while its lease file exists **and** is held (the probe opens
+read-only with permissive sharing so it cannot break a concurrent legitimate
+`AcquireLease`, which additionally retries once).
 `OwnerRegistry.TryFind(provider, sessionId, cwd)` matches by session id when
-one is given, else by workspace, and never returns a stale entry.
+one is given, else by workspace, and never returns a stale entry; stale
+registrations it scans past are deleted, along with their per-key directory
+when it holds no files (spools with pending messages or receipts are kept).
 
 If the daemon starts without `--session-id` it registers a synthetic GUID and
 **rewrites the registration with the provider-native id** (Codex thread id)
@@ -100,14 +134,19 @@ then the session is addressable by `cwd`.
 
 - `<spoolDir>\incoming\<yyyyMMddTHHmmssfff>_<messageId>.json` =
   `{messageId, fromRole, fromSessionId, text, createdAt}`
+- `<spoolDir>\processing\` — the message currently (or last) being run; a
+  leftover here after a crash means the turn outcome is unknown
 - `<spoolDir>\receipts\<messageId>.json` =
   `{messageId, status: delivered|failed, deliveredAt, responseText, error}`
 
-The owner consumes incoming files in filename order, writes the receipt, then
-deletes the incoming file. A receipt with `status=delivered` is the **only**
+The owner consumes incoming files in filename order: it **claims** the file
+into `processing\`, runs the provider turn, writes the receipt, then deletes
+the processing file. A receipt with `status=delivered` is the **only**
 success signal; it is written strictly after the provider turn returned.
 A failed turn produces a `failed` receipt (the message is consumed, not
-retried — the dispatcher surfaces the error and the sender decides).
+retried — the dispatcher surfaces the error and the sender decides). A crash
+between claim and receipt yields an unknown-outcome `failed` receipt at the
+next startup, never a replay.
 
 ### Dispatch integration (Worker-only, zero MCP schema changes)
 
@@ -119,14 +158,20 @@ retried — the dispatcher surfaces the error and the sender decides).
   grok/codex peers route to `Deliver` when owned; auto-selection only picks a
   live-idle grok/codex peer when it is owned, otherwise falls through to
   resume/create.
-- `Deliver` in `DispatchRunner`: posts the job prompt into the spool
-  (`messageId = jobId`), then polls for the receipt (250 ms default,
-  2 h timeout like every other wait). `succeeded` **only** on
-  `receipt.status == delivered`; `responseText` is written to the job's
-  `stdout.log`, so `cccg_job_collect` works unchanged. If the owner pid dies
-  without a receipt the job fails with a diagnostic. Deliver does not take
-  the per-workspace lease — the owner serializes its own turns
-  (`PersistentCodexAppServerClient` turnGate).
+- `Deliver` in `DispatchRunner`: posts the job's **raw** prompt
+  (`prompt.raw.txt`, no dispatch header) into the spool (`messageId =
+  jobId`), then polls for the receipt (250 ms default, 2 h timeout like every
+  other wait). The owner is re-resolved by session id **and** by workspace so
+  a concurrent `RefreshSessionIdentity` swap cannot fake a
+  "released its lease" failure. During the wait, owner liveness is the
+  **lease** (`OwnerRegistry.LeaseIsHeld` on the entry's key), not the PID —
+  PID reuse could otherwise keep a dead owner "alive" for the whole timeout.
+  `succeeded` **only** on `receipt.status == delivered`, persisted before the
+  inbox post; `responseText` is written to the job's `stdout.log`, so
+  `cccg_job_collect` works unchanged. If the owner's lease releases without a
+  receipt the job fails fast with an unknown-outcome diagnostic. Deliver does
+  not take the per-workspace dispatch lease — the owner serializes its own
+  turns (`PersistentCodexAppServerClient` turnGate).
 - New `DispatchJob` fields, all `JsonPropertyName` + null-ignored (old JSON
   keeps deserializing): `ownerPid`, `receiptStatus`, `deliveredAt`,
   `peerTurnsBefore`, `peerTurnsAfter`.
@@ -225,13 +270,19 @@ Would need Host/MCP schema work later:
 | Behavior | Test |
 |---|---|
 | registry write + stale detection | `owner registry registers and detects a stale owner` |
+| stale registration cleanup, non-empty spools kept | `owner registry cleans stale registrations but keeps non-empty spools` |
 | spool → receipt roundtrip (fake transport) | `owner daemon turns spooled messages into receipts` |
 | failed turn → failed receipt | `owner daemon writes a failed receipt when the provider turn fails` |
+| Chinese text byte-exact through spool/turn/receipt | `owner spool preserves Chinese text byte-exactly through the turn roundtrip` |
+| crashed owner's claimed turn → unknown-outcome receipt, no replay | `owner daemon fails abandoned processing turns as unknown outcome without re-running` |
+| one owner per workspace | `second owner daemon in the same workspace fails fast` |
+| transport failure limit → clean exit + lease release | `owner daemon exits after repeated transport failures so the lease releases` |
 | Deliver selection when lease held | `peer selector delivers to an explicit owned live peer and fails closed otherwise` |
-| owner dies mid-delivery → job fails | `dispatch deliver fails when the owner dies mid-delivery` |
+| owner lease releases mid-delivery → fast unknown-outcome failure | `dispatch deliver fails when the owner dies mid-delivery` |
+| empty provider reply → still succeeded + inbox placeholder | `dispatch deliver succeeds and posts a placeholder for an empty provider reply` |
 | Inject never selected for grok/codex | `dispatch runner refuses keystroke injection for an unowned live window` |
 | Deliver ignores workspace lease | `dispatch runner deliver does not wait for a held workspace lease` |
-| end-to-end deliver via owner daemon | `dispatch runner delivers through the owner daemon to a live-idle peer` |
+| end-to-end deliver via owner daemon (single sender label) | `dispatch runner delivers through the owner daemon to a live-idle peer` |
 | read-back pass / fail | `grok resume read-back confirms the recorded turn` / `... fails when no turn is recorded` |
 
 ## Build, test, install
@@ -239,7 +290,7 @@ Would need Host/MCP schema work later:
 ```powershell
 dotnet build src/CCCG.Dispatch.Worker/CCCG.Dispatch.Worker.csproj -c Release
 dotnet build src/CCCG.Dispatch/CCCG.Dispatch.csproj -c Release
-dotnet run --project tests/CCCG.Tests/CCCG.Tests.csproj -c Release   # 63/63
+dotnet run --project tests/CCCG.Tests/CCCG.Tests.csproj -c Release   # 69/69
 
 # hot-install the worker (unchanged pipeline; bump the version)
 powershell -File scripts\install-dispatch-worker.ps1 -Version 0.6.0
