@@ -73,6 +73,7 @@ var tests = new (string Name, Action Run)[]
     ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
     ("owner spool preserves Chinese text byte-exactly through the turn roundtrip", OwnerSpoolPreservesChineseTextBytes),
     ("owner daemon fails abandoned processing turns as unknown outcome without re-running", OwnerDaemonFailsAbandonedProcessingTurns),
+    ("second owner daemon in the same workspace fails fast", SecondOwnerInSameWorkspaceFailsFast),
     ("dispatch deliver fails when the owner dies mid-delivery", DispatchDeliverFailsWhenOwnerDies),
     ("dispatch deliver succeeds and posts a placeholder for an empty provider reply", DispatchDeliverEmptyReplySucceedsWithPlaceholder),
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
@@ -1517,6 +1518,35 @@ static void OwnerDaemonFailsAbandonedProcessingTurns()
     True(!File.Exists(processingPath));
     Equal(0, daemon.ProcessPendingOnce());
     Equal(0, transport.Turns.Count);
+}
+
+static void SecondOwnerInSameWorkspaceFailsFast()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-dup-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    using var first = new OwnerDaemon(
+        "codex", "D:\\code\\app", "sess-1", new EchoTurnTransport(_ => "ok"), registry);
+    first.Start();
+
+    // Different session id, same provider + cwd: the per-session keys differ,
+    // so only the workspace lease can make these two collide.
+    using var second = new OwnerDaemon(
+        "codex", "D:\\code\\app", "sess-2", new EchoTurnTransport(_ => "ok"), registry);
+    try
+    {
+        second.Start();
+        throw new InvalidDataException("Expected the second same-workspace owner to fail fast.");
+    }
+    catch (InvalidOperationException exception)
+    {
+        True(exception.Message.Contains("already running", StringComparison.Ordinal));
+        True(exception.Message.Contains("app", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // A different workspace is unaffected.
+    using var elsewhere = new OwnerDaemon(
+        "codex", "D:\\code\\other", "sess-3", new EchoTurnTransport(_ => "ok"), registry);
+    elsewhere.Start();
 }
 
 static void DispatchDeliverFailsWhenOwnerDies()

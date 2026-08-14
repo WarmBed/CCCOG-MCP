@@ -18,6 +18,7 @@ public sealed class OwnerDaemon : IDisposable
     private readonly TimeSpan pollInterval;
     private string? sessionId;
     private string? key;
+    private FileStream? workspaceLease;
     private FileStream? lease;
     private OwnerSpool? spool;
     private OwnerRegistration? registration;
@@ -53,6 +54,29 @@ public sealed class OwnerDaemon : IDisposable
         }
 
         sessionId ??= transport.SessionId ?? Guid.NewGuid().ToString();
+
+        // Workspace-scoped lease FIRST: the per-session key contains the
+        // (possibly synthetic GUID) session id, so two owners started without
+        // --session-id in the same cwd would otherwise never collide and
+        // TryFind-by-workspace would return an arbitrary one. One workspace,
+        // one owner.
+        if (workspaceLease is null)
+        {
+            var workspaceKey = OwnerRegistry.Key(provider, cwd, sessionId: null);
+            try
+            {
+                workspaceLease = registry.AcquireLease(workspaceKey);
+            }
+            catch (InvalidOperationException exception)
+            {
+                throw new InvalidOperationException(
+                    $"Another CCCG owner daemon is already running for {provider} in "
+                    + $"'{cwd}'. One workspace gets exactly one owner; stop the other "
+                    + "daemon (or pick a different --cwd) first.",
+                    exception);
+            }
+        }
+
         key = OwnerRegistry.Key(provider, cwd, sessionId);
         lease = registry.AcquireLease(key);
         spool = new OwnerSpool(registry.SpoolDirectory(key));
@@ -206,5 +230,6 @@ public sealed class OwnerDaemon : IDisposable
         }
 
         lease?.Dispose();
+        workspaceLease?.Dispose();
     }
 }
