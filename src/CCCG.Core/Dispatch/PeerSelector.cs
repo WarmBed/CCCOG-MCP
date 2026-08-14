@@ -5,7 +5,8 @@ public enum DispatchAction
     Attach,
     Resume,
     Create,
-    Inject
+    Inject,
+    Deliver
 }
 
 public sealed record DispatchSelection(
@@ -26,7 +27,8 @@ public static class PeerSelector
         string? sessionId,
         string? cwd,
         bool allowNew,
-        string? boundSessionId = null)
+        string? boundSessionId = null,
+        Func<Peer, bool>? hasLiveOwner = null)
     {
         provider = provider.Trim().ToLowerInvariant();
         if (!string.IsNullOrWhiteSpace(sessionId))
@@ -47,13 +49,14 @@ public static class PeerSelector
                     + "then deliver through mcp__ccd_session_mgmt__send_message; the Desktop session id returned there is authoritative.");
             }
 
+            var matchOwned = hasLiveOwner?.Invoke(match) == true;
             return new DispatchSelection(
                 provider,
                 match.SessionId,
                 FirstNonEmpty(cwd, match.Cwd),
                 match.Title,
-                LiveAction(provider, match.Status),
-                LiveReason(provider, match.Status),
+                LiveAction(provider, match.Status, matchOwned),
+                LiveReason(provider, match.Status, matchOwned),
                 Pid: match.Pid);
         }
 
@@ -70,13 +73,16 @@ public static class PeerSelector
                     bound.SessionId,
                     FirstNonEmpty(cwd, bound.Cwd),
                     bound.Title,
-                    LiveAction(provider, bound.Status),
+                    LiveAction(provider, bound.Status, hasLiveOwner?.Invoke(bound) == true),
                     "Using the bound peer for this workspace.",
                     Pid: bound.Pid);
             }
         }
 
-        var idle = ranked.FirstOrDefault(peer => peer.Status == PeerStatus.LiveIdle);
+        // Live grok/codex peers are auto-selectable only when a CCCG owner
+        // daemon runs them; unowned live windows are never keystroke targets.
+        var idle = ranked.FirstOrDefault(peer => peer.Status == PeerStatus.LiveIdle
+            && (provider is not ("grok" or "codex") || hasLiveOwner?.Invoke(peer) == true));
         if (idle is not null)
         {
             return new DispatchSelection(
@@ -84,7 +90,7 @@ public static class PeerSelector
                 idle.SessionId,
                 FirstNonEmpty(cwd, idle.Cwd),
                 idle.Title,
-                LiveAction(provider, idle.Status),
+                LiveAction(provider, idle.Status, hasOwner: provider is "grok" or "codex"),
                 "Using a live-idle peer.",
                 Pid: idle.Pid);
         }
@@ -116,12 +122,26 @@ public static class PeerSelector
             "No live or resumable peer; creating a new session.");
     }
 
-    internal static DispatchAction LiveAction(string provider, string status)
+    public const string OwnedDeliveryReason =
+        "Delivering into the CCCG-owned session's spool as a new turn.";
+
+    internal static DispatchAction LiveAction(string provider, string status, bool hasOwner = false)
     {
         if (status.StartsWith("live-", StringComparison.Ordinal)
             && provider is "grok" or "codex")
         {
-            return DispatchAction.Inject;
+            if (hasOwner)
+            {
+                return DispatchAction.Deliver;
+            }
+
+            // Keystroke injection (DispatchAction.Inject) is deprecated: it
+            // could never prove the provider consumed the text. Unowned live
+            // sessions fail closed instead.
+            throw new InvalidOperationException(
+                $"The live {provider} session is not CCCG-owned; CCCG no longer types into "
+                + "live windows. Relaunch it via 'cccg-dispatch-worker.exe run-owner "
+                + $"--provider {provider}' or close it to use resume.");
         }
 
         return status.StartsWith("live-", StringComparison.Ordinal)
@@ -129,11 +149,11 @@ public static class PeerSelector
             : DispatchAction.Resume;
     }
 
-    internal static string LiveReason(string provider, string status)
+    internal static string LiveReason(string provider, string status, bool hasOwner = false)
     {
         if (provider is "grok" or "codex" && status.StartsWith("live-", StringComparison.Ordinal))
         {
-            return "Typing into the live window as a new turn.";
+            return OwnedDeliveryReason;
         }
 
         return status == PeerStatus.LiveIdle

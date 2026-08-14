@@ -60,14 +60,20 @@ var tests = new (string Name, Action Run)[]
     ("codex directory fills parent cwd from subagent rollouts", CodexDirectoryFillsParentFromSubagentOnly),
     ("claude directory lists transcripts and marks live Desktop writers", ClaudeDirectoryListsAndMarksLive),
     ("claude directory ignores dead session registry entries", ClaudeDirectoryIgnoresDeadRegistry),
-    ("peer selector prefers live idle then resume then create", PeerSelectorPrefersIdle),
+    ("peer selector skips unowned live peers and delivers to owned ones", PeerSelectorPrefersIdle),
     ("peer selector rejects a working session", PeerSelectorRejectsWorking),
-    ("peer selector inserts an explicit live grok or codex session", PeerSelectorInsertsExplicitLivePeer),
-    ("dispatch runner types into a live window instead of launching a process", DispatchRunnerInjectsLiveWindow),
-    ("dispatch runner inject does not wait for a held workspace lease", DispatchRunnerInjectSkipsWorkspaceLease),
+    ("peer selector delivers to an explicit owned live peer and fails closed otherwise", PeerSelectorInsertsExplicitLivePeer),
+    ("dispatch runner refuses keystroke injection for an unowned live window", DispatchRunnerRefusesUnownedLiveWindow),
+    ("dispatch runner deliver does not wait for a held workspace lease", DispatchRunnerDeliverSkipsWorkspaceLease),
     ("live injector builds unicode key events and a trailing enter", LiveInjectorBuildsEnterRecords),
     ("live injector binds WriteConsoleInputW for unicode", LiveInjectorBindsWriteConsoleInputW),
-    ("dispatch runner delivers immediately to a live-idle peer", DispatchRunnerDeliversToLiveIdlePeer),
+    ("dispatch runner delivers through the owner daemon to a live-idle peer", DispatchRunnerDeliversToLiveIdlePeer),
+    ("owner registry registers and detects a stale owner", OwnerRegistryDetectsStaleOwner),
+    ("owner daemon turns spooled messages into receipts", OwnerDaemonProcessesSpool),
+    ("owner daemon writes a failed receipt when the provider turn fails", OwnerDaemonRecordsFailedTurn),
+    ("dispatch deliver fails when the owner dies mid-delivery", DispatchDeliverFailsWhenOwnerDies),
+    ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
+    ("grok resume read-back fails when no turn is recorded", GrokResumeReadBackFails),
     ("provider command resumes grok codex and claude", ProviderCommandResumesPeers),
     ("provider command preassigns a new Grok session id", ProviderCommandPreassignsGrokId),
     ("provider output parses Claude session and normalized answer", ProviderOutputParsesClaude),
@@ -847,8 +853,13 @@ static void PeerSelectorPrefersIdle()
         new Peer("grok", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
     };
     var picked = PeerSelector.Select("grok", peers, sessionId: null, cwd: "D:\\code\\app", allowNew: true);
-    Equal("idle", picked.SessionId);
-    Equal(DispatchAction.Inject, picked.Action);
+    Equal("old", picked.SessionId);
+    Equal(DispatchAction.Resume, picked.Action);
+
+    var owned = PeerSelector.Select(
+        "grok", peers, null, "D:\\code\\app", allowNew: true, boundSessionId: null, hasLiveOwner: _ => true);
+    Equal("idle", owned.SessionId);
+    Equal(DispatchAction.Deliver, owned.Action);
 
     var created = PeerSelector.Select("grok", Array.Empty<Peer>(), null, "D:\\code\\app", allowNew: true);
     Equal(DispatchAction.Create, created.Action);
@@ -870,12 +881,24 @@ static void PeerSelectorInsertsExplicitLivePeer()
     {
         new Peer("codex", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 4242, null, null, null)
     };
-    var picked = PeerSelector.Select("codex", peers, "busy", null, allowNew: false);
+    try
+    {
+        PeerSelector.Select("codex", peers, "busy", null, allowNew: false);
+        throw new InvalidDataException("Expected the unowned live peer to fail closed.");
+    }
+    catch (InvalidOperationException exception)
+    {
+        True(exception.Message.Contains("not CCCG-owned", StringComparison.Ordinal));
+        True(exception.Message.Contains("run-owner", StringComparison.Ordinal));
+    }
+
+    var picked = PeerSelector.Select(
+        "codex", peers, "busy", null, allowNew: false, boundSessionId: null, hasLiveOwner: _ => true);
     Equal("busy", picked.SessionId);
-    Equal(DispatchAction.Inject, picked.Action);
+    Equal(DispatchAction.Deliver, picked.Action);
     Equal(4242, picked.Pid);
     True(!picked.WaitForWriterFree);
-    True(picked.Reason.Contains("Typing into the live window", StringComparison.Ordinal));
+    True(picked.Reason.Contains("CCCG-owned", StringComparison.Ordinal));
 }
 
 static void ProviderCommandResumesPeers()
@@ -1155,10 +1178,10 @@ static void DispatchRunnerCollectsSuccess()
     True(json.Contains("DISPATCH-OK", StringComparison.Ordinal));
 }
 
-static void DispatchRunnerInjectsLiveWindow()
+static void DispatchRunnerRefusesUnownedLiveWindow()
 {
-    var root = Path.Combine(Path.GetTempPath(), $"cccg-live-inject-{Guid.NewGuid():N}");
-    var store = new DispatchJobStore(root);
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-live-refuse-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
     var launcher = new CountingProcessLauncher("SHOULD-NOT-LAUNCH");
     var injector = new RecordingLiveInputInjector();
     var runner = new DispatchRunner(
@@ -1169,20 +1192,23 @@ static void DispatchRunnerInjectsLiveWindow()
         ],
         launcher,
         codexCommand: "codex.exe",
-        injector: injector);
-    var job = runner.Enqueue("codex", "hello live window", "busy", "D:\\code\\app", allowNew: false);
-    True(job.Reason?.Contains("Typing into the live window", StringComparison.Ordinal) == true);
-    var done = runner.Run(job.JobId);
-    Equal(DispatchJobStatus.Succeeded, done.Status);
+        injector: injector,
+        owners: new OwnerRegistry(Path.Combine(root, "owners")));
+    try
+    {
+        runner.Enqueue("codex", "hello live window", "busy", "D:\\code\\app", allowNew: false);
+        throw new InvalidDataException("Expected the unowned live peer to fail closed.");
+    }
+    catch (InvalidOperationException exception)
+    {
+        True(exception.Message.Contains("not CCCG-owned", StringComparison.Ordinal));
+    }
+
     Equal(0, launcher.Starts);
-    Equal(1, injector.Calls.Count);
-    Equal(4242, injector.Calls[0].ProcessId);
-    True(injector.Calls[0].Text.Contains("hello live window", StringComparison.Ordinal));
-    var json = System.Text.Json.JsonSerializer.Serialize(runner.Collect(job.JobId));
-    True(json.Contains("Typed into the live", StringComparison.Ordinal));
+    Equal(0, injector.Calls.Count);
 }
 
-static void DispatchRunnerInjectSkipsWorkspaceLease()
+static void DispatchRunnerDeliverSkipsWorkspaceLease()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-live-nolease-{Guid.NewGuid():N}");
     var store = new DispatchJobStore(Path.Combine(root, "jobs"));
@@ -1195,6 +1221,10 @@ static void DispatchRunnerInjectSkipsWorkspaceLease()
         "leases",
         CrossProcessFileGate.Key(affinity) + ".lock");
     using var held = CrossProcessFileGate.Acquire(gatePath, TimeSpan.FromSeconds(2));
+    var registry = new OwnerRegistry(Path.Combine(root, "owners"));
+    var transport = new EchoTurnTransport(text => "OWNED-OK");
+    using var owner = new BackgroundOwner(new OwnerDaemon(
+        "grok", "D:\\code\\app", "busy", transport, registry, TimeSpan.FromMilliseconds(20)));
     var injector = new RecordingLiveInputInjector();
     var runner = new DispatchRunner(
         store,
@@ -1203,11 +1233,16 @@ static void DispatchRunnerInjectSkipsWorkspaceLease()
             new Peer("grok", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 11, null, null, null)
         ],
         new FakeProcessLauncher("SHOULD-NOT-LAUNCH"),
-        injector: injector);
+        injector: injector,
+        owners: registry,
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        deliverWaitTimeout: TimeSpan.FromSeconds(10));
     var job = runner.Enqueue("grok", "hello", "busy", "D:\\code\\app", allowNew: false);
+    Equal("deliver", job.Action);
     var done = runner.Run(job.JobId);
     Equal(DispatchJobStatus.Succeeded, done.Status);
-    Equal(1, injector.Calls.Count);
+    Equal(0, injector.Calls.Count);
+    Equal("delivered", done.ReceiptStatus);
 }
 
 static void LiveInjectorBindsWriteConsoleInputW()
@@ -1241,18 +1276,31 @@ static void DispatchRunnerDeliversToLiveIdlePeer()
     {
         new Peer("grok", "idle", PeerStatus.LiveIdle, "D:\\code\\app", "Idle", null, null, 9, null, null, null)
     };
+    var registry = new OwnerRegistry(Path.Combine(root, "owners"));
+    var transport = new EchoTurnTransport(text => "OWNED-REPLY::" + text);
+    using var owner = new BackgroundOwner(new OwnerDaemon(
+        "grok", "D:\\code\\app", "idle", transport, registry, TimeSpan.FromMilliseconds(20)));
     var injector = new RecordingLiveInputInjector();
     var runner = new DispatchRunner(
-        new DispatchJobStore(root),
+        new DispatchJobStore(Path.Combine(root, "jobs")),
         _ => peers,
         new FakeProcessLauncher("SHOULD-NOT-LAUNCH"),
-        injector: injector);
-    var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
-    True(job.Reason?.Contains("Typing into the live window", StringComparison.Ordinal) == true);
+        injector: injector,
+        owners: registry,
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        deliverWaitTimeout: TimeSpan.FromSeconds(10));
+    var job = runner.Enqueue("grok", "hello owned peer", cwd: "D:\\code\\app", allowNew: false);
+    True(job.Reason?.Contains("CCCG-owned", StringComparison.Ordinal) == true);
     var done = runner.Run(job.JobId);
     Equal(DispatchJobStatus.Succeeded, done.Status);
-    Equal(1, injector.Calls.Count);
-    Equal(9, injector.Calls[0].ProcessId);
+    Equal(0, injector.Calls.Count);
+    Equal("delivered", done.ReceiptStatus);
+    True(done.DeliveredAt is not null);
+    var json = System.Text.Json.JsonSerializer.Serialize(runner.Collect(job.JobId));
+    True(json.Contains("OWNED-REPLY", StringComparison.Ordinal));
+    Equal(1, transport.Turns.Count);
+    True(transport.Turns[0].StartsWith("[CCCG message from claude]", StringComparison.Ordinal));
+    True(transport.Turns[0].Contains("hello owned peer", StringComparison.Ordinal));
 }
 
 static void DispatchRunnersSerializeManagedPeer()
@@ -1345,6 +1393,146 @@ static void InboxLedgerPreservesConcurrentPosts()
         ledger.Post("claude", "codex", "message-" + index);
     });
     Equal(80, first.List(limit: 100).Count);
+}
+
+static void OwnerRegistryDetectsStaleOwner()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owners-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    var key = OwnerRegistry.Key("codex", "D:\\code\\app", "sess-1");
+    var lease = registry.AcquireLease(key);
+    try
+    {
+        registry.Register(key, new OwnerRegistration(
+            1, "codex", "sess-1", "D:\\code\\app", Environment.ProcessId,
+            registry.SpoolDirectory(key), DateTimeOffset.UtcNow));
+        Equal("sess-1", registry.TryFind("codex", "sess-1", null)?.SessionId);
+        Equal("sess-1", registry.TryFind("codex", null, "D:\\code\\app")?.SessionId);
+        True(registry.TryFind("grok", "sess-1", null) is null);
+        True(registry.TryFind("codex", "sess-2", null) is null);
+        True(registry.LeaseIsHeld(key));
+    }
+    finally
+    {
+        lease.Dispose();
+    }
+
+    True(!registry.LeaseIsHeld(key));
+    True(registry.TryFind("codex", "sess-1", null) is null);
+    True(File.Exists(registry.RegistrationPath(key)));
+}
+
+static void OwnerDaemonProcessesSpool()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-daemon-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    var transport = new EchoTurnTransport(text => "ECHO::" + text, sessionId: "thread-real");
+    using var daemon = new OwnerDaemon("codex", "D:\\code\\app", sessionId: null, transport, registry);
+    var registration = daemon.Start();
+    Equal(Environment.ProcessId, registration.OwnerPid);
+    var spool = new OwnerSpool(registration.SpoolDir);
+    spool.Post(new OwnerMessage("m1", "claude", "sess-9", "please review", DateTimeOffset.UtcNow));
+
+    True(spool.TryReadReceipt("m1") is null);
+    Equal(1, daemon.ProcessPendingOnce());
+
+    var receipt = spool.TryReadReceipt("m1")!;
+    Equal(OwnerReceiptStatus.Delivered, receipt.Status);
+    True(receipt.DeliveredAt is not null);
+    True(receipt.ResponseText!.Contains("please review", StringComparison.Ordinal));
+    Equal(1, transport.Turns.Count);
+    True(transport.Turns[0].StartsWith("[CCCG message from claude sess-9]", StringComparison.Ordinal));
+    Equal(0, spool.ReadIncoming().Count);
+    Equal(0, daemon.ProcessPendingOnce());
+    Equal("thread-real", registry.TryFind("codex", "thread-real", null)?.SessionId);
+}
+
+static void OwnerDaemonRecordsFailedTurn()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-fail-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(root);
+    var transport = new EchoTurnTransport(_ => throw new InvalidOperationException("PROVIDER-DOWN"));
+    using var daemon = new OwnerDaemon("codex", "D:\\code\\app", "sess-1", transport, registry);
+    var registration = daemon.Start();
+    var spool = new OwnerSpool(registration.SpoolDir);
+    spool.Post(new OwnerMessage("m1", "claude", null, "hello", DateTimeOffset.UtcNow));
+
+    Equal(1, daemon.ProcessPendingOnce());
+    var receipt = spool.TryReadReceipt("m1")!;
+    Equal(OwnerReceiptStatus.Failed, receipt.Status);
+    True(receipt.DeliveredAt is null);
+    True(receipt.Error!.Contains("PROVIDER-DOWN", StringComparison.Ordinal));
+    Equal(0, spool.ReadIncoming().Count);
+}
+
+static void DispatchDeliverFailsWhenOwnerDies()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-dead-{Guid.NewGuid():N}");
+    var registry = new OwnerRegistry(Path.Combine(root, "owners"));
+    var key = OwnerRegistry.Key("codex", "D:\\code\\app", "busy");
+    using var lease = registry.AcquireLease(key);
+    registry.Register(key, new OwnerRegistration(
+        1, "codex", "busy", "D:\\code\\app", int.MaxValue,
+        registry.SpoolDirectory(key), DateTimeOffset.UtcNow));
+
+    var runner = new DispatchRunner(
+        new DispatchJobStore(Path.Combine(root, "jobs")),
+        _ =>
+        [
+            new Peer("codex", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 4242, null, null, null)
+        ],
+        new FakeProcessLauncher("unused"),
+        codexCommand: "codex.exe",
+        owners: registry,
+        writerPollInterval: TimeSpan.FromMilliseconds(20));
+    var job = runner.Enqueue("codex", "hello", "busy", "D:\\code\\app", allowNew: false);
+    Equal("deliver", job.Action);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Failed, done.Status);
+    True(done.Error?.Contains("exited before", StringComparison.Ordinal) == true);
+}
+
+static void GrokResumeReadBackPasses()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-readback-ok-{Guid.NewGuid():N}");
+    var count = 4;
+    var launcher = new CallbackProcessLauncher("GROK-DONE", () => count = 5);
+    var runner = new DispatchRunner(
+        new DispatchJobStore(Path.Combine(root, "jobs")),
+        _ =>
+        [
+            new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, count)
+        ],
+        launcher,
+        owners: new OwnerRegistry(Path.Combine(root, "owners")),
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        readBackTimeout: TimeSpan.FromSeconds(2));
+    var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    Equal(4, done.PeerTurnsBefore);
+    Equal(5, done.PeerTurnsAfter);
+}
+
+static void GrokResumeReadBackFails()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-readback-bad-{Guid.NewGuid():N}");
+    var runner = new DispatchRunner(
+        new DispatchJobStore(Path.Combine(root, "jobs")),
+        _ =>
+        [
+            new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, 4)
+        ],
+        new FakeProcessLauncher("GROK-DONE"),
+        owners: new OwnerRegistry(Path.Combine(root, "owners")),
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        readBackTimeout: TimeSpan.FromMilliseconds(200));
+    var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Failed, done.Status);
+    True(done.Error?.Contains("was not recorded", StringComparison.Ordinal) == true);
+    Equal(4, done.PeerTurnsBefore);
+    Equal(4, done.PeerTurnsAfter);
 }
 
 static void Throws<T>(Action action) where T : Exception
@@ -1646,6 +1834,87 @@ sealed class TrackingProcessLauncher : IProcessLauncher
             completed();
             return 0;
         }
+    }
+}
+
+sealed class EchoTurnTransport : IProviderTurnTransport
+{
+    private readonly Func<string, string> reply;
+    private readonly string? sessionId;
+
+    public EchoTurnTransport(Func<string, string> reply, string? sessionId = null)
+    {
+        this.reply = reply;
+        this.sessionId = sessionId;
+    }
+
+    public List<string> Turns { get; } = new();
+
+    public string? SessionId => sessionId;
+
+    public Task<string> RunTurnAsync(string text, CancellationToken cancellationToken = default)
+    {
+        Turns.Add(text);
+        return Task.FromResult(reply(text));
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+sealed class BackgroundOwner : IDisposable
+{
+    private readonly OwnerDaemon daemon;
+    private readonly CancellationTokenSource stop = new();
+    private readonly Thread thread;
+
+    public BackgroundOwner(OwnerDaemon daemon)
+    {
+        this.daemon = daemon;
+        Registration = daemon.Start();
+        thread = new Thread(() =>
+        {
+            try
+            {
+                daemon.Run(stop.Token);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        })
+        {
+            IsBackground = true
+        };
+        thread.Start();
+    }
+
+    public OwnerRegistration Registration { get; }
+
+    public void Dispose()
+    {
+        stop.Cancel();
+        thread.Join(TimeSpan.FromSeconds(2));
+        daemon.Dispose();
+        stop.Dispose();
+    }
+}
+
+sealed class CallbackProcessLauncher : FakeProcessLauncher
+{
+    private readonly Action onStart;
+
+    public CallbackProcessLauncher(string stdout, Action onStart) : base(stdout) =>
+        this.onStart = onStart;
+
+    public override int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        var pid = base.Start(command, stdoutPath, stderrPath, stdinPath, out waiter);
+        onStart();
+        return pid;
     }
 }
 

@@ -31,8 +31,11 @@ public sealed class DispatchRunner
     private readonly DispatchBindingStore? bindings;
     private readonly InboxLedger? inbox;
     private readonly ILiveInputInjector injector;
+    private readonly OwnerRegistry owners;
     private readonly TimeSpan writerPollInterval;
     private readonly TimeSpan writerWaitTimeout;
+    private readonly TimeSpan deliverWaitTimeout;
+    private readonly TimeSpan readBackTimeout;
 
     public DispatchRunner(
         DispatchJobStore store,
@@ -45,7 +48,10 @@ public sealed class DispatchRunner
         InboxLedger? inbox = null,
         TimeSpan? writerPollInterval = null,
         TimeSpan? writerWaitTimeout = null,
-        ILiveInputInjector? injector = null)
+        ILiveInputInjector? injector = null,
+        OwnerRegistry? owners = null,
+        TimeSpan? deliverWaitTimeout = null,
+        TimeSpan? readBackTimeout = null)
     {
         this.store = store;
         this.listPeers = listPeers;
@@ -56,8 +62,11 @@ public sealed class DispatchRunner
         this.bindings = bindings;
         this.inbox = inbox;
         this.injector = injector ?? new WindowsLiveInputInjector();
+        this.owners = owners ?? new OwnerRegistry();
         this.writerPollInterval = writerPollInterval ?? TimeSpan.FromMilliseconds(250);
         this.writerWaitTimeout = writerWaitTimeout ?? TimeSpan.FromHours(2);
+        this.deliverWaitTimeout = deliverWaitTimeout ?? TimeSpan.FromHours(2);
+        this.readBackTimeout = readBackTimeout ?? TimeSpan.FromSeconds(5);
     }
 
     public DispatchJob Enqueue(
@@ -152,6 +161,11 @@ public sealed class DispatchRunner
                 store.Write(job);
             }
 
+            if (selection.Action == DispatchAction.Deliver)
+            {
+                return DeliverToOwner(job, selection);
+            }
+
             if (selection.Action == DispatchAction.Inject)
             {
                 return InjectLive(job, selection);
@@ -176,6 +190,17 @@ public sealed class DispatchRunner
 
             try
             {
+
+            // Read-back verification baseline: how many messages the target
+            // grok session shows on disk before this resume turn runs.
+            int? peerTurnsBefore = null;
+            if (selection.Provider == "grok"
+                && selection.Action == DispatchAction.Resume
+                && !string.IsNullOrWhiteSpace(selection.SessionId))
+            {
+                peerTurnsBefore = FindGrokMessageCount(selection.SessionId);
+                job.PeerTurnsBefore = peerTurnsBefore;
+            }
 
             var command = selection.Provider switch
             {
@@ -244,6 +269,20 @@ public sealed class DispatchRunner
             {
                 throw new InvalidDataException(
                     $"{selection.Provider} completed but did not expose the new session id; CCCG refused to create an unbound peer.");
+            }
+
+            if (peerTurnsBefore is int turnsBefore)
+            {
+                var turnsAfter = WaitForGrokTurnIncrease(selection.SessionId!, turnsBefore);
+                job.PeerTurnsAfter = turnsAfter;
+                if (turnsAfter is null || turnsAfter <= turnsBefore)
+                {
+                    store.Write(job);
+                    throw new InvalidDataException(
+                        $"grok exited successfully but session '{selection.SessionId}' still shows "
+                        + $"{turnsAfter ?? turnsBefore} messages (was {turnsBefore}); the resumed turn "
+                        + "was not recorded, so the delivery is unverified.");
+                }
             }
 
             job.SessionId = resolvedSessionId;
@@ -350,6 +389,20 @@ public sealed class DispatchRunner
         bool allowNew,
         DispatchBinding? binding)
     {
+        // The owner registry is authoritative: a live owner daemon accepts
+        // spooled turns even before its provider session is visible as a peer.
+        var owned = owners.TryFind(provider, requestedSessionId ?? binding?.SessionId, cwd);
+        if (owned is not null)
+        {
+            return new DispatchSelection(
+                provider,
+                owned.SessionId ?? requestedSessionId,
+                cwd ?? owned.Cwd,
+                Title: null,
+                DispatchAction.Deliver,
+                PeerSelector.OwnedDeliveryReason);
+        }
+
         var peers = listPeers(provider);
         var preferredId = requestedSessionId ?? binding?.SessionId;
         if (!string.IsNullOrWhiteSpace(preferredId))
@@ -385,8 +438,8 @@ public sealed class DispatchRunner
                     preferredId,
                     cwd ?? preferred.Cwd,
                     preferred.Title,
-                    PeerSelector.LiveAction(provider, preferred.Status),
-                    PeerSelector.LiveReason(provider, preferred.Status),
+                    PeerSelector.LiveAction(provider, preferred.Status, hasOwner: false),
+                    PeerSelector.LiveReason(provider, preferred.Status, hasOwner: false),
                     Pid: preferred.Pid);
             }
         }
@@ -397,7 +450,114 @@ public sealed class DispatchRunner
             requestedSessionId,
             cwd,
             allowNew,
-            binding?.SessionId);
+            binding?.SessionId,
+            peer => owners.TryFind(peer.Provider, peer.SessionId, peer.Cwd) is not null);
+    }
+
+    private DispatchJob DeliverToOwner(DispatchJob job, DispatchSelection selection)
+    {
+        var owner = owners.TryFind(selection.Provider, selection.SessionId, selection.Cwd)
+            ?? throw new InvalidOperationException(
+                $"The CCCG owner for {selection.Provider} session '{selection.SessionId}' "
+                + "released its lease before delivery.");
+        var spool = new OwnerSpool(owner.SpoolDir);
+        spool.Post(new OwnerMessage(
+            job.JobId,
+            "claude",
+            FromSessionId: null,
+            File.ReadAllText(store.PromptPath(job.JobId)),
+            DateTimeOffset.UtcNow));
+
+        job.Status = DispatchJobStatus.Running;
+        job.OwnerPid = owner.OwnerPid;
+        job.StartedAt = DateTimeOffset.UtcNow;
+        job.Reason = "Waiting for the CCCG owner daemon to run the delivered turn.";
+        store.Write(job);
+
+        var deadline = DateTimeOffset.UtcNow + deliverWaitTimeout;
+        OwnerReceipt? receipt;
+        while ((receipt = spool.TryReadReceipt(job.JobId)) is null)
+        {
+            if (!ProcessIsAlive(owner.OwnerPid))
+            {
+                // One grace re-read: the owner may have written the receipt
+                // just before exiting.
+                receipt = spool.TryReadReceipt(job.JobId);
+                if (receipt is null)
+                {
+                    throw new InvalidOperationException(
+                        $"The CCCG owner daemon (pid {owner.OwnerPid}) exited before "
+                        + "confirming delivery; the message was not consumed.");
+                }
+
+                break;
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                throw new TimeoutException(
+                    $"The CCCG owner did not confirm delivery within {deliverWaitTimeout}.");
+            }
+
+            job = store.Require(job.JobId);
+            if (IsTerminal(job.Status))
+            {
+                return job;
+            }
+
+            Thread.Sleep(writerPollInterval);
+        }
+
+        job.ReceiptStatus = receipt.Status;
+        job.DeliveredAt = receipt.DeliveredAt;
+        job.FinishedAt = DateTimeOffset.UtcNow;
+        if (receipt.Status != OwnerReceiptStatus.Delivered)
+        {
+            store.Write(job);
+            throw new InvalidOperationException(
+                receipt.Error ?? "The CCCG owner reported a failed delivery.");
+        }
+
+        File.WriteAllText(
+            store.StdoutPath(job.JobId),
+            receipt.ResponseText ?? string.Empty,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        job.Status = DispatchJobStatus.Succeeded;
+        job.ExitCode = 0;
+        inbox?.Post(
+            selection.Provider,
+            "claude",
+            ProviderOutputParser.CollectResponse(
+                selection.Provider,
+                store.StdoutPath(job.JobId),
+                2000),
+            fromProvider: selection.Provider,
+            fromSessionId: selection.SessionId,
+            toProvider: "claude",
+            jobId: job.JobId);
+        store.Write(job);
+        return job;
+    }
+
+    private int? FindGrokMessageCount(string sessionId) =>
+        listPeers("grok").FirstOrDefault(peer =>
+                string.Equals(peer.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+            ?.MessageCount;
+
+    private int? WaitForGrokTurnIncrease(string sessionId, int before)
+    {
+        var deadline = DateTimeOffset.UtcNow + readBackTimeout;
+        int? observed = null;
+        while (true)
+        {
+            observed = FindGrokMessageCount(sessionId) ?? observed;
+            if (observed > before || DateTimeOffset.UtcNow >= deadline)
+            {
+                return observed;
+            }
+
+            Thread.Sleep(writerPollInterval);
+        }
     }
 
     private DispatchJob InjectLive(DispatchJob job, DispatchSelection selection)

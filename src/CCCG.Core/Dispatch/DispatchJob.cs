@@ -65,6 +65,21 @@ public sealed class DispatchJob
 
     [JsonPropertyName("promptChars")]
     public int PromptChars { get; set; }
+
+    [JsonPropertyName("ownerPid")]
+    public int? OwnerPid { get; set; }
+
+    [JsonPropertyName("receiptStatus")]
+    public string? ReceiptStatus { get; set; }
+
+    [JsonPropertyName("deliveredAt")]
+    public DateTimeOffset? DeliveredAt { get; set; }
+
+    [JsonPropertyName("peerTurnsBefore")]
+    public int? PeerTurnsBefore { get; set; }
+
+    [JsonPropertyName("peerTurnsAfter")]
+    public int? PeerTurnsAfter { get; set; }
 }
 
 public sealed record LaunchCommand(
