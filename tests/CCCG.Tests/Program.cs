@@ -1,0 +1,1673 @@
+using CCCG.Core;
+using CCCG.Core.Dispatch;
+using CCCG.Core.Monitoring;
+using CCCG.Core.Providers;
+using CCCG.Monitor;
+using CCCG.Host;
+
+if (args is ["--emit-utf8-grok-json"])
+{
+    const string payload = "{\"text\":\"繁體中文測試：你好，世界！\",\"thought\":\"clean English thought\"}";
+    var stdoutBytes = System.Text.Encoding.UTF8.GetBytes(payload + Environment.NewLine);
+    var stderrBytes = System.Text.Encoding.UTF8.GetBytes("診斷訊息：正常" + Environment.NewLine);
+    Console.OpenStandardOutput().Write(stdoutBytes);
+    Console.OpenStandardError().Write(stderrBytes);
+    return 0;
+}
+
+if (args is ["--echo-utf8-stdin"])
+{
+    using var input = Console.OpenStandardInput();
+    using var buffer = new MemoryStream();
+    input.CopyTo(buffer);
+    Console.OpenStandardOutput().Write(buffer.ToArray());
+    return 0;
+}
+
+var tests = new (string Name, Action Run)[]
+{
+    ("arguments parse split and inline values", ArgumentsParse),
+    ("protocol parses user text", ProtocolParsesUser),
+    ("protocol accepts UTF-8 BOM on first frame", ProtocolAcceptsBom),
+    ("protocol parses set_model", ProtocolParsesSetModel),
+    ("configuration resolves exact aliases", ConfigurationResolves),
+    ("Luna experiment maps Haiku without renaming backend", LunaConfigurationResolves),
+    ("configuration resolves relative passthrough beside config", ConfigurationResolvesRelativePassthrough),
+    ("configuration rejects unsupported provider", ConfigurationRejectsProvider),
+    ("process passthrough preserves stdin stdout stderr and exit code", ProcessPassthroughRoundTrips),
+    ("codex adapter uses ordered read-only Sol lifecycle", CodexAdapterUsesOrderedSolLifecycle),
+    ("codex adapter discloses backend reroutes", CodexAdapterDisclosesReroute),
+    ("monitor parses healthy lifecycle", MonitorParsesHealthy),
+    ("monitor parses startup timings", MonitorParsesTimings),
+    ("monitor deduplicates duplicate log lines", MonitorDeduplicates),
+    ("monitor metadata excludes content fields", MonitorMetadataIsMinimal),
+    ("monitor content captures only visible user and assistant text", MonitorContentSelectsVisibleText),
+    ("monitor operations correlate web search results and hooks", MonitorOperationsParse),
+    ("monitor content dataset is explicit and separate", MonitorContentDatasetIsSeparate),
+    ("monitor content watcher captures only appended transcript lines", MonitorContentWatcherCapturesAppend),
+    ("monitor pseudonyms are stable", MonitorPseudonymsAreStable),
+    ("monitor tailer reads appended lines", MonitorTailerReadsAppend),
+    ("monitor worker control round-trips readiness and stop", MonitorWorkerControlRoundTrips),
+    ("host stages immutable hash-addressed workers", HostStagesImmutableWorker),
+    ("host parses supervised content-capture options", HostParsesOptions),
+    ("host reports update only after retiring workers clear", HostRequiresStableActivation),
+    ("grok directory treats every live writer as unavailable", GrokDirectoryRanksPeers),
+    ("grok directory filters by cwd and inspects one peer", GrokDirectoryFiltersAndInspects),
+    ("grok directory ignores dead active pids", GrokDirectoryIgnoresDeadPids),
+    ("grok directory is empty when home is missing", GrokDirectoryEmptyHome),
+    ("codex directory treats every held writer lock as unavailable", CodexDirectoryRanksParents),
+    ("codex directory filters by cwd and inspects one peer", CodexDirectoryFiltersAndInspects),
+    ("codex directory fills parent cwd from subagent rollouts", CodexDirectoryFillsParentFromSubagentOnly),
+    ("claude directory lists transcripts and marks live Desktop writers", ClaudeDirectoryListsAndMarksLive),
+    ("claude directory ignores dead session registry entries", ClaudeDirectoryIgnoresDeadRegistry),
+    ("peer selector prefers live idle then resume then create", PeerSelectorPrefersIdle),
+    ("peer selector rejects a working session", PeerSelectorRejectsWorking),
+    ("peer selector inserts an explicit live grok or codex session", PeerSelectorInsertsExplicitLivePeer),
+    ("dispatch runner types into a live window instead of launching a process", DispatchRunnerInjectsLiveWindow),
+    ("dispatch runner inject does not wait for a held workspace lease", DispatchRunnerInjectSkipsWorkspaceLease),
+    ("live injector builds unicode key events and a trailing enter", LiveInjectorBuildsEnterRecords),
+    ("live injector binds WriteConsoleInputW for unicode", LiveInjectorBindsWriteConsoleInputW),
+    ("dispatch runner delivers immediately to a live-idle peer", DispatchRunnerDeliversToLiveIdlePeer),
+    ("provider command resumes grok codex and claude", ProviderCommandResumesPeers),
+    ("provider command preassigns a new Grok session id", ProviderCommandPreassignsGrokId),
+    ("provider output parses Claude session and normalized answer", ProviderOutputParsesClaude),
+    ("provider output strips Grok thought and usage metadata", ProviderOutputNormalizesGrok),
+    ("file process launcher preserves UTF-8 provider output", FileProcessLauncherPreservesUtf8),
+    ("file process launcher writes UTF-8 stdin bytes unchanged", FileProcessLauncherPreservesUtf8Stdin),
+    ("dispatch runner creates and binds a Claude session", DispatchRunnerBindsNewClaudeSession),
+    ("dispatch runner routes live Claude through Desktop session management", DispatchRunnerRoutesLiveClaude),
+    ("provider output captures and binds a new Codex thread id", DispatchRunnerBindsNewCodexThread),
+    ("dispatch runner starts a resumable job and collects success", DispatchRunnerCollectsSuccess),
+    ("dispatch runners serialize the same managed peer across processes", DispatchRunnersSerializeManagedPeer),
+    ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
+    ("binding store marks and prefers the bound peer", BindingStorePrefersBoundPeer),
+    ("inbox ledger posts lists and acks for Claude", InboxLedgerRoundTrips),
+    ("inbox ledger preserves concurrent posts", InboxLedgerPreservesConcurrentPosts)
+};
+
+var failures = 0;
+foreach (var (name, run) in tests)
+{
+    try
+    {
+        run();
+        Console.WriteLine($"PASS {name}");
+    }
+    catch (Exception exception)
+    {
+        failures++;
+        Console.Error.WriteLine($"FAIL {name}: {exception.Message}");
+    }
+}
+
+return failures == 0 ? 0 : 1;
+
+static void ArgumentsParse()
+{
+    var parsed = ClaudeArguments.Parse(new[]
+    {
+        "--model=claude-haiku-4-5", "--permission-mode", "default",
+        "--cccg-config", "routes.json", "--verbose"
+    });
+
+    Equal("claude-haiku-4-5", parsed.Model);
+    Equal("default", parsed.PermissionMode);
+    Equal("routes.json", parsed.ConfigPath);
+    True(!parsed.ForwardedArguments.Contains("--cccg-config"));
+    True(parsed.ForwardedArguments.Contains("--verbose"));
+}
+
+static void ProtocolParsesUser()
+{
+    var frame = ClaudeProtocol.ParseInput(
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}");
+    Equal(ClaudeFrameKind.User, frame.Kind);
+    Equal("hello", frame.Text);
+}
+
+static void ProtocolParsesSetModel()
+{
+    var frame = ClaudeProtocol.ParseInput(
+        "{\"type\":\"control_request\",\"request_id\":\"r1\",\"request\":{\"subtype\":\"set_model\",\"model\":\"claude-sonnet-4-6\"}}");
+    Equal(ClaudeFrameKind.SetModel, frame.Kind);
+    Equal("claude-sonnet-4-6", frame.Model);
+    Equal("r1", frame.RequestId);
+}
+
+static void ProtocolAcceptsBom()
+{
+    var frame = ClaudeProtocol.ParseInput(
+        "\uFEFF{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}");
+    Equal(ClaudeFrameKind.User, frame.Kind);
+    Equal("hello", frame.Text);
+}
+
+static void ConfigurationResolves()
+{
+    var path = TempJson("""
+        {"unmappedBehavior":"reject","routes":{"claude-haiku-4-5":{"provider":"mock","model":"gpt-5.6-sol"}}}
+        """);
+    try
+    {
+        var route = RouterConfiguration.Load(path).Resolve("claude-haiku-4-5");
+        Equal("mock", route.NormalizedProvider);
+        Equal("gpt-5.6-sol", route.Model);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ConfigurationRejectsProvider()
+{
+    var path = TempJson("""
+        {"unmappedBehavior":"reject","routes":{"x":{"provider":"unknown","model":"m"}}}
+        """);
+    try
+    {
+        Throws<InvalidDataException>(() => RouterConfiguration.Load(path));
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void LunaConfigurationResolves()
+{
+    var path = System.IO.Path.GetFullPath(
+        System.IO.Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..", "..", "config", "routes.luna.json"));
+    var route = RouterConfiguration.Load(path).Resolve("claude-haiku-4-5");
+    var datedRoute = RouterConfiguration.Load(path).Resolve(
+        "claude-haiku-4-5-20251001");
+
+    Equal("codex-app-server", route.NormalizedProvider);
+    Equal("gpt-5.6-luna", route.Model);
+    Equal("medium", route.ReasoningEffort);
+    Equal("gpt-5.6-luna", datedRoute.Model);
+}
+
+static void ConfigurationResolvesRelativePassthrough()
+{
+    var directory = System.IO.Path.Combine(
+        System.IO.Path.GetTempPath(),
+        "cccg-config-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    var path = System.IO.Path.Combine(directory, "routes.json");
+    File.WriteAllText(path, """
+        {"unmappedBehavior":"passthrough","originalClaudePath":"native\\claude.exe","routes":{}}
+        """);
+
+    try
+    {
+        var configuration = RouterConfiguration.Load(path);
+        True(configuration.UsesPassthrough);
+        Equal(
+            System.IO.Path.GetFullPath(
+                System.IO.Path.Combine(directory, "native", "claude.exe")),
+            configuration.OriginalClaudePath);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ProcessPassthroughRoundTrips()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var executable = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.System),
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe");
+    var inputBytes = System.Text.Encoding.UTF8.GetBytes("PING\n");
+    using var input = new MemoryStream(inputBytes);
+    using var output = new MemoryStream();
+    using var error = new MemoryStream();
+
+    var exitCode = ProcessPassthrough.RunAsync(
+        executable,
+        new[]
+        {
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$line=[Console]::In.ReadLine();"
+            + "[Console]::Out.Write('OUT:'+$line);"
+            + "[Console]::Error.Write('ERR:'+$line);"
+            + "exit 7"
+        },
+        input,
+        output,
+        error).GetAwaiter().GetResult();
+
+    Equal(7, exitCode);
+    Equal("OUT:PING", System.Text.Encoding.UTF8.GetString(output.ToArray()));
+    Equal("ERR:PING", System.Text.Encoding.UTF8.GetString(error.ToArray()));
+}
+
+static void CodexAdapterUsesOrderedSolLifecycle()
+{
+    var transport = new ScriptedJsonLineTransport(new[]
+    {
+        "{\"id\":0,\"result\":{\"userAgent\":\"codex-test\",\"platformFamily\":\"windows\",\"platformOs\":\"windows\"}}",
+        "{\"id\":1,\"result\":{\"thread\":{\"id\":\"thr_test\"},\"model\":\"gpt-5.6-sol\",\"modelProvider\":\"openai\",\"approvalPolicy\":\"never\",\"sandbox\":{\"type\":\"readOnly\"},\"cwd\":\"D:\\\\code\\\\CCCG\",\"approvalsReviewer\":\"user\"}}",
+        "{\"id\":2,\"result\":{\"turn\":{\"id\":\"turn_test\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}}",
+        "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_test\",\"turnId\":\"turn_test\",\"completedAtMs\":1,\"item\":{\"id\":\"item_test\",\"type\":\"agentMessage\",\"text\":\"CCCG-CODEX-OK\"}}}",
+        "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_test\",\"turn\":{\"id\":\"turn_test\",\"status\":\"completed\",\"items\":[],\"error\":null}}}"
+    });
+    var client = new CodexAppServerClient(_ => Task.FromResult<IJsonLineTransport>(transport));
+
+    var result = client.CompleteAsync(
+        "Reply only CCCG-CODEX-OK",
+        "gpt-5.6-sol",
+        "medium",
+        @"D:\code\CCCG").GetAwaiter().GetResult();
+
+    Equal("CCCG-CODEX-OK", result.Text);
+    Equal("gpt-5.6-sol", result.RequestedModel);
+    Equal("gpt-5.6-sol", result.ActualModel);
+    True(!result.WasRerouted);
+    Equal(4, transport.Writes.Count);
+
+    using var initialize = System.Text.Json.JsonDocument.Parse(transport.Writes[0]);
+    Equal("initialize", initialize.RootElement.GetProperty("method").GetString());
+    Equal("cccg_router", initialize.RootElement.GetProperty("params").GetProperty("clientInfo").GetProperty("name").GetString());
+
+    using var initialized = System.Text.Json.JsonDocument.Parse(transport.Writes[1]);
+    Equal("initialized", initialized.RootElement.GetProperty("method").GetString());
+
+    using var threadStart = System.Text.Json.JsonDocument.Parse(transport.Writes[2]);
+    var threadParams = threadStart.RootElement.GetProperty("params");
+    Equal("thread/start", threadStart.RootElement.GetProperty("method").GetString());
+    Equal("gpt-5.6-sol", threadParams.GetProperty("model").GetString());
+    Equal("never", threadParams.GetProperty("approvalPolicy").GetString());
+    Equal("read-only", threadParams.GetProperty("sandbox").GetString());
+    Equal(true, threadParams.GetProperty("ephemeral").GetBoolean());
+
+    using var turnStart = System.Text.Json.JsonDocument.Parse(transport.Writes[3]);
+    Equal("turn/start", turnStart.RootElement.GetProperty("method").GetString());
+    Equal("medium", turnStart.RootElement.GetProperty("params").GetProperty("effort").GetString());
+}
+
+static void CodexAdapterDisclosesReroute()
+{
+    var transport = new ScriptedJsonLineTransport(new[]
+    {
+        "{\"id\":0,\"result\":{}}",
+        "{\"id\":1,\"result\":{\"thread\":{\"id\":\"thr_test\"},\"model\":\"gpt-5.6-sol\"}}",
+        "{\"id\":2,\"result\":{\"turn\":{\"id\":\"turn_test\",\"status\":\"inProgress\"}}}",
+        "{\"method\":\"model/rerouted\",\"params\":{\"threadId\":\"thr_test\",\"turnId\":\"turn_test\",\"fromModel\":\"gpt-5.6-sol\",\"toModel\":\"gpt-5.6-luna\",\"reason\":\"availability\"}}",
+        "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_test\",\"turnId\":\"turn_test\",\"completedAtMs\":1,\"item\":{\"id\":\"item_test\",\"type\":\"agentMessage\",\"text\":\"fallback\"}}}",
+        "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_test\",\"turn\":{\"id\":\"turn_test\",\"status\":\"completed\",\"items\":[],\"error\":null}}}"
+    });
+    var client = new CodexAppServerClient(_ => Task.FromResult<IJsonLineTransport>(transport));
+
+    var result = client.CompleteAsync("test", "gpt-5.6-sol", "medium", @"D:\code\CCCG")
+        .GetAwaiter().GetResult();
+
+    Equal("gpt-5.6-luna", result.ActualModel);
+    True(result.WasRerouted);
+    True(ProviderDisclosure.Format(
+            "codex-app-server",
+            result.ActualModel,
+            result.Text,
+            result.RequestedModel)
+        .StartsWith("[CCCG provider=codex-app-server model=gpt-5.6-luna rerouted-from=gpt-5.6-sol]", StringComparison.Ordinal));
+}
+
+static void MonitorParsesHealthy()
+{
+    var line = "2026-08-12 22:23:35 [info] [CCD CycleHealth] healthy cycle for local_7a70cec7-18e5-4154-b1bd-73c3ed6b5876 (43s, hadFirstResponse=true)";
+    True(new ClaudeLogParser().TryParse(line, out var signal));
+    Equal("session.cycle_healthy", signal!.Event);
+    Equal("local_7a70cec7-18e5-4154-b1bd-73c3ed6b5876", signal.RawSessionId);
+    Equal(43, signal.Data["durationSeconds"]);
+    Equal(true, signal.Data["hadFirstResponse"]);
+}
+
+static void MonitorParsesTimings()
+{
+    var line = "2026-08-12 21:31:28 [info] [CCD start-timing] local_7a70cec7-18e5-4154-b1bd-73c3ed6b5876 preflight=8ms query=11ms enqueue=10ms init=9148ms first_assistant=6410ms total_to_assistant=15976ms";
+    True(new ClaudeLogParser().TryParse(line, out var signal));
+    Equal("session.start_timing", signal!.Event);
+    Equal(6410, signal.Data["first_assistant"]);
+    Equal(15976, signal.Data["total_to_assistant"]);
+}
+
+static void MonitorDeduplicates()
+{
+    var deduplicator = new EventDeduplicator();
+    var now = DateTimeOffset.UtcNow;
+    True(deduplicator.ShouldEmit("same", now));
+    True(!deduplicator.ShouldEmit("same", now.AddMilliseconds(10)));
+    True(deduplicator.ShouldEmit("same", now.AddSeconds(3)));
+}
+
+static void MonitorMetadataIsMinimal()
+{
+    var path = TempJson("""
+        {
+          "sessionId":"local_7a70cec7-18e5-4154-b1bd-73c3ed6b5876",
+          "cliSessionId":"8ff1d57e-a21a-45ca-8168-2ca35a5b66a7",
+          "lastActivityAt":123,
+          "completedTurns":4,
+          "model":"claude-haiku-4-5",
+          "effort":"medium",
+          "permissionMode":"default",
+          "bridgeSessionIds":["bridge-secret"],
+          "title":"must not be collected",
+          "cwd":"must not be collected",
+          "prompt":"must not be collected"
+        }
+        """);
+    try
+    {
+        var snapshot = SessionMetadataReader.TryRead(path)!;
+        Equal(4, snapshot.CompletedTurns);
+        Equal("claude-haiku-4-5", snapshot.Model);
+        Equal(1, snapshot.RawBridgeSessionIds.Count);
+        True(!snapshot.ToString().Contains("must not be collected", StringComparison.Ordinal));
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void MonitorContentSelectsVisibleText()
+{
+    var parser = new TranscriptContentParser();
+    var user = parser.Parse("""
+        {"type":"user","uuid":"u1","parentUuid":"p1","promptId":"prompt1","timestamp":"2026-08-12T23:00:00+08:00","message":{"role":"user","content":"hello"}}
+        """);
+    Equal(1, user.Count);
+    Equal("user_prompt", user[0].Kind);
+    Equal("hello", user[0].Text);
+
+    var assistant = parser.Parse("""
+        {"type":"assistant","uuid":"a1","requestId":"r1","message":{"id":"m1","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"private"},{"type":"text","text":"visible one"},{"type":"tool_use","name":"Read","input":{"secret":"no"}},{"type":"text","text":"visible two"}]}}
+        """);
+    Equal(2, assistant.Count);
+    Equal("assistant_response", assistant[0].Kind);
+    Equal("visible one", assistant[0].Text);
+    Equal(1, assistant[0].BlockIndex);
+    Equal("visible two", assistant[1].Text);
+    Equal(3, assistant[1].BlockIndex);
+    True(!assistant.Any(item => item.Text.Contains("private", StringComparison.Ordinal)));
+    True(!assistant.Any(item => item.Text.Contains("secret", StringComparison.Ordinal)));
+
+    var toolResult = parser.Parse("""
+        {"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"credential"}]}}
+        """);
+    Equal(0, toolResult.Count);
+}
+
+static void MonitorOperationsParse()
+{
+    var parser = new TranscriptOperationParser();
+    var request = parser.Parse("""
+        {"type":"assistant","timestamp":"2026-08-12T23:00:00+08:00","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"WebSearch","input":{"query":"synthetic query"}}]}}
+        """);
+    Equal(1, request.Count);
+    Equal("session.tool_requested", request[0].Event);
+    Equal("tool-1", request[0].RawOperationId);
+    Equal("WebSearch", request[0].ToolName);
+    Equal("web_search", request[0].ToolKind);
+    Equal("query", request[0].InputKeys.Single());
+    True(request[0].PayloadCharacters > 0);
+
+    var result = parser.Parse("""
+        {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"text","text":"synthetic result"}],"is_error":false}]}}
+        """);
+    Equal(1, result.Count);
+    Equal("session.tool_completed", result[0].Event);
+    Equal("tool-1", result[0].RawOperationId);
+    Equal(false, result[0].IsError);
+    Equal(1, result[0].ResultBlockCount);
+
+    var hook = parser.Parse("""
+        {"type":"system","subtype":"stop_hook_summary","timestamp":"2026-08-12T23:00:01+08:00","hookCount":2,"hookInfos":[{}],"hookErrors":[{}],"preventedContinuation":true,"stopReason":"blocked","hasOutput":true}
+        """);
+    Equal(1, hook.Count);
+    Equal("session.hook_summary", hook[0].Event);
+    Equal(2, hook[0].HookCount);
+    Equal(1, hook[0].HookInfoCount);
+    Equal(1, hook[0].HookErrorCount);
+    Equal(true, hook[0].PreventedContinuation);
+    Equal(true, hook[0].HasOutput);
+}
+
+static void MonitorContentDatasetIsSeparate()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"cccg-content-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    string runDirectory;
+    try
+    {
+        using (var dataset = MonitorDataset.Create(directory, Array.Empty<string>(), "test", captureContent: true))
+        {
+            runDirectory = dataset.RunDirectory;
+            dataset.WriteContent(new MonitorContentRecord
+            {
+                Kind = "user_prompt",
+                CliSessionKey = "cs_test",
+                Text = "local debug text"
+            });
+        }
+
+        var manifest = File.ReadAllText(Path.Combine(runDirectory!, "manifest.json"));
+        var content = File.ReadAllText(Path.Combine(runDirectory!, "content.jsonl"));
+        var eventsPath = Path.Combine(runDirectory!, "events.jsonl");
+        True(manifest.Contains("\"promptBodiesStored\": true", StringComparison.Ordinal));
+        True(manifest.Contains("\"thinkingStored\": false", StringComparison.Ordinal));
+        True(content.Contains("local debug text", StringComparison.Ordinal));
+        Equal(string.Empty, File.ReadAllText(eventsPath));
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void MonitorContentWatcherCapturesAppend()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"cccg-watcher-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var path = Path.Combine(directory, "synthetic-session.jsonl");
+    const string oldLine = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"old must stay out\"}}";
+    const string newLine = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"new must be captured\"}}";
+    File.WriteAllText(path, oldLine + Environment.NewLine);
+    try
+    {
+        using var watcher = new TranscriptActivityWatcher(directory, readAppendedLines: true);
+        File.AppendAllText(path, newLine + Environment.NewLine);
+
+        var appended = new List<string>();
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(3);
+        while (DateTimeOffset.UtcNow < deadline && appended.Count == 0)
+        {
+            Thread.Sleep(50);
+            appended.AddRange(watcher.Drain().SelectMany(activity => activity.AppendedLines));
+        }
+
+        Equal(1, appended.Count);
+        Equal(newLine, appended[0]);
+        True(!appended.Any(line => line.Contains("old must stay out", StringComparison.Ordinal)));
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void MonitorPseudonymsAreStable()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"cccg-pseudo-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var first = StablePseudonymizer.LoadOrCreate(directory).Session("raw-session-id");
+        var second = StablePseudonymizer.LoadOrCreate(directory).Session("raw-session-id");
+        Equal(first, second);
+        True(!first.Contains("raw-session-id", StringComparison.Ordinal));
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void MonitorTailerReadsAppend()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-tail-{Guid.NewGuid():N}.log");
+    File.WriteAllText(path, "old\n");
+    try
+    {
+        var tailer = new IncrementalFileTailer(path, startAtEnd: true);
+        File.AppendAllText(path, "new-one\nnew-two\n");
+        var lines = tailer.ReadNewLines();
+        Equal(2, lines.Count);
+        Equal("new-one", lines[0]);
+        Equal("new-two", lines[1]);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void MonitorWorkerControlRoundTrips()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"cccg-control-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var readyPath = Path.Combine(directory, "ready.json");
+        var stopPath = Path.Combine(directory, "stop.signal");
+        MonitorWorkerControl.WriteReady(readyPath, new MonitorWorkerReady
+        {
+            Generation = "gen-test",
+            WorkerPid = 123,
+            RunDirectory = directory,
+            ContentCapture = true,
+            MonitorVersion = "test"
+        });
+        var ready = MonitorWorkerControl.TryReadReady(readyPath)!;
+        Equal("gen-test", ready.Generation);
+        Equal(123, ready.WorkerPid);
+        Equal(true, ready.ContentCapture);
+        True(!MonitorWorkerControl.IsStopRequested(stopPath));
+        MonitorWorkerControl.RequestStop(stopPath);
+        True(MonitorWorkerControl.IsStopRequested(stopPath));
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void HostStagesImmutableWorker()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"cccg-host-store-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    var source = Path.Combine(directory, "candidate.exe");
+    File.WriteAllBytes(source, new byte[] { 1, 2, 3, 4, 5 });
+    try
+    {
+        var store = new SupervisorStore(Path.Combine(directory, "state"));
+        var first = store.StageAndRequest(source);
+        var second = store.StageAndRequest(source);
+        True(File.Exists(first.StagedPath));
+        True(!string.Equals(source, first.StagedPath, StringComparison.OrdinalIgnoreCase));
+        Equal(first.Sha256, second.Sha256);
+        Equal(first.StagedPath, second.StagedPath);
+        True(first.RequestId != second.RequestId);
+        var desired = store.Read<DesiredWorker>(store.DesiredPath)!;
+        Equal(second.RequestId, desired.RequestId);
+        Equal(second.Sha256, desired.Sha256);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void HostParsesOptions()
+{
+    var state = Path.Combine(Path.GetTempPath(), "cccg-state-test");
+    var data = Path.Combine(Path.GetTempPath(), "cccg-data-test");
+    var parsed = HostOptions.Parse(new[]
+    {
+        "run", "--worker", "worker.exe", "--state-dir", state,
+        "--data-dir", data, "--capture-content", "--history", "0",
+        "--ready-timeout", "7", "--stop-timeout", "3", "--overlap-ms", "1500",
+        "--no-dashboard"
+    });
+    Equal("run", parsed.Command);
+    Equal("worker.exe", parsed.WorkerPath);
+    Equal(true, parsed.CaptureContent);
+    Equal(0, parsed.HistoryLines);
+    Equal(TimeSpan.FromSeconds(7), parsed.ReadyTimeout);
+    Equal(TimeSpan.FromSeconds(3), parsed.StopTimeout);
+    Equal(TimeSpan.FromMilliseconds(1500), parsed.HandoffOverlap);
+    Equal(true, parsed.NoDashboard);
+}
+
+static void HostRequiresStableActivation()
+{
+    var active = new ActiveWorker
+    {
+        RequestId = "request",
+        Generation = "generation",
+        Sha256 = "ABC",
+        ConfigurationKey = "CONFIG",
+        WorkerPath = "worker.exe",
+        WorkerPid = 123,
+        ReadyFile = "ready.json",
+        StopFile = "stop.signal",
+        RunDirectory = "run",
+        ReadyAtUtc = DateTimeOffset.UtcNow,
+        Retiring = new[]
+        {
+            new RetiringWorker
+            {
+                Generation = "old",
+                WorkerPid = 122,
+                WorkerPath = "old.exe",
+                ReadyFile = "old-ready.json",
+                StopFile = "old-stop.signal"
+            }
+        }
+    };
+    True(!SupervisorStore.IsStableActivation(active, "ABC"));
+    True(SupervisorStore.IsStableActivation(
+        active with { Retiring = Array.Empty<RetiringWorker>() },
+        "abc"));
+    True(!SupervisorStore.IsStableActivation(
+        active with { Retiring = Array.Empty<RetiringWorker>() },
+        "different"));
+}
+
+static string TempJson(string json)
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-test-{Guid.NewGuid():N}.json");
+    File.WriteAllText(path, json);
+    return path;
+}
+
+static void Equal<T>(T expected, T actual)
+{
+    if (!EqualityComparer<T>.Default.Equals(expected, actual))
+    {
+        throw new InvalidOperationException($"Expected '{expected}', got '{actual}'.");
+    }
+}
+
+static void True(bool value)
+{
+    if (!value)
+    {
+        throw new InvalidOperationException("Expected true.");
+    }
+}
+
+static void GrokDirectoryRanksPeers()
+{
+    var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
+    using var home = new GrokHomeFixture();
+    home.WriteSummary("D:\\code\\app", "sess-idle", "Idle peer", "waiting", now.AddMinutes(-10));
+    home.WriteSummary("D:\\code\\app", "sess-work", "Busy peer", "editing", now.AddSeconds(-20));
+    home.WriteSummary("D:\\code\\app", "sess-sleep", "Old peer", "yesterday", now.AddDays(-1));
+    home.WriteActive("sess-idle", 1001, "D:\\code\\app", now.AddHours(-1));
+    home.WriteActive("sess-work", 1002, "D:\\code\\app", now.AddMinutes(-5));
+
+    var listed = home.Open(pid => pid is 1001 or 1002, now).List();
+    Equal(3, listed.TotalCount);
+    Equal("sess-work", listed.Peers[0].SessionId);
+    Equal(PeerStatus.LiveWorking, listed.Peers[0].Status);
+    Equal("sess-idle", listed.Peers[1].SessionId);
+    Equal(PeerStatus.LiveWorking, listed.Peers[1].Status);
+    Equal("sess-sleep", listed.Peers[2].SessionId);
+    Equal(PeerStatus.Resumable, listed.Peers[2].Status);
+    True(listed.CanCreateNew);
+}
+
+static void GrokDirectoryFiltersAndInspects()
+{
+    var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
+    using var home = new GrokHomeFixture();
+    home.WriteSummary("D:\\code\\app", "sess-app", "App peer", "in app", now);
+    home.WriteSummary("D:\\code\\other", "sess-other", "Other peer", "elsewhere", now);
+
+    var directory = home.Open(_ => false, now);
+    var listed = directory.List("D:\\code\\app");
+    Equal(1, listed.TotalCount);
+    Equal("sess-app", listed.Peers[0].SessionId);
+    Equal("D:\\code\\app", listed.Workspace);
+
+    var inspected = directory.Inspect("sess-app");
+    Equal("App peer", inspected?.Title);
+    Equal("in app", inspected?.LastTurnSummary);
+    True(directory.Inspect("missing") is null);
+}
+
+static void GrokDirectoryIgnoresDeadPids()
+{
+    var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
+    using var home = new GrokHomeFixture();
+    home.WriteSummary("D:\\code\\app", "sess-dead", "Dead peer", "gone", now.AddHours(-2));
+    home.WriteActive("sess-dead", 9, "D:\\code\\app", now);
+
+    var listed = home.Open(_ => false, now).List();
+    Equal(1, listed.TotalCount);
+    Equal(PeerStatus.Resumable, listed.Peers[0].Status);
+    True(listed.Peers[0].Pid is null);
+}
+
+static void GrokDirectoryEmptyHome()
+{
+    var listed = new GrokPeerDirectory(
+        Path.Combine(Path.GetTempPath(), $"cccg-missing-grok-{Guid.NewGuid():N}"))
+        .List();
+    Equal(0, listed.TotalCount);
+    True(listed.CanCreateNew);
+}
+
+static void CodexDirectoryRanksParents()
+{
+    var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
+    using var home = new CodexHomeFixture();
+    home.WriteIndex("sess-idle", "Idle Codex");
+    home.WriteIndex("sess-work", "Busy Codex");
+    home.WriteIndex("sess-sleep", "Old Codex");
+    home.WriteRollout("sess-idle", "D:\\code\\app", now.AddMinutes(-10), subagent: false);
+    home.WriteRollout("sess-work", "D:\\code\\app", now.AddSeconds(-20), subagent: false);
+    home.WriteRollout("sess-sleep", "D:\\code\\app", now.AddDays(-1), subagent: false);
+    home.WriteRollout("sess-idle", "D:\\code\\app", now.AddMinutes(-9), subagent: true);
+    var held = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        home.LockPath("sess-idle"),
+        home.LockPath("sess-work")
+    };
+
+    var listed = home.Open(held.Contains, now).List();
+    Equal(3, listed.TotalCount);
+    Equal("sess-work", listed.Peers[0].SessionId);
+    Equal(PeerStatus.LiveWorking, listed.Peers[0].Status);
+    Equal("sess-idle", listed.Peers[1].SessionId);
+    Equal(PeerStatus.LiveWorking, listed.Peers[1].Status);
+    Equal("sess-sleep", listed.Peers[2].SessionId);
+    Equal(PeerStatus.Resumable, listed.Peers[2].Status);
+    Equal(3, listed.Peers.Count);
+    Equal("D:\\code\\app", listed.Peers[0].Cwd);
+}
+
+static void CodexDirectoryFiltersAndInspects()
+{
+    var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
+    using var home = new CodexHomeFixture();
+    home.WriteIndex("sess-app", "App Codex");
+    home.WriteIndex("sess-other", "Other Codex");
+    home.WriteRollout("sess-app", "D:\\code\\app", now, subagent: false);
+    home.WriteRollout("sess-other", "D:\\code\\other", now, subagent: false);
+
+    var directory = home.Open(_ => false, now);
+    var listed = directory.List("D:\\code\\app");
+    Equal(1, listed.TotalCount);
+    Equal("sess-app", listed.Peers[0].SessionId);
+    Equal("App Codex", listed.Peers[0].Title);
+    True(listed.Peers[0].LastTurnSummary is null);
+
+    var inspected = directory.Inspect("sess-app");
+    Equal("D:\\code\\app", inspected?.Cwd);
+    True(directory.Inspect("missing") is null);
+}
+
+static void CodexDirectoryFillsParentFromSubagentOnly()
+{
+    var now = DateTimeOffset.Parse("2026-08-13T03:00:00Z");
+    using var home = new CodexHomeFixture();
+    home.WriteIndex("sess-live", "Live parent");
+    home.WriteRollout("sess-live", "D:\\code\\openruterati", now.AddMinutes(-5), subagent: true);
+    var listed = home.Open(path => path.Contains("sess-live", StringComparison.Ordinal), now).List();
+    Equal(1, listed.TotalCount);
+    Equal(PeerStatus.LiveWorking, listed.Peers[0].Status);
+    Equal("D:\\code\\openruterati", listed.Peers[0].Cwd);
+    Equal("openai", listed.Peers[0].Model);
+}
+
+static void ClaudeDirectoryListsAndMarksLive()
+{
+    using var home = new ClaudeHomeFixture();
+    var liveId = "11111111-1111-4111-8111-111111111111";
+    var oldId = "22222222-2222-4222-8222-222222222222";
+    home.WriteTranscript(liveId, "D:\\code\\app", "Live Claude", "claude-sonnet-5");
+    home.WriteTranscript(oldId, "D:\\code\\other", "Old Claude", "claude-opus-5");
+    home.WriteActive(liveId, 777, "D:\\code\\app", "desktop-app");
+
+    var directory = new ClaudePeerDirectory(home.Root, pid => pid == 777);
+    var listed = directory.List("D:\\code\\app", 20);
+    Equal(1, listed.TotalCount);
+    Equal(liveId, listed.Peers[0].SessionId);
+    Equal(PeerStatus.LiveWorking, listed.Peers[0].Status);
+    Equal("Live Claude", listed.Peers[0].Title);
+    Equal("claude-sonnet-5", listed.Peers[0].Model);
+    Equal(777, listed.Peers[0].Pid);
+    Equal(liveId, directory.Inspect(liveId)?.SessionId);
+}
+
+static void ClaudeDirectoryIgnoresDeadRegistry()
+{
+    using var home = new ClaudeHomeFixture();
+    var id = "33333333-3333-4333-8333-333333333333";
+    home.WriteTranscript(id, "D:\\code\\app", "Closed Claude", "claude-opus-5");
+    home.WriteActive(id, 888, "D:\\code\\app", "stale");
+
+    var peer = new ClaudePeerDirectory(home.Root, _ => false).List().Peers.Single();
+    Equal(PeerStatus.Resumable, peer.Status);
+    True(peer.Pid is null);
+}
+
+static void PeerSelectorPrefersIdle()
+{
+    var peers = new[]
+    {
+        new Peer("grok", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 1, null, null, null),
+        new Peer("grok", "idle", PeerStatus.LiveIdle, "D:\\code\\app", "Idle", null, null, 2, null, null, null),
+        new Peer("grok", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
+    };
+    var picked = PeerSelector.Select("grok", peers, sessionId: null, cwd: "D:\\code\\app", allowNew: true);
+    Equal("idle", picked.SessionId);
+    Equal(DispatchAction.Inject, picked.Action);
+
+    var created = PeerSelector.Select("grok", Array.Empty<Peer>(), null, "D:\\code\\app", allowNew: true);
+    Equal(DispatchAction.Create, created.Action);
+}
+
+static void PeerSelectorRejectsWorking()
+{
+    var peers = new[]
+    {
+        new Peer("claude", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, null, null, null, null)
+    };
+    Throws<InvalidOperationException>(() =>
+        PeerSelector.Select("claude", peers, "busy", null, allowNew: false));
+}
+
+static void PeerSelectorInsertsExplicitLivePeer()
+{
+    var peers = new[]
+    {
+        new Peer("codex", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 4242, null, null, null)
+    };
+    var picked = PeerSelector.Select("codex", peers, "busy", null, allowNew: false);
+    Equal("busy", picked.SessionId);
+    Equal(DispatchAction.Inject, picked.Action);
+    Equal(4242, picked.Pid);
+    True(!picked.WaitForWriterFree);
+    True(picked.Reason.Contains("Typing into the live window", StringComparison.Ordinal));
+}
+
+static void ProviderCommandResumesPeers()
+{
+    var grok = ProviderCommand.BuildGrok(
+        DispatchAction.Resume, "sess-1", "D:\\code\\app", "D:\\tmp\\prompt.txt", grokHome: "D:\\tmp\\grok-home");
+    True(grok.Arguments.Contains("-r"));
+    True(grok.Arguments.Contains("sess-1"));
+    True(grok.Arguments.Contains("--prompt-file"));
+
+    var created = ProviderCommand.BuildGrok(
+        DispatchAction.Create, null, "D:\\code\\app", "D:\\tmp\\prompt.txt", grokHome: "D:\\tmp\\grok-home");
+    True(!created.Arguments.Contains("-r"));
+
+    var codex = ProviderCommand.BuildCodex(
+        DispatchAction.Attach, "thread-1", "D:\\code\\app", "D:\\tmp\\prompt.txt", "codex.cmd");
+    Equal("codex.cmd", codex.FileName);
+    True(codex.Arguments[0] == "exec");
+    True(codex.Arguments.Contains("resume"));
+    True(codex.Arguments.Contains("thread-1"));
+    True(codex.Arguments.Contains("-"));
+    True(codex.Arguments.Contains("--json"));
+
+    var claude = ProviderCommand.BuildClaude(
+        DispatchAction.Resume,
+        "11111111-1111-4111-8111-111111111111",
+        "D:\\code\\app",
+        "D:\\tmp\\prompt.txt",
+        "claude.exe");
+    Equal("claude.exe", claude.FileName);
+    True(claude.Arguments.Contains("--resume"));
+    True(claude.Arguments.Contains("--safe-mode"));
+    True(claude.Arguments.Contains("--disable-slash-commands"));
+    True(claude.Arguments.Contains("--system-prompt"));
+    True(claude.Arguments.Contains(ProviderCommand.ClaudeTextOnlySystemPrompt));
+    True(claude.Arguments.Contains("--tools="));
+    True(claude.Arguments.Contains("--strict-mcp-config"));
+    True(claude.Arguments.Contains("--setting-sources="));
+}
+
+static void ProviderCommandPreassignsGrokId()
+{
+    var command = ProviderCommand.BuildGrok(
+        DispatchAction.Create,
+        null,
+        "D:\\code\\app",
+        "D:\\tmp\\prompt.txt",
+        "D:\\tmp\\grok-home",
+        "11111111-1111-4111-8111-111111111111");
+    True(command.Arguments.Contains("--session-id"));
+    True(command.Arguments.Contains("11111111-1111-4111-8111-111111111111"));
+}
+
+static void ProviderOutputParsesClaude()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-claude-output-{Guid.NewGuid():N}.jsonl");
+    try
+    {
+        File.WriteAllText(path,
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"11111111-1111-4111-8111-111111111111\"}\n"
+            + "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"draft\"}]}}\n"
+            + "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"11111111-1111-4111-8111-111111111111\",\"result\":\"CLAUDE-OK\"}");
+        Equal(
+            "11111111-1111-4111-8111-111111111111",
+            ProviderOutputParser.FindSessionId("claude", path));
+        Equal("CLAUDE-OK", ProviderOutputParser.CollectResponse("claude", path));
+        True(ProviderOutputParser.FindError("claude", path) is null);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ProviderOutputNormalizesGrok()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-grok-output-{Guid.NewGuid():N}.json");
+    try
+    {
+        File.WriteAllText(path, """
+            {
+              "text": "GROK-NORMALIZED-OK",
+              "thought": "private chain text",
+              "usage": { "input_tokens": 10 },
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            }
+            """);
+        Equal("GROK-NORMALIZED-OK", ProviderOutputParser.CollectResponse("grok", path));
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void FileProcessLauncherPreservesUtf8()
+{
+    const string expected = "繁體中文測試：你好，世界！";
+    const string expectedError = "診斷訊息：正常";
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-utf8-process-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    var stdoutPath = Path.Combine(root, "stdout.log");
+    var stderrPath = Path.Combine(root, "stderr.log");
+
+    try
+    {
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("The current process executable is unavailable.");
+        var childArguments = Path.GetFileNameWithoutExtension(executable)
+            .Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+            ? new[] { System.Reflection.Assembly.GetExecutingAssembly().Location, "--emit-utf8-grok-json" }
+            : new[] { "--emit-utf8-grok-json" };
+
+        var launcher = new FileProcessLauncher();
+        launcher.Start(
+            new LaunchCommand(executable, childArguments, root),
+            stdoutPath,
+            stderrPath,
+            stdinPath: null,
+            out var waiter);
+
+        Equal(0, waiter.Wait(TimeSpan.FromSeconds(15)));
+        var stdoutBytes = File.ReadAllBytes(stdoutPath);
+        True(stdoutBytes.Length > 0 && stdoutBytes[0] == (byte)'{');
+        Equal(expected, ProviderOutputParser.CollectResponse("grok", stdoutPath));
+        Equal(expectedError, File.ReadAllText(stderrPath, System.Text.Encoding.UTF8).Trim());
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void FileProcessLauncherPreservesUtf8Stdin()
+{
+    const string expected = "編碼測試通過，繁體中文顯示正常";
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-utf8-stdin-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    var stdinPath = Path.Combine(root, "prompt.txt");
+    var stdoutPath = Path.Combine(root, "stdout.log");
+    var stderrPath = Path.Combine(root, "stderr.log");
+    File.WriteAllText(stdinPath, expected, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+    try
+    {
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("The current process executable is unavailable.");
+        var childArguments = Path.GetFileNameWithoutExtension(executable)
+            .Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+            ? new[] { System.Reflection.Assembly.GetExecutingAssembly().Location, "--echo-utf8-stdin" }
+            : new[] { "--echo-utf8-stdin" };
+
+        var launcher = new FileProcessLauncher();
+        launcher.Start(
+            new LaunchCommand(executable, childArguments, root),
+            stdoutPath,
+            stderrPath,
+            stdinPath,
+            out var waiter);
+
+        Equal(0, waiter.Wait(TimeSpan.FromSeconds(15)));
+        Equal(expected, File.ReadAllText(stdoutPath, System.Text.Encoding.UTF8).TrimEnd('\r', '\n'));
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void DispatchRunnerBindsNewClaudeSession()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-new-claude-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var bindings = new DispatchBindingStore(Path.Combine(root, "bindings"));
+    var runner = new DispatchRunner(
+        store,
+        _ => Array.Empty<Peer>(),
+        new ClaudeEchoProcessLauncher(),
+        claudeCommand: "claude.exe",
+        bindings: bindings);
+    var job = runner.Enqueue("claude", "Reply CLAUDE-BOUND-OK", cwd: "D:\\code\\app");
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    True(Guid.TryParse(done.SessionId, out _));
+    Equal(done.SessionId, bindings.Load("claude", "D:\\code\\app")?.SessionId);
+    var collected = System.Text.Json.JsonSerializer.Serialize(runner.Collect(job.JobId));
+    True(collected.Contains("CLAUDE-BOUND-OK", StringComparison.Ordinal));
+}
+
+static void DispatchRunnerRoutesLiveClaude()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-live-claude-{Guid.NewGuid():N}");
+    var peers = new[]
+    {
+        new Peer(
+            "claude",
+            "11111111-1111-4111-8111-111111111111",
+            PeerStatus.LiveWorking,
+            "D:\\code\\app",
+            "Doc peer",
+            null,
+            "claude-sonnet-5",
+            123,
+            null,
+            null,
+            4)
+    };
+    var runner = new DispatchRunner(new DispatchJobStore(root), _ => peers);
+    try
+    {
+        runner.Enqueue(
+            "claude",
+            "hello",
+            "11111111-1111-4111-8111-111111111111",
+            "D:\\code\\app",
+            allowNew: false);
+        throw new InvalidOperationException("Expected live Claude routing refusal.");
+    }
+    catch (InvalidOperationException exception)
+    {
+        True(exception.Message.Contains("mcp__ccd_session_mgmt__list_sessions", StringComparison.Ordinal));
+        True(exception.Message.Contains("mcp__ccd_session_mgmt__send_message", StringComparison.Ordinal));
+    }
+}
+
+static void DispatchRunnerBindsNewCodexThread()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-new-codex-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var bindings = new DispatchBindingStore(Path.Combine(root, "bindings"));
+    const string output = "{\"type\":\"thread.started\",\"thread_id\":\"thread-new\"}\n"
+        + "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"NEW-CODEX-OK\"}}";
+    var runner = new DispatchRunner(
+        store,
+        _ => Array.Empty<Peer>(),
+        new FakeProcessLauncher(output),
+        codexCommand: "codex.exe",
+        bindings: bindings);
+    var job = runner.Enqueue("codex", "Reply NEW-CODEX-OK", cwd: "D:\\code\\app");
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    Equal("thread-new", done.SessionId);
+    Equal("thread-new", bindings.Load("codex", "D:\\code\\app")?.SessionId);
+    True(bindings.Load("codex", "D:\\code\\app")?.ManagedByCccg == true);
+    var collected = System.Text.Json.JsonSerializer.Serialize(runner.Collect(job.JobId));
+    True(collected.Contains("NEW-CODEX-OK", StringComparison.Ordinal));
+}
+
+static void DispatchRunnerCollectsSuccess()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"cccg-jobs-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(directory);
+    var peers = new[]
+    {
+        new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("DISPATCH-OK"));
+    var job = runner.Dispatch("grok", "Reply only DISPATCH-OK", "idle", "D:\\code\\app", allowNew: false);
+    True(!string.IsNullOrWhiteSpace(job.JobId));
+    var deadline = DateTime.UtcNow.AddSeconds(2);
+    DispatchJob done;
+    do
+    {
+        done = runner.Status(job.JobId);
+        if (done.Status is DispatchJobStatus.Succeeded or DispatchJobStatus.Failed)
+        {
+            break;
+        }
+
+        Thread.Sleep(20);
+    }
+    while (DateTime.UtcNow < deadline);
+
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    var collected = runner.Collect(job.JobId);
+    var json = System.Text.Json.JsonSerializer.Serialize(collected);
+    True(json.Contains("DISPATCH-OK", StringComparison.Ordinal));
+}
+
+static void DispatchRunnerInjectsLiveWindow()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-live-inject-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var launcher = new CountingProcessLauncher("SHOULD-NOT-LAUNCH");
+    var injector = new RecordingLiveInputInjector();
+    var runner = new DispatchRunner(
+        store,
+        _ =>
+        [
+            new Peer("codex", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 4242, null, null, null)
+        ],
+        launcher,
+        codexCommand: "codex.exe",
+        injector: injector);
+    var job = runner.Enqueue("codex", "hello live window", "busy", "D:\\code\\app", allowNew: false);
+    True(job.Reason?.Contains("Typing into the live window", StringComparison.Ordinal) == true);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    Equal(0, launcher.Starts);
+    Equal(1, injector.Calls.Count);
+    Equal(4242, injector.Calls[0].ProcessId);
+    True(injector.Calls[0].Text.Contains("hello live window", StringComparison.Ordinal));
+    var json = System.Text.Json.JsonSerializer.Serialize(runner.Collect(job.JobId));
+    True(json.Contains("Typed into the live", StringComparison.Ordinal));
+}
+
+static void DispatchRunnerInjectSkipsWorkspaceLease()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-live-nolease-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var affinity = "grok|cwd|" + Path.GetFullPath("D:\\code\\app")
+        .TrimEnd(Path.DirectorySeparatorChar)
+        .ToLowerInvariant();
+    var gatePath = Path.Combine(
+        store.Root,
+        "..",
+        "leases",
+        CrossProcessFileGate.Key(affinity) + ".lock");
+    using var held = CrossProcessFileGate.Acquire(gatePath, TimeSpan.FromSeconds(2));
+    var injector = new RecordingLiveInputInjector();
+    var runner = new DispatchRunner(
+        store,
+        _ =>
+        [
+            new Peer("grok", "busy", PeerStatus.LiveWorking, "D:\\code\\app", "Busy", null, null, 11, null, null, null)
+        ],
+        new FakeProcessLauncher("SHOULD-NOT-LAUNCH"),
+        injector: injector);
+    var job = runner.Enqueue("grok", "hello", "busy", "D:\\code\\app", allowNew: false);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    Equal(1, injector.Calls.Count);
+}
+
+static void LiveInjectorBindsWriteConsoleInputW()
+{
+    Equal("WriteConsoleInputW", WindowsLiveInputInjector.WriteConsoleInputEntryPoint);
+}
+
+static void LiveInjectorBuildsEnterRecords()
+{
+    Equal(
+        "[CCCG dispatch from Claude Desktop to grok] hello",
+        WindowsLiveInputInjector.FlattenForTyping(
+            "[CCCG dispatch from Claude Desktop to grok]\n\nhello\n"));
+    var records = WindowsLiveInputInjector.BuildKeyEvents("你好");
+    True(records.Length >= 6);
+    Equal(WindowsLiveInputInjector.KeyEvent, records[0].EventType);
+    Equal('你', records[0].KeyEvent.UnicodeChar);
+    Equal('\r', records[^1].KeyEvent.UnicodeChar);
+    Equal(WindowsLiveInputInjector.VkReturn, records[^1].KeyEvent.wVirtualKeyCode);
+    var typed = WindowsLiveInputInjector.BuildSendInput("a\n\nb");
+    Equal(6, typed.Length);
+    var submit = WindowsLiveInputInjector.BuildSubmitInput();
+    True(submit.Length >= 8);
+    True(WindowsLiveInputInjector.EnumerateProcessChain(Environment.ProcessId).Contains(Environment.ProcessId));
+}
+
+static void DispatchRunnerDeliversToLiveIdlePeer()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-live-idle-{Guid.NewGuid():N}");
+    var peers = new[]
+    {
+        new Peer("grok", "idle", PeerStatus.LiveIdle, "D:\\code\\app", "Idle", null, null, 9, null, null, null)
+    };
+    var injector = new RecordingLiveInputInjector();
+    var runner = new DispatchRunner(
+        new DispatchJobStore(root),
+        _ => peers,
+        new FakeProcessLauncher("SHOULD-NOT-LAUNCH"),
+        injector: injector);
+    var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
+    True(job.Reason?.Contains("Typing into the live window", StringComparison.Ordinal) == true);
+    var done = runner.Run(job.JobId);
+    Equal(DispatchJobStatus.Succeeded, done.Status);
+    Equal(1, injector.Calls.Count);
+    Equal(9, injector.Calls[0].ProcessId);
+}
+
+static void DispatchRunnersSerializeManagedPeer()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-serial-{Guid.NewGuid():N}");
+    var jobs = Path.Combine(root, "jobs");
+    var bindings = new DispatchBindingStore(Path.Combine(root, "bindings"));
+    bindings.Save("codex", "managed-peer", "D:\\code\\app");
+    var peers = new[]
+    {
+        new Peer("codex", "managed-peer", PeerStatus.LiveWorking, "D:\\code\\app", "Managed", null, null, null, null, null, null)
+    };
+    var launcher = new TrackingProcessLauncher();
+    var first = new DispatchRunner(
+        new DispatchJobStore(jobs),
+        _ => peers,
+        launcher,
+        codexCommand: "codex.exe",
+        bindings: bindings);
+    var second = new DispatchRunner(
+        new DispatchJobStore(jobs),
+        _ => peers,
+        launcher,
+        codexCommand: "codex.exe",
+        bindings: bindings);
+    var job1 = first.Enqueue("codex", "one", "managed-peer", "D:\\code\\app", false);
+    var job2 = second.Enqueue("codex", "two", "managed-peer", "D:\\code\\app", false);
+    Task.WaitAll(
+        Task.Run(() => first.Run(job1.JobId)),
+        Task.Run(() => second.Run(job2.JobId)));
+    Equal(1, launcher.MaxConcurrent);
+    Equal(DispatchJobStatus.Succeeded, first.Status(job1.JobId).Status);
+    Equal(DispatchJobStatus.Succeeded, second.Status(job2.JobId).Status);
+}
+
+static void DispatchStatusFailsDeadWorker()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-dead-worker-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    var job = runner.Enqueue("codex", "test", "old", "D:\\code\\app", false);
+    runner.MarkWorker(job.JobId, int.MaxValue);
+    var failed = runner.Status(job.JobId);
+    Equal(DispatchJobStatus.Failed, failed.Status);
+    True(failed.Error?.Contains("worker exited", StringComparison.OrdinalIgnoreCase) == true);
+}
+
+static void BindingStorePrefersBoundPeer()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-bind-{Guid.NewGuid():N}");
+    var store = new DispatchBindingStore(root);
+    store.Save("codex", "bound-id", "D:\\code\\app");
+    var peers = new[]
+    {
+        new Peer("codex", "other", PeerStatus.LiveIdle, "D:\\code\\app", "Other", null, null, null, null, null, null),
+        new Peer("codex", "bound-id", PeerStatus.Resumable, "D:\\code\\app", "Bound", null, null, null, null, null, null)
+    };
+    var marked = store.Mark(peers, "codex", "D:\\code\\app");
+    True(marked.Single(peer => peer.SessionId == "bound-id").Bound);
+    var picked = PeerSelector.Select("codex", marked, null, "D:\\code\\app", true, store.Load("codex", "D:\\code\\app")?.SessionId);
+    Equal("bound-id", picked.SessionId);
+}
+
+static void InboxLedgerRoundTrips()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-inbox-{Guid.NewGuid():N}");
+    var inbox = new InboxLedger(root);
+    inbox.Post("claude", "codex", "Please review", toProvider: "codex", toSessionId: "s1");
+    inbox.Post("codex", "claude", "Done", fromProvider: "codex", fromSessionId: "s1");
+    var listed = inbox.List();
+    Equal(2, listed.Count);
+    Equal("pending", listed[0].Status);
+    var acked = inbox.Ack(listed[1].Id);
+    Equal("read", acked?.Status);
+    Equal(1, inbox.List(unreadOnly: true).Count);
+}
+
+static void InboxLedgerPreservesConcurrentPosts()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-inbox-race-{Guid.NewGuid():N}");
+    var first = new InboxLedger(root);
+    var second = new InboxLedger(root);
+    Parallel.For(0, 80, index =>
+    {
+        var ledger = index % 2 == 0 ? first : second;
+        ledger.Post("claude", "codex", "message-" + index);
+    });
+    Equal(80, first.List(limit: 100).Count);
+}
+
+static void Throws<T>(Action action) where T : Exception
+{
+    try
+    {
+        action();
+    }
+    catch (T)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+sealed class GrokHomeFixture : IDisposable
+{
+    public string Root { get; } = Path.Combine(Path.GetTempPath(), $"cccg-grok-{Guid.NewGuid():N}");
+
+    private readonly List<string> activeRows = new();
+
+    public GrokHomeFixture() => System.IO.Directory.CreateDirectory(Root);
+
+    public GrokPeerDirectory Open(Func<int, bool> alive, DateTimeOffset now) =>
+        new(Root, alive, () => now, TimeSpan.FromSeconds(90));
+
+    public void WriteActive(string sessionId, int pid, string cwd, DateTimeOffset openedAt)
+    {
+        activeRows.Add(
+            $"{{\"session_id\":\"{sessionId}\",\"pid\":{pid},\"cwd\":{System.Text.Json.JsonSerializer.Serialize(cwd)},\"opened_at\":\"{openedAt:O}\"}}");
+        File.WriteAllText(Path.Combine(Root, "active_sessions.json"), "[" + string.Join(",", activeRows) + "]");
+    }
+
+    public void WriteSummary(
+        string cwd,
+        string sessionId,
+        string title,
+        string lastTurn,
+        DateTimeOffset updated)
+    {
+        var group = Path.Combine(Root, "sessions", Uri.EscapeDataString(cwd), sessionId);
+        System.IO.Directory.CreateDirectory(group);
+        File.WriteAllText(Path.Combine(group, "summary.json"), $$"""
+            {
+              "info": { "id": "{{sessionId}}", "cwd": {{System.Text.Json.JsonSerializer.Serialize(cwd)}} },
+              "generated_title": {{System.Text.Json.JsonSerializer.Serialize(title)}},
+              "last_turn_summary": {{System.Text.Json.JsonSerializer.Serialize(lastTurn)}},
+              "current_model_id": "grok-4.6",
+              "created_at": "{{updated:O}}",
+              "updated_at": "{{updated:O}}",
+              "last_active_at": "{{updated:O}}",
+              "num_messages": 4
+            }
+            """);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            System.IO.Directory.Delete(Root, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
+    }
+}
+
+sealed class CodexHomeFixture : IDisposable
+{
+    public string Root { get; } = Path.Combine(Path.GetTempPath(), $"cccg-codex-{Guid.NewGuid():N}");
+
+    public CodexHomeFixture() => System.IO.Directory.CreateDirectory(Root);
+
+    public CodexPeerDirectory Open(Func<string, bool> lockHeld, DateTimeOffset now) =>
+        new(Root, lockHeld, () => now, TimeSpan.FromSeconds(90));
+
+    public string LockPath(string sessionId) =>
+        Path.Combine(Root, "thread-writer-locks", sessionId + ".lock");
+
+    public void WriteIndex(string sessionId, string title)
+    {
+        File.AppendAllText(
+            Path.Combine(Root, "session_index.jsonl"),
+            $"{{\"id\":\"{sessionId}\",\"thread_name\":{System.Text.Json.JsonSerializer.Serialize(title)},\"updated_at\":\"2026-08-13T03:00:00Z\"}}\n");
+    }
+
+    public void WriteRollout(string sessionId, string cwd, DateTimeOffset updated, bool subagent)
+    {
+        var day = Path.Combine(Root, "sessions", "2026", "08", "13");
+        System.IO.Directory.CreateDirectory(day);
+        var path = Path.Combine(day, $"rollout-2026-08-13T00-00-00-{sessionId}.jsonl");
+        var source = subagent ? "subagent" : "interactive";
+        var cwdJson = System.Text.Json.JsonSerializer.Serialize(cwd);
+        File.WriteAllText(
+            path,
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + sessionId +
+            "\",\"id\":\"" + sessionId + "\",\"cwd\":" + cwdJson +
+            ",\"thread_source\":\"" + source + "\",\"timestamp\":\"" + updated.ToString("O") +
+            "\",\"model_provider\":\"openai\"}}\n" +
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"SECRET USER PROMPT\"}}\n");
+        File.SetLastWriteTimeUtc(path, updated.UtcDateTime);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            System.IO.Directory.Delete(Root, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
+    }
+}
+
+sealed class ClaudeHomeFixture : IDisposable
+{
+    public string Root { get; } = Path.Combine(Path.GetTempPath(), $"cccg-claude-{Guid.NewGuid():N}");
+
+    public ClaudeHomeFixture()
+    {
+        Directory.CreateDirectory(Path.Combine(Root, "projects"));
+        Directory.CreateDirectory(Path.Combine(Root, "sessions"));
+    }
+
+    public void WriteTranscript(string sessionId, string cwd, string title, string model)
+    {
+        var project = Path.Combine(
+            Root,
+            "projects",
+            Path.GetFullPath(cwd).TrimEnd('\\').Replace(':', '-').Replace('\\', '-'));
+        Directory.CreateDirectory(project);
+        File.WriteAllText(
+            Path.Combine(project, sessionId + ".jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"" + sessionId
+            + "\",\"cwd\":" + System.Text.Json.JsonSerializer.Serialize(cwd)
+            + ",\"timestamp\":\"2026-08-13T03:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"SECRET\"}}\n"
+            + "{\"type\":\"custom-title\",\"customTitle\":"
+            + System.Text.Json.JsonSerializer.Serialize(title) + ",\"sessionId\":\"" + sessionId + "\"}\n"
+            + "{\"type\":\"assistant\",\"sessionId\":\"" + sessionId
+            + "\",\"cwd\":" + System.Text.Json.JsonSerializer.Serialize(cwd)
+            + ",\"message\":{\"role\":\"assistant\",\"model\":"
+            + System.Text.Json.JsonSerializer.Serialize(model) + ",\"content\":[]}}\n");
+    }
+
+    public void WriteActive(string sessionId, int pid, string cwd, string name)
+    {
+        File.WriteAllText(
+            Path.Combine(Root, "sessions", pid + ".json"),
+            "{\"pid\":" + pid + ",\"sessionId\":\"" + sessionId
+            + "\",\"cwd\":" + System.Text.Json.JsonSerializer.Serialize(cwd)
+            + ",\"startedAt\":1786600000000,\"updatedAt\":1786600100000,\"name\":"
+            + System.Text.Json.JsonSerializer.Serialize(name) + "}");
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            Directory.Delete(Root, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
+    }
+}
+
+sealed class ClaudeEchoProcessLauncher : IProcessLauncher
+{
+    public int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        var idIndex = command.Arguments
+            .Select((argument, index) => (argument, index))
+            .FirstOrDefault(item => item.argument == "--session-id")
+            .index;
+        var sessionId = idIndex >= 0 ? command.Arguments[idIndex + 1] : "missing";
+        Directory.CreateDirectory(Path.GetDirectoryName(stdoutPath)!);
+        File.WriteAllText(
+            stdoutPath,
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"" + sessionId + "\"}\n"
+            + "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"" + sessionId
+            + "\",\"result\":\"CLAUDE-BOUND-OK\"}");
+        File.WriteAllText(stderrPath, string.Empty);
+        waiter = new ClaudeImmediateWaiter();
+        return 4343;
+    }
+
+    private sealed class ClaudeImmediateWaiter : IProcessWaiter
+    {
+        public int? Pid => 4343;
+
+        public int Wait(TimeSpan timeout) => 0;
+    }
+}
+
+sealed class CountingProcessLauncher : FakeProcessLauncher
+{
+    public int Starts { get; private set; }
+
+    public CountingProcessLauncher(string stdout) : base(stdout)
+    {
+    }
+
+    public override int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        Starts++;
+        return base.Start(command, stdoutPath, stderrPath, stdinPath, out waiter);
+    }
+}
+
+class FakeProcessLauncher : IProcessLauncher
+{
+    private readonly string stdout;
+
+    public FakeProcessLauncher(string stdout) => this.stdout = stdout;
+
+    public virtual int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(stdoutPath)!);
+        File.WriteAllText(stdoutPath, stdout);
+        File.WriteAllText(stderrPath, "");
+        waiter = new ImmediateWaiter();
+        return 4242;
+    }
+
+    private sealed class ImmediateWaiter : IProcessWaiter
+    {
+        public int? Pid => 4242;
+
+        public int Wait(TimeSpan timeout) => 0;
+    }
+}
+
+sealed class TrackingProcessLauncher : IProcessLauncher
+{
+    private int active;
+    private int maxConcurrent;
+    private int pid = 5000;
+
+    public int MaxConcurrent => maxConcurrent;
+
+    public int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(stdoutPath)!);
+        File.WriteAllText(stdoutPath, "SERIAL-OK");
+        File.WriteAllText(stderrPath, "");
+        var current = Interlocked.Increment(ref active);
+        UpdateMaximum(current);
+        waiter = new DelayedWaiter(() => Interlocked.Decrement(ref active));
+        return Interlocked.Increment(ref pid);
+    }
+
+    private void UpdateMaximum(int value)
+    {
+        while (true)
+        {
+            var observed = Volatile.Read(ref maxConcurrent);
+            if (observed >= value
+                || Interlocked.CompareExchange(ref maxConcurrent, value, observed) == observed)
+            {
+                return;
+            }
+        }
+    }
+
+    private sealed class DelayedWaiter : IProcessWaiter
+    {
+        private readonly Action completed;
+
+        public DelayedWaiter(Action completed) => this.completed = completed;
+
+        public int? Pid => null;
+
+        public int Wait(TimeSpan timeout)
+        {
+            Thread.Sleep(100);
+            completed();
+            return 0;
+        }
+    }
+}
+
+sealed class ScriptedJsonLineTransport : IJsonLineTransport
+{
+    private readonly Queue<string> responses;
+
+    public ScriptedJsonLineTransport(IEnumerable<string> responses)
+    {
+        this.responses = new Queue<string>(responses);
+    }
+
+    public List<string> Writes { get; } = new();
+
+    public ValueTask WriteLineAsync(string line, CancellationToken cancellationToken = default)
+    {
+        Writes.Add(line);
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<string?> ReadLineAsync(CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult(responses.Count == 0 ? null : responses.Dequeue());
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}

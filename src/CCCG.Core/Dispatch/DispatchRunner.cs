@@ -1,0 +1,633 @@
+using System.Diagnostics;
+using System.Text;
+
+namespace CCCG.Core.Dispatch;
+
+public interface IProcessLauncher
+{
+    int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter);
+}
+
+public interface IProcessWaiter
+{
+    int? Pid { get; }
+
+    int Wait(TimeSpan timeout);
+}
+
+public sealed class DispatchRunner
+{
+    private readonly DispatchJobStore store;
+    private readonly IProcessLauncher launcher;
+    private readonly Func<string, IReadOnlyList<Peer>> listPeers;
+    private readonly string? grokHome;
+    private readonly string? codexCommand;
+    private readonly string? claudeCommand;
+    private readonly DispatchBindingStore? bindings;
+    private readonly InboxLedger? inbox;
+    private readonly ILiveInputInjector injector;
+    private readonly TimeSpan writerPollInterval;
+    private readonly TimeSpan writerWaitTimeout;
+
+    public DispatchRunner(
+        DispatchJobStore store,
+        Func<string, IReadOnlyList<Peer>> listPeers,
+        IProcessLauncher? launcher = null,
+        string? grokHome = null,
+        string? codexCommand = null,
+        string? claudeCommand = null,
+        DispatchBindingStore? bindings = null,
+        InboxLedger? inbox = null,
+        TimeSpan? writerPollInterval = null,
+        TimeSpan? writerWaitTimeout = null,
+        ILiveInputInjector? injector = null)
+    {
+        this.store = store;
+        this.listPeers = listPeers;
+        this.launcher = launcher ?? new FileProcessLauncher();
+        this.grokHome = grokHome;
+        this.codexCommand = codexCommand;
+        this.claudeCommand = claudeCommand;
+        this.bindings = bindings;
+        this.inbox = inbox;
+        this.injector = injector ?? new WindowsLiveInputInjector();
+        this.writerPollInterval = writerPollInterval ?? TimeSpan.FromMilliseconds(250);
+        this.writerWaitTimeout = writerWaitTimeout ?? TimeSpan.FromHours(2);
+    }
+
+    public DispatchJob Enqueue(
+        string provider,
+        string prompt,
+        string? sessionId = null,
+        string? cwd = null,
+        bool allowNew = true)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
+        provider = NormalizeProvider(provider);
+        var binding = bindings?.Load(provider, cwd);
+        var selection = Select(provider, sessionId, cwd, allowNew, binding);
+        var job = store.Create(selection, prompt);
+        job.RequestedSessionId = sessionId;
+        job.AllowNew = allowNew;
+        job.AffinityKey = BuildAffinityKey(
+            provider,
+            sessionId ?? binding?.SessionId,
+            selection.Cwd ?? cwd);
+        store.Write(job);
+
+        inbox?.Post(
+            "claude",
+            provider,
+            prompt,
+            fromProvider: "claude",
+            toProvider: provider,
+            toSessionId: selection.SessionId,
+            jobId: job.JobId);
+        return job;
+    }
+
+    public DispatchJob Dispatch(
+        string provider,
+        string prompt,
+        string? sessionId = null,
+        string? cwd = null,
+        bool allowNew = true)
+    {
+        var job = Enqueue(provider, prompt, sessionId, cwd, allowNew);
+        ThreadPool.QueueUserWorkItem(_ => Run(job.JobId));
+        return job;
+    }
+
+    public DispatchJob MarkWorker(string jobId, int workerPid) =>
+        store.Update(jobId, job => job.WorkerPid = workerPid);
+
+    public DispatchJob Run(string jobId)
+    {
+        var job = store.Update(jobId, current => current.WorkerPid = Environment.ProcessId);
+        if (IsTerminal(job.Status))
+        {
+            return job;
+        }
+
+        try
+        {
+            var binding = bindings?.Load(job.Provider, job.Cwd);
+            var selection = Select(
+                job.Provider,
+                job.RequestedSessionId,
+                job.Cwd,
+                job.AllowNew,
+                binding);
+            string? plannedSessionId = null;
+            if (selection.Action == DispatchAction.Create
+                && selection.Provider is "grok" or "claude")
+            {
+                plannedSessionId = Guid.NewGuid().ToString();
+                selection = selection with { SessionId = plannedSessionId };
+            }
+
+            job.SessionId = selection.SessionId;
+            job.Cwd = selection.Cwd;
+            job.Action = selection.Action.ToString().ToLowerInvariant();
+            job.Reason = selection.Reason;
+            store.Write(job);
+
+            if (selection.WaitForWriterFree)
+            {
+                job.Reason = "Waiting for the live writer to become idle.";
+                store.Write(job);
+                WaitUntilWriterFree(selection.Provider, selection.SessionId);
+                job = store.Require(job.JobId);
+                if (IsTerminal(job.Status))
+                {
+                    return job;
+                }
+
+                job.Reason = "Live writer is idle; delivering the queued turn.";
+                store.Write(job);
+            }
+
+            if (selection.Action == DispatchAction.Inject)
+            {
+                return InjectLive(job, selection);
+            }
+
+            CrossProcessFileGate? lease = null;
+            if (selection.Action != DispatchAction.Attach)
+            {
+                var gatePath = Path.Combine(
+                    store.Root,
+                    "..",
+                    "leases",
+                    CrossProcessFileGate.Key(job.AffinityKey ?? job.Provider + "|_") + ".lock");
+                lease = CrossProcessFileGate.Acquire(gatePath, TimeSpan.FromHours(2));
+                job = store.Require(jobId);
+                if (IsTerminal(job.Status))
+                {
+                    lease.Dispose();
+                    return job;
+                }
+            }
+
+            try
+            {
+
+            var command = selection.Provider switch
+            {
+                "grok" => ProviderCommand.BuildGrok(
+                    selection.Action,
+                    selection.Action == DispatchAction.Create ? null : selection.SessionId,
+                    selection.Cwd ?? Environment.CurrentDirectory,
+                    store.PromptPath(job.JobId),
+                    grokHome,
+                    plannedSessionId),
+                "claude" => ProviderCommand.BuildClaude(
+                    selection.Action,
+                    selection.Action == DispatchAction.Create ? null : selection.SessionId,
+                    selection.Cwd ?? Environment.CurrentDirectory,
+                    store.PromptPath(job.JobId),
+                    claudeCommand,
+                    plannedSessionId),
+                _ => ProviderCommand.BuildCodex(
+                    selection.Action,
+                    selection.SessionId,
+                    selection.Cwd ?? Environment.CurrentDirectory,
+                    store.PromptPath(job.JobId), codexCommand)
+            };
+            var stdin = selection.Provider is "codex" or "claude"
+                ? store.PromptPath(job.JobId)
+                : null;
+            var pid = launcher.Start(
+                command,
+                store.StdoutPath(job.JobId),
+                store.StderrPath(job.JobId),
+                stdin,
+                out var waiter);
+
+            job.Status = DispatchJobStatus.Running;
+            job.Pid = pid;
+            job.StartedAt = DateTimeOffset.UtcNow;
+            store.Write(job);
+
+            var exit = waiter.Wait(TimeSpan.FromHours(2));
+            job = store.Require(job.JobId);
+            job.ExitCode = exit;
+            job.FinishedAt = DateTimeOffset.UtcNow;
+            if (exit != 0)
+            {
+                job.Status = DispatchJobStatus.Failed;
+                job.Error = "Provider exited with code " + exit + ".";
+                store.Write(job);
+                return job;
+            }
+
+            var providerError = ProviderOutputParser.FindError(
+                selection.Provider,
+                store.StdoutPath(job.JobId));
+            if (!string.IsNullOrWhiteSpace(providerError))
+            {
+                throw new InvalidDataException(providerError);
+            }
+
+            var resolvedSessionId = selection.SessionId
+                ?? ProviderOutputParser.FindSessionId(
+                    selection.Provider,
+                    store.StdoutPath(job.JobId),
+                    plannedSessionId);
+            if (selection.Action == DispatchAction.Create
+                && string.IsNullOrWhiteSpace(resolvedSessionId))
+            {
+                throw new InvalidDataException(
+                    $"{selection.Provider} completed but did not expose the new session id; CCCG refused to create an unbound peer.");
+            }
+
+            job.SessionId = resolvedSessionId;
+            job.Status = DispatchJobStatus.Succeeded;
+            if (!string.IsNullOrWhiteSpace(resolvedSessionId))
+            {
+                bindings?.Save(selection.Provider, resolvedSessionId, selection.Cwd, managedByCccg: true);
+            }
+
+            inbox?.Post(
+                selection.Provider,
+                "claude",
+                ProviderOutputParser.CollectResponse(
+                    selection.Provider,
+                    store.StdoutPath(job.JobId),
+                    2000),
+                fromProvider: selection.Provider,
+                fromSessionId: resolvedSessionId,
+                toProvider: "claude",
+                jobId: job.JobId);
+            store.Write(job);
+            return job;
+            }
+            finally
+            {
+                lease?.Dispose();
+            }
+        }
+        catch (Exception exception)
+        {
+            job = store.Require(jobId);
+            job.Status = DispatchJobStatus.Failed;
+            job.Error = exception.Message;
+            job.FinishedAt = DateTimeOffset.UtcNow;
+            store.Write(job);
+            return job;
+        }
+    }
+
+    public DispatchJob Status(string jobId)
+    {
+        var job = store.Require(jobId);
+        if (!IsTerminal(job.Status)
+            && job.WorkerPid is int workerPid
+            && !ProcessIsAlive(workerPid))
+        {
+            return store.Update(jobId, current =>
+            {
+                if (IsTerminal(current.Status))
+                {
+                    return;
+                }
+
+                current.Status = DispatchJobStatus.Failed;
+                current.Error = "Dispatch worker exited before recording a terminal result.";
+                current.FinishedAt = DateTimeOffset.UtcNow;
+            });
+        }
+
+        return job;
+    }
+
+    public object Collect(string jobId)
+    {
+        var job = Status(jobId);
+        return new
+        {
+            job.JobId,
+            job.Provider,
+            job.SessionId,
+            job.Cwd,
+            job.Action,
+            job.Status,
+            job.Reason,
+            job.ExitCode,
+            job.Error,
+            response = ProviderOutputParser.CollectResponse(
+                job.Provider,
+                store.StdoutPath(jobId))
+        };
+    }
+
+    public object WaitAndCollect(string jobId, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var job = Status(jobId);
+            if (IsTerminal(job.Status))
+            {
+                return Collect(jobId);
+            }
+
+            Thread.Sleep(50);
+        }
+
+        return Collect(jobId);
+    }
+
+    private DispatchSelection Select(
+        string provider,
+        string? requestedSessionId,
+        string? cwd,
+        bool allowNew,
+        DispatchBinding? binding)
+    {
+        var peers = listPeers(provider);
+        var preferredId = requestedSessionId ?? binding?.SessionId;
+        if (!string.IsNullOrWhiteSpace(preferredId))
+        {
+            var preferred = peers.FirstOrDefault(peer => string.Equals(
+                peer.SessionId,
+                preferredId,
+                StringComparison.OrdinalIgnoreCase));
+            if (preferred is not null
+                && preferred.Status.StartsWith("live-", StringComparison.Ordinal))
+            {
+                if (provider == "claude")
+                {
+                    throw new InvalidOperationException(
+                        $"Claude session '{preferredId}' is live in Desktop and owns its writer. "
+                        + "Do not CLI-resume it. Match its title with mcp__ccd_session_mgmt__list_sessions, "
+                        + "then deliver through mcp__ccd_session_mgmt__send_message; the Desktop session id returned there is authoritative.");
+                }
+
+                if (bindings?.IsManaged(provider, preferredId) == true)
+                {
+                    return new DispatchSelection(
+                        provider,
+                        preferredId,
+                        cwd ?? preferred.Cwd,
+                        preferred.Title,
+                        DispatchAction.Resume,
+                        "Queued behind the active CCCG-owned turn; the same session will resume when its writer is free.");
+                }
+
+                return new DispatchSelection(
+                    provider,
+                    preferredId,
+                    cwd ?? preferred.Cwd,
+                    preferred.Title,
+                    PeerSelector.LiveAction(provider, preferred.Status),
+                    PeerSelector.LiveReason(provider, preferred.Status),
+                    Pid: preferred.Pid);
+            }
+        }
+
+        return PeerSelector.Select(
+            provider,
+            peers,
+            requestedSessionId,
+            cwd,
+            allowNew,
+            binding?.SessionId);
+    }
+
+    private DispatchJob InjectLive(DispatchJob job, DispatchSelection selection)
+    {
+        var pid = selection.Pid
+            ?? listPeers(selection.Provider).FirstOrDefault(peer =>
+                    string.Equals(peer.SessionId, selection.SessionId, StringComparison.OrdinalIgnoreCase))
+                ?.Pid;
+        if (pid is null or <= 0)
+        {
+            throw new InvalidOperationException(
+                $"No live process id for {selection.Provider} session '{selection.SessionId}'.");
+        }
+
+        var text = File.ReadAllText(store.PromptPath(job.JobId));
+        job.Status = DispatchJobStatus.Running;
+        job.Pid = pid;
+        job.StartedAt = DateTimeOffset.UtcNow;
+        job.Reason = "Typing into the live window as a new turn.";
+        store.Write(job);
+
+        injector.Inject(pid.Value, text);
+
+        var receipt = "{\"text\":" + JsonEncode(
+                $"Typed into the live {selection.Provider} window (pid {pid.Value}) as a new turn.")
+            + "}";
+        File.WriteAllText(store.StdoutPath(job.JobId), receipt);
+        job.Status = DispatchJobStatus.Succeeded;
+        job.ExitCode = 0;
+        job.FinishedAt = DateTimeOffset.UtcNow;
+        inbox?.Post(
+            selection.Provider,
+            "claude",
+            ProviderOutputParser.CollectResponse(
+                selection.Provider,
+                store.StdoutPath(job.JobId),
+                2000),
+            fromProvider: selection.Provider,
+            fromSessionId: selection.SessionId,
+            toProvider: "claude",
+            jobId: job.JobId);
+        store.Write(job);
+        return job;
+    }
+
+    private static string JsonEncode(string value) =>
+        System.Text.Json.JsonSerializer.Serialize(value);
+
+    private void WaitUntilWriterFree(string provider, string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return;
+        }
+
+        var deadline = DateTimeOffset.UtcNow + writerWaitTimeout;
+        while (true)
+        {
+            var peer = listPeers(provider).FirstOrDefault(candidate =>
+                string.Equals(candidate.SessionId, sessionId, StringComparison.OrdinalIgnoreCase));
+            if (peer is null || peer.Status != PeerStatus.LiveWorking)
+            {
+                return;
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                throw new TimeoutException(
+                    $"{provider} session '{sessionId}' stayed live-working longer than {writerWaitTimeout}.");
+            }
+
+            Thread.Sleep(writerPollInterval);
+        }
+    }
+
+    private static string BuildAffinityKey(string provider, string? sessionId, string? cwd)
+    {
+        if (!string.IsNullOrWhiteSpace(cwd))
+        {
+            var workspace = Path.GetFullPath(cwd)
+                .TrimEnd(Path.DirectorySeparatorChar)
+                .ToLowerInvariant();
+            return provider + "|cwd|" + workspace;
+        }
+
+        return !string.IsNullOrWhiteSpace(sessionId)
+            ? provider + "|session|" + sessionId.Trim().ToLowerInvariant()
+            : provider + "|cwd|_";
+    }
+
+    private static string NormalizeProvider(string provider)
+    {
+        provider = provider.Trim().ToLowerInvariant();
+        return provider is "grok" or "codex" or "claude"
+            ? provider
+            : throw new ArgumentException("Provider must be grok, codex, or claude.");
+    }
+
+    private static bool IsTerminal(string status) =>
+        status is DispatchJobStatus.Succeeded or DispatchJobStatus.Failed;
+
+    private static bool ProcessIsAlive(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+}
+
+public sealed class FileProcessLauncher : IProcessLauncher
+{
+    public int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(stdoutPath)!);
+        var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        var info = new ProcessStartInfo
+        {
+            FileName = command.FileName,
+            WorkingDirectory = command.WorkingDirectory,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = stdinPath is not null,
+            StandardOutputEncoding = utf8,
+            StandardErrorEncoding = utf8,
+            CreateNoWindow = true
+        };
+        if (stdinPath is not null)
+        {
+            info.StandardInputEncoding = utf8;
+        }
+
+        foreach (var argument in command.Arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        var process = new Process { StartInfo = info, EnableRaisingEvents = true };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Failed to start " + command.FileName);
+        }
+
+        var stdout = new StreamWriter(
+            new FileStream(stdoutPath, FileMode.Create, FileAccess.Write, FileShare.Read),
+            utf8);
+        var stderr = new StreamWriter(
+            new FileStream(stderrPath, FileMode.Create, FileAccess.Write, FileShare.Read),
+            utf8);
+        process.OutputDataReceived += (_, args) => WriteLine(stdout, args.Data);
+        process.ErrorDataReceived += (_, args) => WriteLine(stderr, args.Data);
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        if (stdinPath is not null)
+        {
+            var stdinBytes = File.ReadAllBytes(stdinPath);
+            process.StandardInput.BaseStream.Write(stdinBytes, 0, stdinBytes.Length);
+            process.StandardInput.Close();
+        }
+
+        waiter = new ProcessWaiter(process, stdout, stderr);
+        return process.Id;
+    }
+
+    private static void WriteLine(TextWriter writer, string? value)
+    {
+        if (value is null)
+        {
+            return;
+        }
+
+        lock (writer)
+        {
+            writer.WriteLine(value);
+            writer.Flush();
+        }
+    }
+
+    private sealed class ProcessWaiter : IProcessWaiter
+    {
+        private readonly Process process;
+        private readonly TextWriter stdout;
+        private readonly TextWriter stderr;
+
+        public ProcessWaiter(Process process, TextWriter stdout, TextWriter stderr)
+        {
+            this.process = process;
+            this.stdout = stdout;
+            this.stderr = stderr;
+        }
+
+        public int? Pid => process.Id;
+
+        public int Wait(TimeSpan timeout)
+        {
+            try
+            {
+                if (!process.WaitForExit(timeout))
+                {
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                    }
+
+                    throw new TimeoutException("Dispatch worker exceeded " + timeout + ".");
+                }
+
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+            finally
+            {
+                stdout.Dispose();
+                stderr.Dispose();
+                process.Dispose();
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+{
+  "unmappedBehavior": "reject",
+  "originalClaudePath": null,
+  "routes": {
+    "claude-haiku-4-5": {
+      "provider": "codex-app-server",
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "medium"
+    },
+    "claude-haiku-4-5-20251001": {
+      "provider": "codex-app-server",
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "medium"
+    }
+  }
+}

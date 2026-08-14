@@ -1,0 +1,16 @@
+{
+  "unmappedBehavior": "reject",
+  "originalClaudePath": null,
+  "routes": {
+    "claude-haiku-4-5": {
+      "provider": "mock",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "medium"
+    },
+    "claude-sonnet-4-6": {
+      "provider": "mock",
+      "model": "grok-4.5",
+      "reasoningEffort": "medium"
+    }
+  }
+}

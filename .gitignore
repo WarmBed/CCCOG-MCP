@@ -1,0 +1,17 @@
+bin/
+obj/
+artifacts/
+.vs/
+.idea/
+*.user
+*.suo
+*.log
+config/routes.local.json
+test-results/live-*/
+monitor-data/
+data/runs/
+.monitor-salt
+experiments/claude-desktop-bridge-shim/publish/
+experiments/claude-desktop-bridge-shim/test-stage/
+experiments/claude-desktop-bridge-shim/test-results/
+experiments/claude-desktop-bridge-shim/claude-desktop-bridge-shim.exe
