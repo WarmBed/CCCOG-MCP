@@ -74,7 +74,9 @@ public sealed class DispatchRunner
         string prompt,
         string? sessionId = null,
         string? cwd = null,
-        bool allowNew = true)
+        bool allowNew = true,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
         provider = NormalizeProvider(provider);
@@ -83,6 +85,8 @@ public sealed class DispatchRunner
         var job = store.Create(selection, prompt);
         job.RequestedSessionId = sessionId;
         job.AllowNew = allowNew;
+        job.Model = NormalizeOverride(model);
+        job.ReasoningEffort = NormalizeOverride(reasoningEffort);
         job.AffinityKey = BuildAffinityKey(
             provider,
             sessionId ?? binding?.SessionId,
@@ -105,9 +109,18 @@ public sealed class DispatchRunner
         string prompt,
         string? sessionId = null,
         string? cwd = null,
-        bool allowNew = true)
+        bool allowNew = true,
+        string? model = null,
+        string? reasoningEffort = null)
     {
-        var job = Enqueue(provider, prompt, sessionId, cwd, allowNew);
+        var job = Enqueue(
+            provider,
+            prompt,
+            sessionId,
+            cwd,
+            allowNew,
+            model,
+            reasoningEffort);
         ThreadPool.QueueUserWorkItem(_ => Run(job.JobId));
         return job;
     }
@@ -125,6 +138,14 @@ public sealed class DispatchRunner
 
         try
         {
+            if (job.Provider == "claude"
+                && (!string.IsNullOrWhiteSpace(job.Model)
+                    || !string.IsNullOrWhiteSpace(job.ReasoningEffort)))
+            {
+                throw new InvalidOperationException(
+                    "Claude does not support per-dispatch model or reasoningEffort overrides; remove both parameters.");
+            }
+
             var binding = bindings?.Load(job.Provider, job.Cwd);
             var selection = Select(
                 job.Provider,
@@ -210,7 +231,9 @@ public sealed class DispatchRunner
                     selection.Cwd ?? Environment.CurrentDirectory,
                     store.PromptPath(job.JobId),
                     grokHome,
-                    plannedSessionId),
+                    plannedSessionId,
+                    job.Model,
+                    job.ReasoningEffort),
                 "claude" => ProviderCommand.BuildClaude(
                     selection.Action,
                     selection.Action == DispatchAction.Create ? null : selection.SessionId,
@@ -222,7 +245,10 @@ public sealed class DispatchRunner
                     selection.Action,
                     selection.SessionId,
                     selection.Cwd ?? Environment.CurrentDirectory,
-                    store.PromptPath(job.JobId), codexCommand)
+                    store.PromptPath(job.JobId),
+                    codexCommand,
+                    job.Model,
+                    job.ReasoningEffort)
             };
             var stdin = selection.Provider is "codex" or "claude"
                 ? store.PromptPath(job.JobId)
@@ -365,6 +391,8 @@ public sealed class DispatchRunner
             job.Provider,
             job.SessionId,
             job.Cwd,
+            job.Model,
+            job.ReasoningEffort,
             job.Action,
             job.Status,
             job.Reason,
@@ -696,6 +724,9 @@ public sealed class DispatchRunner
             ? provider
             : throw new ArgumentException("Provider must be grok, codex, or claude.");
     }
+
+    private static string? NormalizeOverride(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static bool IsTerminal(string status) =>
         status is DispatchJobStatus.Succeeded or DispatchJobStatus.Failed;

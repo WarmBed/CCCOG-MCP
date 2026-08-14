@@ -92,6 +92,10 @@ var tests = new (string Name, Action Run)[]
     ("provider output strips Grok thought and usage metadata", ProviderOutputNormalizesGrok),
     ("file process launcher preserves UTF-8 provider output", FileProcessLauncherPreservesUtf8),
     ("file process launcher writes UTF-8 stdin bytes unchanged", FileProcessLauncherPreservesUtf8Stdin),
+    ("dispatch runner enqueue copies model and effort", DispatchRunnerEnqueueCopiesModelAndEffort),
+    ("dispatch runner passes overrides to Codex launch", DispatchRunnerPassesOverridesToCodexLaunch),
+    ("dispatch runner rejects Claude overrides", DispatchRunnerRejectsClaudeOverrides),
+    ("collect surfaces model without breaking shape", CollectSurfacesModelWithoutBreakingShape),
     ("dispatch runner creates and binds a Claude session", DispatchRunnerBindsNewClaudeSession),
     ("dispatch runner routes live Claude through Desktop session management", DispatchRunnerRoutesLiveClaude),
     ("provider output captures and binds a new Codex thread id", DispatchRunnerBindsNewCodexThread),
@@ -1230,6 +1234,179 @@ static void FileProcessLauncherPreservesUtf8Stdin()
     }
 }
 
+static void DispatchRunnerEnqueueCopiesModelAndEffort()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-enqueue-model-{Guid.NewGuid():N}");
+    try
+    {
+        var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+        var runner = new DispatchRunner(
+            store,
+            _ => Array.Empty<Peer>(),
+            owners: new OwnerRegistry(Path.Combine(root, "owners")));
+
+        var job = runner.Enqueue(
+            "codex",
+            "hello",
+            cwd: "D:\\code\\app",
+            model: "  gpt-5.6-luna  ",
+            reasoningEffort: "  medium  ");
+        var loaded = store.Require(job.JobId);
+        Equal("gpt-5.6-luna", loaded.Model);
+        Equal("medium", loaded.ReasoningEffort);
+
+        var omitted = runner.Enqueue(
+            "codex",
+            "hello again",
+            cwd: "D:\\code\\app",
+            model: "  ",
+            reasoningEffort: null);
+        loaded = store.Require(omitted.JobId);
+        True(loaded.Model is null);
+        True(loaded.ReasoningEffort is null);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void DispatchRunnerPassesOverridesToCodexLaunch()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-launch-model-{Guid.NewGuid():N}");
+    try
+    {
+        var peers = new[]
+        {
+            new Peer("codex", "thread-1", PeerStatus.Resumable, "D:\\code\\app", "Peer", null, null, null, null, null, null)
+        };
+        const string output =
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"CODEX-OVERRIDE-OK\"}}";
+        var launcher = new RecordingProcessLauncher(output);
+        var runner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(root, "jobs")),
+            _ => peers,
+            launcher,
+            codexCommand: "codex.exe",
+            owners: new OwnerRegistry(Path.Combine(root, "owners")));
+
+        var job = runner.Enqueue(
+            "codex",
+            "hello",
+            "thread-1",
+            "D:\\code\\app",
+            allowNew: false,
+            model: "gpt-5.6-luna",
+            reasoningEffort: "xhigh");
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Succeeded, done.Status);
+
+        var command = launcher.LastCommand
+            ?? throw new InvalidOperationException("Expected a captured launch command.");
+        var modelAt = IndexOf(command.Arguments, "--model");
+        Equal("gpt-5.6-luna", command.Arguments[modelAt + 1]);
+        True(modelAt < IndexOf(command.Arguments, "resume"));
+        var effortAt = IndexOf(command.Arguments, "-c");
+        Equal("model_reasoning_effort=xhigh", command.Arguments[effortAt + 1]);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void DispatchRunnerRejectsClaudeOverrides()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-claude-model-{Guid.NewGuid():N}");
+    try
+    {
+        var launcher = new CountingProcessLauncher("SHOULD-NOT-LAUNCH");
+        var runner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(root, "jobs")),
+            _ => Array.Empty<Peer>(),
+            launcher,
+            claudeCommand: "claude.exe",
+            owners: new OwnerRegistry(Path.Combine(root, "owners")));
+
+        var modelJob = runner.Enqueue(
+            "claude",
+            "hello",
+            cwd: "D:\\code\\app",
+            model: "gpt-5.6-luna");
+        var modelDone = runner.Run(modelJob.JobId);
+        Equal(DispatchJobStatus.Failed, modelDone.Status);
+        True(modelDone.Error?.Contains("claude", StringComparison.OrdinalIgnoreCase) == true);
+        True(modelDone.Error?.Contains("model", StringComparison.Ordinal) == true);
+        True(modelDone.Error?.Contains("reasoningEffort", StringComparison.Ordinal) == true);
+
+        var effortJob = runner.Enqueue(
+            "claude",
+            "hello again",
+            cwd: "D:\\code\\app",
+            reasoningEffort: "xhigh");
+        var effortDone = runner.Run(effortJob.JobId);
+        Equal(DispatchJobStatus.Failed, effortDone.Status);
+        True(effortDone.Error?.Contains("claude", StringComparison.OrdinalIgnoreCase) == true);
+        True(effortDone.Error?.Contains("model", StringComparison.Ordinal) == true);
+        True(effortDone.Error?.Contains("reasoningEffort", StringComparison.Ordinal) == true);
+        Equal(0, launcher.Starts);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void CollectSurfacesModelWithoutBreakingShape()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-collect-model-{Guid.NewGuid():N}");
+    try
+    {
+        var peers = new[]
+        {
+            new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, null)
+        };
+        var runner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(root, "jobs")),
+            _ => peers,
+            new FakeProcessLauncher("DISPATCH-OK"),
+            owners: new OwnerRegistry(Path.Combine(root, "owners")));
+        var job = runner.Enqueue(
+            "grok",
+            "hello",
+            "idle",
+            "D:\\code\\app",
+            allowNew: false,
+            model: "grok-4.6",
+            reasoningEffort: "high");
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Succeeded, done.Status);
+
+        var collected = System.Text.Json.JsonSerializer.SerializeToElement(runner.Collect(job.JobId));
+        True(collected.TryGetProperty("JobId", out _));
+        True(collected.TryGetProperty("Status", out _));
+        Equal("DISPATCH-OK", collected.GetProperty("response").GetString());
+        Equal("grok-4.6", collected.GetProperty("Model").GetString());
+        Equal("high", collected.GetProperty("ReasoningEffort").GetString());
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
 static void DispatchRunnerBindsNewClaudeSession()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-new-claude-{Guid.NewGuid():N}");
@@ -2098,6 +2275,26 @@ sealed class CountingProcessLauncher : FakeProcessLauncher
         out IProcessWaiter waiter)
     {
         Starts++;
+        return base.Start(command, stdoutPath, stderrPath, stdinPath, out waiter);
+    }
+}
+
+sealed class RecordingProcessLauncher : FakeProcessLauncher
+{
+    public RecordingProcessLauncher(string stdout) : base(stdout)
+    {
+    }
+
+    public LaunchCommand? LastCommand { get; private set; }
+
+    public override int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        LastCommand = command;
         return base.Start(command, stdoutPath, stderrPath, stdinPath, out waiter);
     }
 }

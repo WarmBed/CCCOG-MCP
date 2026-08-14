@@ -298,7 +298,9 @@ sealed class WorkerRuntime
             Required(arguments, "prompt"),
             String(arguments, "sessionId"),
             String(arguments, "cwd"),
-            Boolean(arguments, "allowNew", true));
+            Boolean(arguments, "allowNew", true),
+            String(arguments, "model"),
+            String(arguments, "reasoningEffort"));
         if (wait)
         {
             Runner.Run(job.JobId);
