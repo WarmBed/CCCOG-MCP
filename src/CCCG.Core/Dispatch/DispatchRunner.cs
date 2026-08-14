@@ -467,10 +467,16 @@ public sealed class DispatchRunner
 
     private DispatchJob DeliverToOwner(DispatchJob job, DispatchSelection selection)
     {
-        var owner = owners.TryFind(selection.Provider, selection.SessionId, selection.Cwd)
+        // Re-resolve by session id first, then by workspace: the owner's
+        // RefreshSessionIdentity can swap the registered sessionId between
+        // Select's lookup and this one, and that tiny window must not turn a
+        // live owner into a false "released its lease" failure.
+        var entry = owners.TryFindEntry(selection.Provider, selection.SessionId, selection.Cwd)
+            ?? owners.TryFindEntry(selection.Provider, sessionId: null, selection.Cwd)
             ?? throw new InvalidOperationException(
                 $"The CCCG owner for {selection.Provider} session '{selection.SessionId}' "
                 + "released its lease before delivery.");
+        var owner = entry.Registration;
         var spool = new OwnerSpool(owner.SpoolDir);
         // Spool the RAW prompt: OwnerDaemon.BuildTurnText adds the single
         // "[CCCG message from <role> <session>]" sender label, so the wrapped
@@ -495,7 +501,12 @@ public sealed class DispatchRunner
         OwnerReceipt? receipt;
         while ((receipt = spool.TryReadReceipt(job.JobId)) is null)
         {
-            if (!ProcessIsAlive(owner.OwnerPid))
+            // Liveness = the DeleteOnClose lease, not the PID: a reused PID
+            // can look alive for the whole 2 h timeout while the owner is
+            // long dead. The lease is released the instant the owner process
+            // exits, so lease-held is authoritative (PID stays recorded on
+            // the job for diagnostics only).
+            if (!owners.LeaseIsHeld(entry.Key))
             {
                 // One grace re-read: the owner may have written the receipt
                 // just before exiting.

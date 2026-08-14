@@ -1521,12 +1521,16 @@ static void OwnerDaemonFailsAbandonedProcessingTurns()
 
 static void DispatchDeliverFailsWhenOwnerDies()
 {
+    // Real death semantics: the owner is fully registered and its OWN pid is
+    // alive (this test process), but the DeleteOnClose lease is released
+    // mid-delivery — exactly what happens when the owner process dies and its
+    // PID gets reused. The lease, not the PID, must drive the fast failure.
     var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-dead-{Guid.NewGuid():N}");
     var registry = new OwnerRegistry(Path.Combine(root, "owners"));
     var key = OwnerRegistry.Key("codex", "D:\\code\\app", "busy");
-    using var lease = registry.AcquireLease(key);
+    var lease = registry.AcquireLease(key);
     registry.Register(key, new OwnerRegistration(
-        1, "codex", "busy", "D:\\code\\app", int.MaxValue,
+        1, "codex", "busy", "D:\\code\\app", Environment.ProcessId,
         registry.SpoolDirectory(key), DateTimeOffset.UtcNow));
 
     var runner = new DispatchRunner(
@@ -1538,12 +1542,23 @@ static void DispatchDeliverFailsWhenOwnerDies()
         new FakeProcessLauncher("unused"),
         codexCommand: "codex.exe",
         owners: registry,
-        writerPollInterval: TimeSpan.FromMilliseconds(20));
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        deliverWaitTimeout: TimeSpan.FromSeconds(10));
     var job = runner.Enqueue("codex", "hello", "busy", "D:\\code\\app", allowNew: false);
     Equal("deliver", job.Action);
-    var done = runner.Run(job.JobId);
+    var run = Task.Run(() => runner.Run(job.JobId));
+    var deadline = DateTime.UtcNow.AddSeconds(5);
+    while (runner.Status(job.JobId).Status != DispatchJobStatus.Running
+        && DateTime.UtcNow < deadline)
+    {
+        Thread.Sleep(10);
+    }
+
+    lease.Dispose(); // the owner dies without writing a receipt
+    var done = run.GetAwaiter().GetResult();
     Equal(DispatchJobStatus.Failed, done.Status);
     True(done.Error?.Contains("exited before", StringComparison.Ordinal) == true);
+    True(done.Error?.Contains("unknown", StringComparison.Ordinal) == true);
 }
 
 static void DispatchDeliverEmptyReplySucceedsWithPlaceholder()

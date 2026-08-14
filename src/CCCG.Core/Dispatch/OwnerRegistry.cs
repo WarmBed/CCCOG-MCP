@@ -19,6 +19,14 @@ public sealed record OwnerRegistration(
     [property: JsonPropertyName("startedAt")] DateTimeOffset StartedAt);
 
 /// <summary>
+/// A live registration together with the registry key it is filed under. The
+/// key names the lease file, so callers can re-check liveness
+/// (<see cref="OwnerRegistry.LeaseIsHeld"/>) without another directory scan —
+/// and without being fooled by PID reuse.
+/// </summary>
+public sealed record OwnerRegistryEntry(string Key, OwnerRegistration Registration);
+
+/// <summary>
 /// File registry of live owner daemons under
 /// %LOCALAPPDATA%\CCCG\dispatch\owners. An entry counts only while its
 /// DeleteOnClose lease is still held; a dead owner leaves an openable (or
@@ -142,7 +150,14 @@ public sealed class OwnerRegistry
     /// one is given, otherwise by workspace. Registrations whose lease is no
     /// longer held are stale and never returned.
     /// </summary>
-    public OwnerRegistration? TryFind(string provider, string? sessionId, string? cwd)
+    public OwnerRegistration? TryFind(string provider, string? sessionId, string? cwd) =>
+        TryFindEntry(provider, sessionId, cwd)?.Registration;
+
+    /// <summary>
+    /// Like <see cref="TryFind"/> but also returns the registry key so callers
+    /// can keep probing the same lease during long waits.
+    /// </summary>
+    public OwnerRegistryEntry? TryFindEntry(string provider, string? sessionId, string? cwd)
     {
         if (!Directory.Exists(root))
         {
@@ -187,7 +202,7 @@ public sealed class OwnerRegistry
                 continue;
             }
 
-            return registration;
+            return new OwnerRegistryEntry(key, registration);
         }
 
         return null;
