@@ -13,6 +13,17 @@ internal static class ProviderPalette
         "grok" => Windows.UI.Color.FromArgb(255, 0x1F, 0x29, 0x37),
         _ => Windows.UI.Color.FromArgb(255, 0x8A, 0x94, 0xA6),
     };
+
+    /// <summary>Same table as <see cref="Color"/>, as a hex string — the shape
+    /// TokenBar's <c>Ui.Disc(string hex)</c> takes (ported verbatim in
+    /// Ui.cs), used by the quota section's per-provider disc.</summary>
+    public static string Hex(string provider) => provider.ToLowerInvariant() switch
+    {
+        "claude" => "#DA7756",
+        "codex" => "#3B82F6",
+        "grok" => "#1F2937",
+        _ => "#8A94A6",
+    };
 }
 
 /// <summary>Status maps to dot brightness (and pulse for active work) —
@@ -89,6 +100,11 @@ public sealed class QuotaCardViewModel
 {
     public required string ProviderId { get; init; }
     public required string Label { get; init; }
+    /// <summary>The window's own label without the provider prefix (e.g.
+    /// "5h limit") — what TokenBar's QuotaRow prints as the row title, since
+    /// TokenBar groups rows under a provider header and would otherwise
+    /// repeat the provider name on every row.</summary>
+    public required string WindowLabel { get; init; }
     public double UsedPercent { get; init; }
     public string UsedText => $"{UsedPercent:0.#}% used";
     public string ResetText { get; init; } = "Reset time unavailable";
@@ -96,6 +112,11 @@ public sealed class QuotaCardViewModel
     /// rejected") — never a vague "unavailable" (locked UX requirement).</summary>
     public string StateText { get; init; } = "fresh";
     public bool IsFailure { get; init; }
+    /// <summary>True only for the synthesized single-entry card a provider
+    /// gets when it has no windows at all (auth failure before any quota
+    /// window could be read) — rendered as TokenBar renders `agent.Error`:
+    /// one dim line under the provider header, no gauge bar.</summary>
+    public bool IsWholeProviderFailure { get; init; }
     public Microsoft.UI.Xaml.Media.Brush AccentBrush =>
         new Microsoft.UI.Xaml.Media.SolidColorBrush(ProviderPalette.Color(ProviderId));
 }

@@ -2,14 +2,18 @@
     x:Class="CCCOG.Bar.App.App"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- Ported verbatim from TokenBar-Windows src/TokenBar.App/App.xaml
+         (namespace only): just the default XamlControlsResources dictionary,
+         no app-wide overrides. The previous CCCOG-only global
+         TextBlock/TextWrapping=Wrap style is gone — TokenBar's Ui.Text()/
+         Ui.Dim() set wrapping per-element instead (Text trims with an
+         ellipsis, Dim wraps), so a blanket style is no longer needed and
+         would fight that per-element control. -->
     <Application.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
             </ResourceDictionary.MergedDictionaries>
-            <Style TargetType="TextBlock">
-                <Setter Property="TextWrapping" Value="Wrap" />
-            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>
