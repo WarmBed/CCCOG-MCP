@@ -1,9 +1,11 @@
 //! Deterministic graph reduction and token attribution.
 
 use crate::usage::{dedupe_samples, Provider, UsageSample};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenTotals {
     pub input: u64,
     pub output: u64,
@@ -20,7 +22,8 @@ impl TokenTotals {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DispatchRecord {
     pub job_id: String,
     pub provider: String,
@@ -35,7 +38,8 @@ pub struct DispatchRecord {
     pub task_summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OwnerEdgeInput {
     pub owner_id: String,
     pub provider: String,
@@ -50,7 +54,8 @@ pub struct GraphInput {
     pub usage: Vec<UsageSample>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Node {
     pub id: String,
     pub provider: String,
@@ -61,7 +66,8 @@ pub struct Node {
     pub usage: TokenTotals,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Edge {
     pub id: String,
     pub kind: String,
@@ -76,7 +82,8 @@ pub struct Edge {
     pub identity_confidence: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GraphSnapshot {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,

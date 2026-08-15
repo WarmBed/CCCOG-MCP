@@ -4,17 +4,20 @@
 //! read-only client; tests provide a recorder/fake and therefore never contact
 //! provider endpoints.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum QuotaState {
     Fresh,
     Stale,
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QuotaWindow {
     pub card_id: String,
     pub label: String,
@@ -23,7 +26,8 @@ pub struct QuotaWindow {
     pub resets_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QuotaCards {
     pub client_id: String,
     pub windows: Vec<QuotaWindow>,

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/cccog-bar-core"]
+members = [
+    "crates/cccog-bar-core",
+    "crates/cccog-bar-ffi",
+    "crates/cccog-bar-cli",
+]
 
 [profile.release]
 lto = true
