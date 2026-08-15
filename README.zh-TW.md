@@ -1,9 +1,9 @@
-# CCCG
+# CCCOG-MCP
 
 [English](README.md) | 繁體中文
 
 你平常大概同時開著 Claude、Codex、Grok 三種視窗,但它們彼此完全不認識。
-CCCG(Claude / Codex / Grok)在你自己的電腦上解決這件事:讓 Claude 當總
+CCCOG(**C**laude **C**ode / **Co**dex / **G**rok)在你自己的電腦上解決這件事:讓 Claude 當總
 指揮——它可以把任務丟給 Codex 或 Grok、指定這一單用哪顆模型(例如
 `gpt-5.6-luna` 開 `xhigh`)、等對方做完收回結果,甚至接著你幾天前自己在
 別的視窗聊到一半的對話繼續派工。
@@ -13,7 +13,41 @@ CCCG(Claude / Codex / Grok)在你自己的電腦上解決這件事:讓 Claude �
 session 目錄、以及不用重啟就能熱換的 worker。這套水電就是 **Dispatch
 MCP**,也是這個 repo 的核心。
 
-CCCG 的定位是受控測試,不是隱藏「到底是誰回答的」。每個產生的回答都會標注
+它是純粹的 **stdio MCP server**:你的 MCP client(Claude Desktop / Claude
+Code / Codex)把本地 exe 當子行程拉起來,用 stdin/stdout 溝通。沒有網路埠、
+沒有雲端服務、不用部署——唯一的常駐行程是 CCCOG 自己管理的那些(detached
+job worker 與 PATH A session owner)。程式碼命名空間與執行檔沿用歷史前綴
+`CCCG`。
+
+## 快速開始
+
+```powershell
+git clone https://github.com/WarmBed/CCCOG-MCP.git
+cd CCCOG-MCP
+dotnet build src/CCCG.Dispatch.Worker/CCCG.Dispatch.Worker.csproj -c Release
+dotnet publish src/CCCG.Dispatch/CCCG.Dispatch.csproj -c Release -o artifacts/host
+scripts/install-dispatch-worker.ps1 -Version 1.0.0
+```
+
+然後在你的 MCP client 註冊這個 stdio server,例如 Claude Code 的
+`.mcp.json`:
+
+```json
+{ "mcpServers": { "cccg-dispatch": { "type": "stdio",
+    "command": "<clone>/artifacts/host/cccg-dispatch.exe" } } }
+```
+
+或 Codex 的 `config.toml`:
+
+```toml
+[mcp_servers.cccg-dispatch]
+command = '<clone>\artifacts\host\cccg-dispatch.exe'
+```
+
+目前僅支援 Windows(Win32 session 探索與行程管理)。需要 .NET 8,以及你想
+指揮的 provider CLI(`claude`、`codex`、`grok`)已安裝並登入。
+
+CCCOG 的定位是受控測試,不是隱藏「到底是誰回答的」。每個產生的回答都會標注
 真實的 provider 與後端模型。CCCG 不修補 Claude 執行檔、不挪用 Claude 憑證、
 不繞過計費或認證、不阻擋產品更新、也不會把第三方模型宣稱成 Anthropic 模型。
 

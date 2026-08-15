@@ -1,9 +1,9 @@
-# CCCG
+# CCCOG-MCP
 
 English | [繁體中文](README.zh-TW.md)
 
 You probably run Claude, Codex, and Grok in separate windows that know nothing
-about each other. CCCG (Claude / Codex / Grok) fixes that on your own machine:
+about each other. CCCOG (**C**laude **C**ode / **Co**dex / **G**rok) fixes that on your own machine:
 Claude becomes the coordinator — it can hand a task to Codex or Grok, pick
 which model answers (`gpt-5.6-luna` at `xhigh`, say), wait for the result, and
 even continue a conversation you started yourself in another window days ago.
@@ -14,7 +14,43 @@ processed the message (not "keystrokes were sent"), a session directory for
 all three providers, and workers you can hot-swap without restarting anything.
 That plumbing is the **Dispatch MCP**, and it is the core of this repo.
 
-CCCG is designed for controlled testing, not for concealing which provider
+It is a plain **stdio MCP server**: your MCP client (Claude Desktop / Claude
+Code / Codex) launches a local exe as a child process and talks to it over
+stdin/stdout. No network port, no hosted service, nothing to deploy — the only
+long-lived local processes are the ones CCCOG itself manages (detached job
+workers and PATH A session owners). Code namespaces and binaries keep the
+historical `CCCG` prefix.
+
+## Quick start
+
+```powershell
+git clone https://github.com/WarmBed/CCCOG-MCP.git
+cd CCCOG-MCP
+dotnet build src/CCCG.Dispatch.Worker/CCCG.Dispatch.Worker.csproj -c Release
+dotnet publish src/CCCG.Dispatch/CCCG.Dispatch.csproj -c Release -o artifacts/host
+scripts/install-dispatch-worker.ps1 -Version 1.0.0
+```
+
+Then register the stdio server in your MCP client, e.g. Claude Code
+`.mcp.json`:
+
+```json
+{ "mcpServers": { "cccg-dispatch": { "type": "stdio",
+    "command": "<clone>/artifacts/host/cccg-dispatch.exe" } } }
+```
+
+or Codex `config.toml`:
+
+```toml
+[mcp_servers.cccg-dispatch]
+command = '<clone>\artifacts\host\cccg-dispatch.exe'
+```
+
+Windows-only today (Win32 session discovery + process management). Requires
+.NET 8 and whichever provider CLIs you want to drive (`claude`, `codex`,
+`grok`) already installed and signed in.
+
+CCCOG is designed for controlled testing, not for concealing which provider
 answered. Every generated answer is labeled with the actual provider and
 backend model. CCCG does not patch Claude binaries, reuse Claude credentials,
 bypass billing or authentication, suppress product updates, or claim that a
