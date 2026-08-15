@@ -1,8 +1,9 @@
 # CCCOG-Bar workspace
 
 CCCOG Bar v2 is a slim Windows companion bar: a tray icon whose left click
-toggles a small Mica/Acrylic flyout showing exactly two things — **provider
-quota** (Claude / Codex / Grok, "how full is my plan") and **flow** (who is
+toggles a small Acrylic flyout — TokenBar-Windows' own window chrome and card
+visuals, ported verbatim (see `app/CCCOG.Bar.App/*.cs` doc comments and
+[`SYNC.md`](SYNC.md)) — showing exactly two things — **provider quota** (Claude / Codex / Grok, "how full is my plan") and **flow** (who is
 controlling whom right now, from `cccog-bar-core`'s dispatch-root snapshot).
 No tabs, charts, settings pages, 3D, or usage-history parsing — see
 [`docs/plans/2026-08-16-cccog-bar-v2-slim.md`](../docs/plans/2026-08-16-cccog-bar-v2-slim.md)
@@ -46,8 +47,9 @@ bar/
                              # (7 tests)
   crates/cccog-bar-cli      # debug CLI: prints the envelope for a dispatch
                              # root, optionally polling quotas.
-  app/CCCOG.Bar.App         # the WinUI 3 shell: tray icon, Mica/Acrylic
-                             # flyout (~500px), quota-card section, flow-row
+  app/CCCOG.Bar.App         # the WinUI 3 shell: tray icon, Acrylic flyout
+                             # (~500px, TokenBar's DesktopAcrylicController
+                             # chrome verbatim), quota-card section, flow-row
                              # section.
 ```
 

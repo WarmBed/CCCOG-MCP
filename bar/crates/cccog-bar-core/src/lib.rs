@@ -3,6 +3,7 @@
 //! The core deliberately has no Windows/UI dependency.  It consumes bounded
 //! file snapshots and returns data-only values for a later graph reducer.
 
+pub mod control;
 pub mod dispatch;
 pub mod graph;
 pub mod inbox;

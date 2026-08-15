@@ -501,3 +501,137 @@ fn unavailable(client_id: &str, diagnostic: impl Into<String>) -> QuotaCards {
         diagnostic: Some(diagnostic.into()),
     }
 }
+
+/// Text-pattern check only — it never estimates a percentage. A dispatch
+/// job's `error` field is the provider process's own failure message
+/// (surfaced to CCCG as a generic non-zero exit); when that message itself
+/// reads as a quota/usage-limit rejection, the caller can use this as a
+/// signal to override an otherwise-stale local snapshot with an honest "we
+/// saw this happen" card instead of a frozen pre-block percentage. See
+/// `cccog-bar-ffi`'s job-failure cross-check for where this is applied.
+pub fn looks_like_quota_limit_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "429",
+        "402",
+        "rate limit",
+        "rate_limit",
+        "usage limit",
+        "quota",
+        "credit",
+        "exhaust",
+        "too many requests",
+        "insufficient",
+        "billing",
+        "resource_exhausted",
+        "limit reached",
+        "limit exceeded",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Best-effort reset-date extraction from free-text error content: the
+/// first `YYYY-MM-DD` occurrence, optionally followed by a time component,
+/// anywhere in the string. Returns `None` — never a guess — when nothing
+/// date-shaped is present, per the "raw and honest, never invented"
+/// requirement this exists under.
+pub fn extract_reset_date(error: &str) -> Option<String> {
+    let bytes = error.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    for start in 0..=(bytes.len() - 10) {
+        if !is_iso_date_start(&bytes[start..start + 10]) {
+            continue;
+        }
+        if !error.is_char_boundary(start) {
+            continue;
+        }
+        let date_end = start + 10;
+        // Extend to cover a trailing "THH:MM" or " HH:MM" time component
+        // when present, so "resets 2026-08-20T11:50:00Z" reads whole.
+        let mut end = date_end;
+        let rest = &error[date_end..];
+        if let Some(time_len) = time_suffix_len(rest) {
+            end += time_len;
+        }
+        return Some(error[start..end].to_owned());
+    }
+    None
+}
+
+fn is_iso_date_start(bytes: &[u8]) -> bool {
+    bytes.len() == 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+/// Length of a leading `T` or space followed by `HH:MM` (and an optional
+/// `:SS` / trailing `Z`) at the start of `rest`, or 0 when there is none.
+fn time_suffix_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    if bytes.len() < 6 || (bytes[0] != b'T' && bytes[0] != b' ') {
+        return None;
+    }
+    let digits_colon_digits = |b: &[u8]| -> bool {
+        b.len() >= 5
+            && b[0].is_ascii_digit()
+            && b[1].is_ascii_digit()
+            && b[2] == b':'
+            && b[3].is_ascii_digit()
+            && b[4].is_ascii_digit()
+    };
+    if !digits_colon_digits(&bytes[1..]) {
+        return None;
+    }
+    let mut end = 6; // "T12:34"
+    if bytes.len() > end && bytes[end] == b':' && bytes.len() >= end + 3 {
+        let seconds = &bytes[end + 1..end + 3];
+        if seconds.len() == 2 && seconds.iter().all(u8::is_ascii_digit) {
+            end += 3;
+        }
+    }
+    if bytes.len() > end && bytes[end] == b'Z' {
+        end += 1;
+    }
+    Some(end)
+}
+
+#[cfg(test)]
+mod quota_limit_error_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_common_quota_limit_phrasings_and_ignores_unrelated_failures() {
+        assert!(looks_like_quota_limit_error("HTTP 429 Too Many Requests"));
+        assert!(looks_like_quota_limit_error("HTTP 402 Payment Required"));
+        assert!(looks_like_quota_limit_error("weekly usage limit reached"));
+        assert!(looks_like_quota_limit_error("RESOURCE_EXHAUSTED: quota exceeded"));
+        assert!(looks_like_quota_limit_error("insufficient credits remaining"));
+        assert!(!looks_like_quota_limit_error("Provider exited with code 1."));
+        assert!(!looks_like_quota_limit_error(
+            "An error occurred trying to start process 'codex.exe'"
+        ));
+    }
+
+    #[test]
+    fn extracts_the_first_iso_date_with_an_optional_time_and_nothing_otherwise() {
+        assert_eq!(
+            extract_reset_date("usage limit reached; resets 2026-08-20"),
+            Some("2026-08-20".to_owned())
+        );
+        assert_eq!(
+            extract_reset_date("blocked until 2026-08-20T11:50:00Z per policy"),
+            Some("2026-08-20T11:50:00Z".to_owned())
+        );
+        assert_eq!(
+            extract_reset_date("blocked until 2026-08-20 11:50 per policy"),
+            Some("2026-08-20 11:50".to_owned())
+        );
+        assert_eq!(extract_reset_date("Provider exited with code 1."), None);
+        assert_eq!(extract_reset_date("no date shape at all here"), None);
+    }
+}

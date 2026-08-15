@@ -31,7 +31,6 @@ public sealed partial class FlyoutWindow : Window
     private const int Margin = 12;
     private const int SlideDistance = 24;
 
-    private readonly LocalSnapshotReader _reader = new();
     private readonly DispatcherQueueTimer _refreshTimer;
     private readonly DispatcherQueueTimer _quotaTimer;
     private FileSystemWatcher? _watcher;
@@ -186,7 +185,10 @@ public sealed partial class FlyoutWindow : Window
     /// <summary>
     /// Flow rows are file-only and render synchronously — the &lt;1s cold
     /// window budget depends on this never touching the network or parsing
-    /// usage history. Quota is kicked off separately and arrives async.
+    /// usage history (the windowed Active + last-2h view Rust builds is the
+    /// same bounded local read the old from-scratch scan was, just
+    /// windowed/aggregated — see NativeControlClient below). Quota is
+    /// kicked off separately and arrives async.
     /// </summary>
     private void RefreshView()
     {
@@ -195,8 +197,8 @@ public sealed partial class FlyoutWindow : Window
             return;
         }
 
-        var snapshot = _reader.Read(DateTimeOffset.Now);
-        Dashboard.RenderFlow(snapshot.Rows, snapshot.VisibleJobs);
+        var rows = NativeControlClient.TryFetch(out var visibleJobs);
+        Dashboard.RenderFlow(rows, visibleJobs);
         Dashboard.SetRefreshedText($"refreshed {DateTime.Now:HH:mm:ss}");
         RefreshQuotaCards();
     }
@@ -557,6 +559,13 @@ internal static class NativeQuotaClient
             codexSessionsPath = IOPath.Combine(profile, ".codex", "sessions"),
             claudeCredentialPath = IOPath.Combine(profile, ".claude", ".credentials.json"),
             grokAuthPath = IOPath.Combine(profile, ".grok", "auth.json"),
+            // Enables the stale-snapshot age flag and the job-failure
+            // quota-limit cross-check (Rust: enrich_quota_cards) — a codex
+            // rollout-tail read that froze on the last pre-block value would
+            // otherwise keep reporting "Fresh" forever.
+            dispatchJobsPath = IOPath.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CCCG", "dispatch", "jobs"),
             now = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         });
         try
@@ -682,5 +691,176 @@ internal static class NativeQuotaClient
             }
         }
         return string.IsNullOrWhiteSpace(value) ? "Reset time unavailable" : value;
+    }
+}
+
+/// <summary>
+/// Flow rows via <c>cccog_bar_control_snapshot</c> — the windowed (Active +
+/// last-2h terminal), same-path-aggregated, target-title-resolved view built
+/// by <c>cccog_bar_core::control</c>. Replaces the previous
+/// <c>LocalSnapshotReader</c>, which re-scanned the whole dispatch root
+/// unbounded by age on every refresh; see bar/SYNC.md.
+/// </summary>
+internal static class NativeControlClient
+{
+    [DllImport("cccog_bar_ffi", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr cccog_bar_control_snapshot([MarshalAs(UnmanagedType.LPUTF8Str)] string inputJson);
+
+    [DllImport("cccog_bar_ffi", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void cccog_bar_free_string(IntPtr value);
+
+    private static readonly SolidColorBrush StaleGroupBrush =
+        new(Windows.UI.Color.FromArgb(255, 0x6B, 0x72, 0x80));
+    private static readonly SolidColorBrush NormalLabelBrush =
+        new(Windows.UI.Color.FromArgb(255, 0xF8, 0xFA, 0xFC));
+    private static readonly SolidColorBrush UnknownSourceLabelBrush =
+        new(Windows.UI.Color.FromArgb(180, 0x9A, 0xA5, 0xB4));
+
+    public static IReadOnlyList<FlowRowViewModel> TryFetch(out int visibleJobs)
+    {
+        visibleJobs = 0;
+        var dispatchRoot = IOPath.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CCCG", "dispatch");
+        var input = JsonSerializer.Serialize(new
+        {
+            dispatchRoot,
+            now = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+        });
+        try
+        {
+            var pointer = cccog_bar_control_snapshot(input);
+            if (pointer == IntPtr.Zero)
+            {
+                return [];
+            }
+            try
+            {
+                var json = Marshal.PtrToStringUTF8(pointer);
+                return Parse(json, out visibleJobs);
+            }
+            finally
+            {
+                cccog_bar_free_string(pointer);
+            }
+        }
+        catch (DllNotFoundException)
+        {
+            return [];
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return [];
+        }
+        catch (BadImageFormatException)
+        {
+            return [];
+        }
+        catch (ExternalException)
+        {
+            return [];
+        }
+    }
+
+    private static IReadOnlyList<FlowRowViewModel> Parse(string? json, out int visibleJobs)
+    {
+        visibleJobs = 0;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return [];
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("control", out var control))
+            {
+                return [];
+            }
+            if (!control.TryGetProperty("available", out var availableValue) || !availableValue.GetBoolean())
+            {
+                return [];
+            }
+            if (!control.TryGetProperty("rows", out var rows))
+            {
+                return [];
+            }
+            var result = new List<FlowRowViewModel>();
+            foreach (var row in rows.EnumerateArray())
+            {
+                result.Add(ToRow(row));
+            }
+            visibleJobs = result.Count;
+            return result;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static FlowRowViewModel ToRow(JsonElement row)
+    {
+        var source = String(row, "source") ?? "unknown";
+        var target = String(row, "target") ?? "";
+        var targetProvider = String(row, "targetProvider") ?? "unknown";
+        var status = String(row, "status") ?? "unknown";
+        var active = row.TryGetProperty("active", out var activeValue) && activeValue.GetBoolean();
+        var isStaleGroup = row.TryGetProperty("isStaleGroup", out var staleValue) && staleValue.GetBoolean();
+        long? elapsedSeconds = row.TryGetProperty("elapsedSeconds", out var elapsedValue)
+            && elapsedValue.ValueKind == JsonValueKind.Number
+                ? elapsedValue.GetInt64()
+                : null;
+        var count = row.TryGetProperty("count", out var countValue) ? countValue.GetInt32() : 1;
+        var sourceIsUnknown = row.TryGetProperty("sourceIsUnknown", out var unknownValue) && unknownValue.GetBoolean();
+
+        var summaries = new List<string>();
+        if (row.TryGetProperty("taskSummaries", out var summariesValue))
+        {
+            foreach (var item in summariesValue.EnumerateArray())
+            {
+                var text = item.GetString();
+                if (!string.IsNullOrEmpty(text))
+                {
+                    summaries.Add(text);
+                }
+            }
+        }
+
+        return new FlowRowViewModel
+        {
+            ChainText = isStaleGroup ? target : $"{source} → {target}",
+            CountText = count > 1 ? $"×{count}" : "",
+            ElapsedText = FormatElapsed(elapsedSeconds, active, isStaleGroup),
+            TaskSummary = summaries.Count == 0 ? "No task summary" : string.Join(Environment.NewLine, summaries),
+            DotBrush = isStaleGroup
+                ? StaleGroupBrush
+                : new SolidColorBrush(ProviderPalette.Color(targetProvider)),
+            DotOpacity = isStaleGroup ? StatusVisual.Opacity("stale") : StatusVisual.Opacity(status),
+            Pulse = !isStaleGroup && StatusVisual.Pulses(status),
+            LabelBrush = sourceIsUnknown ? UnknownSourceLabelBrush : NormalLabelBrush,
+            IsStaleGroup = isStaleGroup,
+        };
+    }
+
+    private static string? String(JsonElement row, string name) =>
+        row.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static string FormatElapsed(long? elapsedSeconds, bool active, bool isStaleGroup)
+    {
+        if (isStaleGroup)
+        {
+            return "> 6h queued";
+        }
+        if (elapsedSeconds is not { } seconds)
+        {
+            return active ? "active" : "";
+        }
+        var span = TimeSpan.FromSeconds(Math.Max(seconds, 0));
+        var elapsed = span < TimeSpan.FromMinutes(1) ? "<1m" :
+            span < TimeSpan.FromHours(1) ? $"{(int)span.TotalMinutes}m" :
+            $"{(int)span.TotalHours}h{(int)span.TotalMinutes % 60:00}m";
+        return active ? elapsed : $"{elapsed} ago";
     }
 }
