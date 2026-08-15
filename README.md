@@ -1,5 +1,7 @@
 # CCCG
 
+English | [繁體中文](README.zh-TW.md)
+
 CCCG (Claude / Codex / Grok) is a local multi-agent interoperability toolkit for
 Windows. Its core is the **Dispatch MCP**: Claude (Desktop or Code) stays the
 coordinator and delegates work to Grok, Codex, or safe-mode Claude sessions —
