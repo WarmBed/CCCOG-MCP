@@ -103,6 +103,8 @@ static class OwnerMode
             string.IsNullOrWhiteSpace(cwd) ? Environment.CurrentDirectory : cwd);
 
         IProviderTurnTransport transport;
+        Func<int, IProviderTurnTransport>? transportFactory = null;
+        int? transportHop = null;
         if (provider == "codex")
         {
             model = FirstNonEmpty(
@@ -125,14 +127,24 @@ static class OwnerMode
                 bindingStore.Save(sessionKey, new CodexThreadBinding(1, sessionId, model, now, now));
             }
 
-            transport = new CodexOwnerTurnTransport(
+            var ownerContext = RecursionContext.FromEnvironment();
+            transportHop = ownerContext.JobHop;
+            IProviderTurnTransport BuildTransport(int hop) => new CodexOwnerTurnTransport(
                 new PersistentCodexAppServerClient(
                     sessionKey,
                     bindingStore,
-                    diagnostic: line => Console.Error.WriteLine("[codex] " + line)),
+                    diagnostic: line => Console.Error.WriteLine("[codex] " + line),
+                    processEnvironment: RecursionContext.EnvironmentForHop(
+                        hop,
+                        ownerContext.HopSource,
+                        ownerContext.HopChain,
+                        "codex")),
                 model,
                 effort,
                 cwd);
+
+            transport = BuildTransport(transportHop.Value);
+            transportFactory = BuildTransport;
         }
         else
         {
@@ -141,7 +153,13 @@ static class OwnerMode
             return 3;
         }
 
-        using var daemon = new OwnerDaemon(provider, cwd, sessionId, transport);
+        using var daemon = new OwnerDaemon(
+            provider,
+            cwd,
+            sessionId,
+            transport,
+            transportFactory: transportFactory,
+            transportHop: transportHop);
         OwnerRegistration registration;
         try
         {
@@ -183,11 +201,6 @@ static class OwnerMode
             Console.Error.WriteLine(exception.Message);
             return 5;
         }
-        finally
-        {
-            transport.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
-
         return 0;
     }
 
@@ -329,6 +342,7 @@ sealed class WorkerRuntime
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        RecursionContext.ApplyInheritedEnvironment(info);
         info.ArgumentList.Add("run-job");
         info.ArgumentList.Add(jobId);
         var process = Process.Start(info)

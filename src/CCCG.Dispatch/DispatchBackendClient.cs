@@ -17,15 +17,7 @@ public sealed class DispatchBackendClient
     {
         var descriptor = ResolveWorker();
         VerifyWorker(descriptor);
-        var info = new ProcessStartInfo
-        {
-            FileName = descriptor.Path,
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
+        var info = BuildWorkerStartInfo(descriptor.Path);
         using var process = Process.Start(info)
             ?? throw new InvalidOperationException("Failed to start the CCCG dispatch worker.");
         var request = new DispatchBackendRequest
@@ -62,6 +54,21 @@ public sealed class DispatchBackendClient
         }
 
         return response.Payload ?? "{}";
+    }
+
+    public static ProcessStartInfo BuildWorkerStartInfo(string path)
+    {
+        var info = new ProcessStartInfo
+        {
+            FileName = path,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        RecursionContext.ApplyInheritedEnvironment(info);
+        return info;
     }
 
     public DispatchWorkerDescriptor ResolveWorker()

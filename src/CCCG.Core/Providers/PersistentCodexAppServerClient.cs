@@ -28,13 +28,17 @@ public sealed class PersistentCodexAppServerClient : IAsyncDisposable
         CodexThreadBindingStore? bindingStore = null,
         Func<CancellationToken, Task<IJsonLineTransport>>? transportFactory = null,
         Action<string>? diagnostic = null,
-        Action<string>? protocolDiagnostic = null)
+        Action<string>? protocolDiagnostic = null,
+        IReadOnlyDictionary<string, string>? processEnvironment = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionKey);
         this.sessionKey = sessionKey;
         this.bindingStore = bindingStore ?? new CodexThreadBindingStore();
         this.transportFactory = transportFactory
-            ?? (token => ProcessJsonLineTransport.StartCodexAsync(diagnostic, token));
+            ?? (token => ProcessJsonLineTransport.StartCodexAsync(
+                diagnostic,
+                token,
+                processEnvironment));
         this.protocolDiagnostic = protocolDiagnostic;
     }
 

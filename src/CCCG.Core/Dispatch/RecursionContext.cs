@@ -82,12 +82,39 @@ public sealed class RecursionContext
     }
 
     public IReadOnlyDictionary<string, string> ProviderEnvironment(string provider) =>
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        EnvironmentForHop(JobHop, HopSource, HopChain, provider);
+
+    public static IReadOnlyDictionary<string, string> EnvironmentForHop(
+        int hop,
+        string source,
+        string chain,
+        string provider)
+    {
+        if (hop < 0)
         {
-            [HopVariable] = JobHop.ToString(CultureInfo.InvariantCulture),
-            [SourceVariable] = HopSource,
-            [ChainVariable] = AppendChain(HopChain, provider)
+            throw new ArgumentOutOfRangeException(nameof(hop));
+        }
+
+        return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [HopVariable] = hop.ToString(CultureInfo.InvariantCulture),
+            [SourceVariable] = source,
+            [ChainVariable] = AppendChain(chain, provider)
         };
+    }
+
+    public static void ApplyInheritedEnvironment(ProcessStartInfo startInfo)
+    {
+        ArgumentNullException.ThrowIfNull(startInfo);
+        foreach (var name in new[] { HopVariable, SourceVariable, ChainVariable, MaxHopVariable })
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                startInfo.Environment[name] = value;
+            }
+        }
+    }
 
     public static void ApplyEnvironment(
         ProcessStartInfo startInfo,

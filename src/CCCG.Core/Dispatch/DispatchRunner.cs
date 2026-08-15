@@ -95,9 +95,10 @@ public sealed class DispatchRunner
             throw new InvalidOperationException(reservation.Message);
         }
 
+        DispatchJob? job = null;
         try
         {
-            var job = store.Create(selection, prompt);
+            job = store.Create(selection, prompt);
             job.RequestedSessionId = sessionId;
             job.AllowNew = allowNew;
             job.Model = NormalizeOverride(model);
@@ -119,11 +120,62 @@ public sealed class DispatchRunner
                 toProvider: provider,
                 toSessionId: selection.SessionId,
                 jobId: job.JobId);
+
+            if (recursion.IsRecursive)
+            {
+                if (inbox is null)
+                {
+                    throw new InvalidOperationException(
+                        "CCCG audit notification failed: recursive dispatch requires the inbox ledger; no provider process was started.");
+                }
+
+                var auditModel = string.IsNullOrWhiteSpace(job.Model)
+                    ? "provider-default"
+                    : job.Model;
+                var auditSession = string.IsNullOrWhiteSpace(selection.SessionId)
+                    ? "<new>"
+                    : selection.SessionId;
+                var auditCwd = selection.Cwd ?? cwd ?? Environment.CurrentDirectory;
+                inbox.Post(
+                    "system",
+                    "claude",
+                    "CCCG audit: source=" + recursion.HopSource
+                    + " chain=" + recursion.HopChain
+                    + " cwd=" + auditCwd
+                    + " model=" + auditModel
+                    + " called provider=" + provider
+                    + " session=" + auditSession
+                    + " job=" + job.JobId
+                    + " hop=" + job.HopCount + ".",
+                    fromProvider: "cccg",
+                    toProvider: provider,
+                    toSessionId: selection.SessionId,
+                    jobId: job.JobId);
+            }
+
             return job;
         }
-        catch
+        catch (Exception exception)
         {
             quota.Release(reservation);
+            if (job is not null && recursion.IsRecursive)
+            {
+                try
+                {
+                    store.Update(job.JobId, failed =>
+                    {
+                        failed.Status = DispatchJobStatus.Failed;
+                        failed.Error = exception.Message;
+                        failed.FinishedAt = DateTimeOffset.UtcNow;
+                    });
+                }
+                catch
+                {
+                    // Preserve the original fail-closed error; the job file
+                    // remains available for recovery diagnostics.
+                }
+            }
+
             throw;
         }
     }
@@ -547,7 +599,10 @@ public sealed class DispatchRunner
                 File.Exists(rawPromptPath) ? rawPromptPath : store.PromptPath(job.JobId)),
             DateTimeOffset.UtcNow,
             Model: job.Model,
-            ReasoningEffort: job.ReasoningEffort));
+            ReasoningEffort: job.ReasoningEffort,
+            HopCount: job.HopCount,
+            HopSource: job.HopSource,
+            HopChain: job.HopChain));
 
         job.Status = DispatchJobStatus.Running;
         job.OwnerPid = owner.OwnerPid;

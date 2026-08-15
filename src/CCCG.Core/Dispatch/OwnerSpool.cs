@@ -10,7 +10,10 @@ public sealed record OwnerMessage(
     [property: JsonPropertyName("text")] string Text,
     [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt,
     [property: JsonPropertyName("model")] string? Model = null,
-    [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort = null);
+    [property: JsonPropertyName("reasoningEffort")] string? ReasoningEffort = null,
+    [property: JsonPropertyName("hopCount")] int? HopCount = null,
+    [property: JsonPropertyName("hopSource")] string? HopSource = null,
+    [property: JsonPropertyName("hopChain")] string? HopChain = null);
 
 public static class OwnerReceiptStatus
 {

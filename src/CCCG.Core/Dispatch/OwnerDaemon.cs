@@ -12,7 +12,9 @@ namespace CCCG.Core.Dispatch;
 public sealed class OwnerDaemon : IDisposable
 {
     private readonly OwnerRegistry registry;
-    private readonly IProviderTurnTransport transport;
+    private IProviderTurnTransport transport;
+    private readonly Func<int, IProviderTurnTransport>? transportFactory;
+    private int? transportHop;
     private readonly string provider;
     private readonly string cwd;
     private readonly TimeSpan pollInterval;
@@ -33,7 +35,9 @@ public sealed class OwnerDaemon : IDisposable
         IProviderTurnTransport transport,
         OwnerRegistry? registry = null,
         TimeSpan? pollInterval = null,
-        int transportFailureLimit = 3)
+        int transportFailureLimit = 3,
+        Func<int, IProviderTurnTransport>? transportFactory = null,
+        int? transportHop = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(provider);
         ArgumentException.ThrowIfNullOrWhiteSpace(cwd);
@@ -43,6 +47,8 @@ public sealed class OwnerDaemon : IDisposable
         this.cwd = Path.GetFullPath(cwd);
         this.sessionId = string.IsNullOrWhiteSpace(sessionId) ? null : sessionId.Trim();
         this.transport = transport;
+        this.transportFactory = transportFactory;
+        this.transportHop = transportHop;
         this.registry = registry ?? new OwnerRegistry();
         this.pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(250);
         this.transportFailureLimit = transportFailureLimit;
@@ -136,6 +142,7 @@ public sealed class OwnerDaemon : IDisposable
             var labeled = BuildTurnText(message);
             try
             {
+                EnsureTransportHop(message);
                 var response = transport.RunTurnAsync(
                     labeled,
                     model: message.Model,
@@ -171,6 +178,49 @@ public sealed class OwnerDaemon : IDisposable
         }
 
         return handled;
+    }
+
+    private void EnsureTransportHop(OwnerMessage message)
+    {
+        if (message.HopCount is not int requestedHop)
+        {
+            return;
+        }
+
+        if (transportHop is null)
+        {
+            transportHop = requestedHop;
+            return;
+        }
+
+        if (transportHop == requestedHop)
+        {
+            return;
+        }
+
+        if (transportFactory is null)
+        {
+            throw new InvalidOperationException(
+                "CCCG owner hop changed from " + transportHop + " to " + requestedHop
+                + "; refusing to run a turn through a provider child with stale CCCG_HOP.");
+        }
+
+        var replacement = transportFactory(requestedHop)
+            ?? throw new InvalidOperationException(
+                "CCCG owner transport factory returned no provider child for hop " + requestedHop + ".");
+        var previous = transport;
+        transport = replacement;
+        transportHop = requestedHop;
+        try
+        {
+            previous.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            throw new InvalidOperationException(
+                "CCCG owner could not dispose the stale provider child; refusing to run the new hop.",
+                exception);
+        }
     }
 
     /// <summary>
@@ -265,5 +315,14 @@ public sealed class OwnerDaemon : IDisposable
 
         lease?.Dispose();
         workspaceLease?.Dispose();
+        try
+        {
+            transport.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            // The owner is already shutting down; lease/registration cleanup
+            // above remains authoritative even if the provider child is gone.
+        }
     }
 }

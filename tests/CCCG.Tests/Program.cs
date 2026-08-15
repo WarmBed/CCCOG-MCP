@@ -123,7 +123,12 @@ var tests = new (string Name, Action Run)[]
     ("quota uses Claude and default overrides", QuotaUsesClaudeAndDefaultOverrides),
     ("quota rejects at limit with tomorrow reset", QuotaRejectsAtLimitWithTomorrowReset),
     ("quota resets across local date", QuotaResetsAcrossLocalDate),
-    ("quota reservation rolls back", QuotaReservationRollsBack)
+    ("quota reservation rolls back", QuotaReservationRollsBack),
+    ("owner message round-trips hop metadata", OwnerMessageRoundTripsHopMetadata),
+    ("recursive enqueue posts a system audit", RecursiveEnqueuePostsSystemAudit),
+    ("human root enqueue has no recursive audit", HumanRootEnqueueHasNoRecursiveAudit),
+    ("audit failure fails closed", AuditFailureFailsClosed),
+    ("owner daemon rebuilds transport when hop changes", OwnerDaemonRebuildsTransportWhenHopChanges)
 };
 
 var failures = 0;
@@ -2584,6 +2589,179 @@ static void QuotaReservationRollsBack()
     }
 }
 
+static void OwnerMessageRoundTripsHopMetadata()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-hop-message-{Guid.NewGuid():N}");
+    try
+    {
+        var spool = new OwnerSpool(root);
+        spool.Post(new OwnerMessage(
+            "hop-message",
+            "claude",
+            null,
+            "hello",
+            DateTimeOffset.UtcNow,
+            Model: "gpt-5.6-luna",
+            ReasoningEffort: "high",
+            HopCount: 2,
+            HopSource: "user:test@machine",
+            HopChain: "human>claude"));
+        var loaded = spool.ReadIncoming().Single().Message;
+        Equal(2, loaded.HopCount);
+        Equal("user:test@machine", loaded.HopSource);
+        Equal("human>claude", loaded.HopChain);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void RecursiveEnqueuePostsSystemAudit()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-audit-{Guid.NewGuid():N}");
+    try
+    {
+        var inbox = new InboxLedger(Path.Combine(root, "inbox"));
+        var runner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(root, "jobs")),
+            _ =>
+            [
+                new Peer("codex", "thread-1", PeerStatus.Resumable, "D:\\code\\app", "Peer", null, null, null, null, null, null)
+            ],
+            new FakeProcessLauncher("unused"),
+            inbox: inbox,
+            codexCommand: "codex.exe",
+            owners: new OwnerRegistry(Path.Combine(root, "owners")),
+            recursion: new RecursionContext(
+                1, 2, "user:test@machine", "human>claude", Path.Combine(root, "quotas")));
+
+        var job = runner.Enqueue(
+            "codex",
+            "secret prompt must not be audited",
+            "thread-1",
+            "D:\\code\\app",
+            allowNew: false,
+            model: "gpt-5.6-luna");
+        var audit = inbox.List().Single(message => message.FromRole == "system");
+        Equal("claude", audit.ToRole);
+        Equal("cccg", audit.FromProvider);
+        Equal("codex", audit.ToProvider);
+        Equal(job.JobId, audit.JobId);
+        True(audit.Content.Contains("source=user:test@machine", StringComparison.Ordinal));
+        True(audit.Content.Contains("cwd=D:\\code\\app", StringComparison.Ordinal));
+        True(audit.Content.Contains("model=gpt-5.6-luna", StringComparison.Ordinal));
+        True(audit.Content.Contains("called provider=codex", StringComparison.Ordinal));
+        True(!audit.Content.Contains("secret prompt", StringComparison.Ordinal));
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void HumanRootEnqueueHasNoRecursiveAudit()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-no-audit-{Guid.NewGuid():N}");
+    try
+    {
+        var inbox = new InboxLedger(Path.Combine(root, "inbox"));
+        var runner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(root, "jobs")),
+            _ => Array.Empty<Peer>(),
+            inbox: inbox,
+            recursion: new RecursionContext(
+                0, 2, "user:test@machine", "human", Path.Combine(root, "quotas")));
+        runner.Enqueue("codex", "human root", cwd: "D:\\code\\app");
+        True(!inbox.List().Any(message => message.FromRole == "system"));
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void AuditFailureFailsClosed()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-audit-failure-{Guid.NewGuid():N}");
+    try
+    {
+        var jobs = new DispatchJobStore(Path.Combine(root, "jobs"));
+        var runner = new DispatchRunner(
+            jobs,
+            _ => Array.Empty<Peer>(),
+            recursion: new RecursionContext(
+                1, 2, "user:test@machine", "human>claude", Path.Combine(root, "quotas")));
+        var exception = Throws<InvalidOperationException>(() =>
+            runner.Enqueue("codex", "must be audited", cwd: "D:\\code\\app"));
+        True(exception.Message.Contains("audit", StringComparison.OrdinalIgnoreCase));
+        var status = Directory.EnumerateFiles(Path.Combine(root, "jobs"), "status.json", SearchOption.AllDirectories)
+            .Select(path => System.Text.Json.JsonSerializer.Deserialize<DispatchJob>(File.ReadAllText(path)))
+            .OfType<DispatchJob>()
+            .Single();
+        Equal(DispatchJobStatus.Failed, status.Status);
+        True(status.Error?.Contains("audit", StringComparison.OrdinalIgnoreCase) == true);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void OwnerDaemonRebuildsTransportWhenHopChanges()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-owner-hop-switch-{Guid.NewGuid():N}");
+    try
+    {
+        var registry = new OwnerRegistry(Path.Combine(root, "owners"));
+        var created = new List<HopRecordingTransport>();
+        var initial = new HopRecordingTransport(1);
+        using var daemon = new OwnerDaemon(
+            "codex",
+            "D:\\code\\app",
+            "thread-1",
+            initial,
+            registry,
+            transportFactory: hop =>
+            {
+                var next = new HopRecordingTransport(hop);
+                created.Add(next);
+                return next;
+            },
+            transportHop: 1);
+        var registration = daemon.Start();
+        var spool = new OwnerSpool(registration.SpoolDir);
+        spool.Post(new OwnerMessage("h1", "claude", null, "one", DateTimeOffset.UtcNow, HopCount: 1));
+        Equal(1, daemon.ProcessPendingOnce());
+        Equal(0, created.Count);
+        spool.Post(new OwnerMessage("h2", "claude", null, "two", DateTimeOffset.UtcNow.AddMilliseconds(1), HopCount: 2));
+        Equal(1, daemon.ProcessPendingOnce());
+        Equal(1, created.Count);
+        Equal(2, created[0].Hop);
+        Equal(1, initial.Turns.Count);
+        Equal(1, created[0].Turns.Count);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
 static void GrokResumeReadBackPasses()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-readback-ok-{Guid.NewGuid():N}");
@@ -2978,6 +3156,29 @@ sealed class EchoTurnTransport : IProviderTurnTransport
         LastModel = model;
         LastReasoningEffort = reasoningEffort;
         return Task.FromResult(reply(text));
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+sealed class HopRecordingTransport : IProviderTurnTransport
+{
+    public HopRecordingTransport(int hop) => Hop = hop;
+
+    public int Hop { get; }
+
+    public List<string> Turns { get; } = new();
+
+    public string? SessionId => "thread-1";
+
+    public Task<string> RunTurnAsync(
+        string text,
+        CancellationToken cancellationToken = default,
+        string? model = null,
+        string? reasoningEffort = null)
+    {
+        Turns.Add(text);
+        return Task.FromResult("reply");
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
