@@ -171,7 +171,13 @@ var tests = new (string Name, Action Run)[]
     ("set title Codex returns unsupported without index write", SetTitleCodexReturnsUnsupportedWithoutIndexWrite),
     ("set title Grok returns unsupported without summary write", SetTitleGrokReturnsUnsupportedWithoutSummaryWrite),
     ("set title refuses live writer for every provider", SetTitleRefusesLiveWriterForEveryProvider),
-    ("set title rejects control characters and oversize title", SetTitleRejectsControlCharactersAndOversizeTitle)
+    ("set title rejects control characters and oversize title", SetTitleRejectsControlCharactersAndOversizeTitle),
+    ("archive Codex moves rollouts and index manifest", ArchiveCodexMovesRolloutsAndIndexManifest),
+    ("archive Grok moves complete session directory", ArchiveGrokMovesCompleteSessionDirectory),
+    ("archive Claude moves transcript and sidecars", ArchiveClaudeMovesTranscriptAndSidecars),
+    ("archive is manually restorable from manifest", ArchiveIsManuallyRestorableFromManifest),
+    ("archive refuses live or CCCG owned peer", ArchiveRefusesLiveOrCccgOwnedPeer),
+    ("archive collision or manifest failure leaves source intact", ArchiveCollisionOrManifestFailureLeavesSourceIntact)
 };
 
 var failures = 0;
@@ -3319,6 +3325,153 @@ static void SetTitleRejectsControlCharactersAndOversizeTitle()
         ownerProbe: (_, _) => false);
     Throws<ArgumentException>(() => service.SetTitle("claude", "id", "bad\nname"));
     Throws<ArgumentException>(() => service.SetTitle("claude", "id", new string('x', 300)));
+}
+
+static void ArchiveCodexMovesRolloutsAndIndexManifest()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-archive-codex-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "7e999999-9999-4999-8999-999999999999";
+        WriteCodexTranscript(root, id, "Archive Codex", "archive me");
+        var source = Directory.EnumerateFiles(Path.Combine(root, "sessions"), "rollout-*.jsonl", SearchOption.AllDirectories).Single();
+        var result = new PeerArchiveService(codexHome: root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("codex", id);
+        Equal("archived", result.Status);
+        True(!File.Exists(source));
+        True(File.Exists(result.ManifestPath));
+        var manifest = ArchiveManifest.Load(result.ManifestPath!);
+        True(manifest.Files.Any(file => file.OriginalPath == source));
+        True(manifest.Files.Any(file => file.ArchivedPath.Contains("cccg-archive", StringComparison.OrdinalIgnoreCase)));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ArchiveGrokMovesCompleteSessionDirectory()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-archive-grok-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "7f999999-9999-4999-8999-999999999999";
+        var dir = Path.Combine(root, "sessions", "D%3A%5Ccode%5Capp", id);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "summary.json"), $$"""{"info":{"id":"{{id}}"},"generated_title":"archive"}""");
+        File.WriteAllText(Path.Combine(dir, "chat_history.jsonl"), "{\"type\":\"user\",\"content\":\"archive\"}\n");
+        File.WriteAllText(Path.Combine(dir, "events.jsonl"), "{\"type\":\"event\"}\n");
+        var result = new PeerArchiveService(grokHome: root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("grok", id);
+        Equal("archived", result.Status);
+        True(!Directory.Exists(dir));
+        var manifest = ArchiveManifest.Load(result.ManifestPath!);
+        Equal(3, manifest.Files.Count);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ArchiveClaudeMovesTranscriptAndSidecars()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-archive-claude-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "80999999-9999-4999-8999-999999999999";
+        var project = Path.Combine(root, "projects", "D--code-app");
+        var sidecar = Path.Combine(project, id, "tool-results");
+        Directory.CreateDirectory(sidecar);
+        File.WriteAllText(Path.Combine(project, id + ".jsonl"), "{\"type\":\"user\"}\n");
+        File.WriteAllText(Path.Combine(sidecar, "result.txt"), "sidecar");
+        var result = new PeerArchiveService(claudeHome: root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("claude", id);
+        Equal("archived", result.Status);
+        True(!File.Exists(Path.Combine(project, id + ".jsonl")));
+        True(!Directory.Exists(Path.Combine(project, id)));
+        var manifest = ArchiveManifest.Load(result.ManifestPath!);
+        Equal(2, manifest.Files.Count);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ArchiveIsManuallyRestorableFromManifest()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-archive-restore-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "81999999-9999-4999-8999-999999999999";
+        WriteCodexTranscript(root, id, "Restore Codex", "restore me");
+        var source = Directory.EnumerateFiles(Path.Combine(root, "sessions"), "rollout-*.jsonl", SearchOption.AllDirectories).Single();
+        var result = new PeerArchiveService(codexHome: root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("codex", id);
+        var manifest = ArchiveManifest.Load(result.ManifestPath!);
+        foreach (var file in manifest.Files)
+        {
+            if (!File.Exists(file.ArchivedPath))
+            {
+                continue;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(file.OriginalPath)!);
+            File.Move(file.ArchivedPath, file.OriginalPath);
+        }
+        True(File.Exists(source));
+        Equal("restore me", new TranscriptService(codexHome: root)
+            .Read(new TranscriptReadRequest("codex", id)).Rendered.Contains("restore me")
+            ? "restore me" : "missing");
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ArchiveRefusesLiveOrCccgOwnedPeer()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-archive-live-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "82999999-9999-4999-8999-999999999999";
+        WriteCodexTranscript(root, id, "Live Codex", "live");
+        var live = new PeerArchiveService(codexHome: root,
+            liveProbe: (_, _) => true, ownerProbe: (_, _) => false).Archive("codex", id);
+        Equal("live_refused", live.Status);
+        var owned = new PeerArchiveService(codexHome: root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => true).Archive("codex", id);
+        Equal("owner_refused", owned.Status);
+        True(Directory.EnumerateFiles(Path.Combine(root, "sessions"), "rollout-*.jsonl", SearchOption.AllDirectories).Any());
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ArchiveCollisionOrManifestFailureLeavesSourceIntact()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-archive-fail-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "83999999-9999-4999-8999-999999999999";
+        WriteCodexTranscript(root, id, "Fail Codex", "keep me");
+        var source = Directory.EnumerateFiles(Path.Combine(root, "sessions"), "rollout-*.jsonl", SearchOption.AllDirectories).Single();
+        var result = new PeerArchiveService(codexHome: root,
+            liveProbe: (_, _) => false,
+            ownerProbe: (_, _) => false,
+            manifestCanWrite: _ => false).Archive("codex", id);
+        Equal("failed", result.Status);
+        True(File.Exists(source));
+        True(!Directory.Exists(Path.Combine(root, "sessions", "cccg-archive")));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
 }
 
 static void WriteCodexTranscript(string root, string sessionId, string title, string content)
