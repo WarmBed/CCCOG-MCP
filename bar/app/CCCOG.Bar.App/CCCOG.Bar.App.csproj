@@ -19,4 +19,10 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.*" />
     <PackageReference Include="H.NotifyIcon.WinUI" Version="2.*" />
   </ItemGroup>
+  <Target Name="CopyCccogBarFfi" AfterTargets="Build"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\cccog_bar_ffi.dll')">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\target\release\cccog_bar_ffi.dll"
+          DestinationFolder="$(TargetDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>
