@@ -1,4 +1,4 @@
-use cccog_bar_core::quota::{
+use cccog_bar_quota::{
     fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_codex_quota_from_sessions,
     load_grok_token, parse_codex_rate_limits, HttpClient, HttpRequest, HttpResponse,
     OAuthCredential, PollGate, QuotaState,
@@ -6,12 +6,19 @@ use cccog_bar_core::quota::{
 
 #[derive(Default)]
 struct FakeHttp {
-    responses: Vec<HttpResponse>,
+    responses: Vec<Result<HttpResponse, String>>,
     requests: Vec<HttpRequest>,
 }
 
 impl FakeHttp {
     fn with(responses: Vec<HttpResponse>) -> Self {
+        Self {
+            responses: responses.into_iter().map(Ok).collect(),
+            requests: Vec::new(),
+        }
+    }
+
+    fn with_results(responses: Vec<Result<HttpResponse, String>>) -> Self {
         Self {
             responses,
             requests: Vec::new(),
@@ -22,14 +29,10 @@ impl FakeHttp {
 impl HttpClient for FakeHttp {
     fn send(&mut self, request: HttpRequest) -> Result<HttpResponse, String> {
         self.requests.push(request);
-        self.responses
-            .first()
-            .cloned()
-            .ok_or_else(|| "offline".to_owned())
-            .map(|response| {
-                self.responses.remove(0);
-                response
-            })
+        if self.responses.is_empty() {
+            return Err("offline".to_owned());
+        }
+        self.responses.remove(0)
     }
 }
 
@@ -46,7 +49,19 @@ fn codex_local_rate_limits_map_windows_without_http() {
 }
 
 #[test]
-fn claude_200_maps_cards_and_401_is_stale_without_data_leak() {
+fn codex_malformed_json_reports_a_concrete_reason() {
+    let error = parse_codex_rate_limits("not-json").expect_err("malformed input must fail");
+    assert_eq!(error, "invalid Codex rate_limits JSON");
+
+    let empty = parse_codex_rate_limits("{}").expect_err("no windows must fail");
+    assert_eq!(
+        empty,
+        "Codex response contained no usable rate limit windows"
+    );
+}
+
+#[test]
+fn claude_200_maps_cards_and_401_is_stale_with_concrete_http_reason() {
     let response = HttpResponse::json(
         200,
         r#"{"five_hour":{"utilization":1.0,"resets_at":"2026-08-15T05:00:00Z"},"seven_day":{"utilization":91.0}}"#,
@@ -63,6 +78,9 @@ fn claude_200_maps_cards_and_401_is_stale_without_data_leak() {
     let mut unauthorized = FakeHttp::with(vec![HttpResponse::json(401, "{}")]);
     let stale = fetch_claude_quota(&mut unauthorized, &credential, 1_000).expect("stale cards");
     assert_eq!(stale.state, QuotaState::Stale);
+    // Lessons-learned: failures must carry a concrete reason, never a vague
+    // "unavailable" placeholder.
+    assert_eq!(stale.diagnostic.as_deref(), Some("HTTP 401"));
 }
 
 #[test]
@@ -85,8 +103,62 @@ fn claude_403_is_unavailable_without_messages_probe_and_expired_refresh_is_post_
     let fresh = fetch_claude_quota(&mut refresh, &expired, 1_000).expect("refreshed cards");
     assert_eq!(fresh.state, QuotaState::Fresh);
     assert_eq!(refresh.requests[0].method, "POST");
+    assert_eq!(refresh.requests[0].url, "https://platform.claude.com/v1/oauth/token");
+    // The refresh body must carry the same client_id TokenBar-Windows sends;
+    // some deployments of the endpoint reject a refresh without it.
+    let refresh_body = refresh.requests[0].body.as_deref().unwrap_or_default();
+    assert!(refresh_body.contains("grant_type=refresh_token"));
+    assert!(refresh_body.contains("refresh_token=refresh"));
+    assert!(refresh_body.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));
     assert_eq!(refresh.requests[1].method, "GET");
     assert_eq!(refresh.requests[1].bearer.as_deref(), Some("refreshed"));
+}
+
+#[test]
+fn claude_refresh_rejected_and_transport_failure_report_exact_diagnostics() {
+    let expired = OAuthCredential::new("expired", Some("refresh"), Some(1));
+
+    let mut rejected = FakeHttp::with(vec![HttpResponse::json(400, r#"{"error":"invalid_grant"}"#)]);
+    let stale = fetch_claude_quota(&mut rejected, &expired, 1_000).expect("stale cards");
+    assert_eq!(stale.state, QuotaState::Stale);
+    assert_eq!(stale.diagnostic.as_deref(), Some("token refresh rejected"));
+
+    let mut offline = FakeHttp::with_results(vec![Err("connection reset".to_owned())]);
+    let failed = fetch_claude_quota(&mut offline, &expired, 1_000).expect("stale cards");
+    assert_eq!(failed.state, QuotaState::Stale);
+    assert_eq!(failed.diagnostic.as_deref(), Some("token refresh failed"));
+
+    let mut malformed_refresh = FakeHttp::with(vec![HttpResponse::json(200, "not-json")]);
+    let malformed = fetch_claude_quota(&mut malformed_refresh, &expired, 1_000).expect("stale cards");
+    assert_eq!(malformed.diagnostic.as_deref(), Some("token refresh response malformed"));
+
+    let mut no_token = FakeHttp::with(vec![HttpResponse::json(200, r#"{"expires_in":3600}"#)]);
+    let missing_token = fetch_claude_quota(&mut no_token, &expired, 1_000).expect("stale cards");
+    assert_eq!(
+        missing_token.diagnostic.as_deref(),
+        Some("token refresh returned no access token")
+    );
+}
+
+#[test]
+fn claude_transport_failure_and_malformed_body_after_success_are_stale() {
+    let credential = OAuthCredential::new("access-token", None, None);
+
+    let mut offline = FakeHttp::with_results(vec![Err("timed out".to_owned())]);
+    let stale = fetch_claude_quota(&mut offline, &credential, 1_000).expect("stale cards");
+    assert_eq!(stale.state, QuotaState::Stale);
+    assert_eq!(stale.diagnostic.as_deref(), Some("quota request failed"));
+
+    let mut malformed = FakeHttp::with(vec![HttpResponse::json(200, "not-json")]);
+    let malformed_cards = fetch_claude_quota(&mut malformed, &credential, 1_000).expect("stale cards");
+    assert_eq!(malformed_cards.diagnostic.as_deref(), Some("quota response malformed"));
+
+    let mut empty_windows = FakeHttp::with(vec![HttpResponse::json(200, "{}")]);
+    let empty = fetch_claude_quota(&mut empty_windows, &credential, 1_000).expect("stale cards");
+    assert_eq!(
+        empty.diagnostic.as_deref(),
+        Some("quota response contained no windows")
+    );
 }
 
 #[test]
@@ -102,6 +174,25 @@ fn grok_missing_auth_hides_card_and_valid_response_maps_credit_usage() {
     let cards = fetch_grok_quota(&mut http, Some("grok-token")).expect("grok cards");
     assert_eq!(cards.windows[0].used_percent, 68.0);
     assert_eq!(cards.windows[0].remaining_percent, 32.0);
+    assert_eq!(http.requests[0].bearer.as_deref(), Some("grok-token"));
+}
+
+#[test]
+fn grok_transport_failure_and_http_status_report_exact_diagnostics() {
+    let mut offline = FakeHttp::with_results(vec![Err("dns failure".to_owned())]);
+    let stale = fetch_grok_quota(&mut offline, Some("token")).expect("stale cards");
+    assert_eq!(stale.diagnostic.as_deref(), Some("quota request failed"));
+
+    let mut unauthorized = FakeHttp::with(vec![HttpResponse::json(401, "{}")]);
+    let unauthorized_cards = fetch_grok_quota(&mut unauthorized, Some("token")).expect("stale cards");
+    assert_eq!(unauthorized_cards.diagnostic.as_deref(), Some("HTTP 401"));
+
+    let mut no_credits = FakeHttp::with(vec![HttpResponse::json(200, "{}")]);
+    let no_credits_cards = fetch_grok_quota(&mut no_credits, Some("token")).expect("stale cards");
+    assert_eq!(
+        no_credits_cards.diagnostic.as_deref(),
+        Some("quota response contained no credit usage")
+    );
 }
 
 #[test]
@@ -115,6 +206,15 @@ fn malformed_timeout_and_bounds_are_stale_or_unavailable_and_polling_is_gated() 
     gate.mark(1_000);
     assert!(!gate.due(1_059));
     assert!(gate.due(1_060));
+}
+
+#[test]
+fn poll_gate_clamps_any_requested_minimum_to_the_sixty_second_floor() {
+    let mut fast_requested = PollGate::new(1);
+    assert!(fast_requested.due(0));
+    fast_requested.mark(0);
+    assert!(!fast_requested.due(30));
+    assert!(fast_requested.due(60));
 }
 
 #[test]
@@ -151,6 +251,15 @@ fn credential_loaders_are_read_only_and_restrict_grok_issuer() {
 }
 
 #[test]
+fn missing_credential_files_are_none_not_errors() {
+    let directory = tempfile::tempdir().expect("temp fixture");
+    let claude_path = directory.path().join("missing-claude.json");
+    let grok_path = directory.path().join("missing-grok.json");
+    assert_eq!(load_claude_credential(&claude_path).expect("ok"), None);
+    assert_eq!(load_grok_token(&grok_path).expect("ok"), None);
+}
+
+#[test]
 fn codex_rollout_tail_reads_real_event_msg_rate_limits_and_numeric_reset() {
     let root = tempfile::tempdir().expect("sessions fixture");
     let nested = root.path().join("2026").join("08").join("15");
@@ -167,4 +276,23 @@ fn codex_rollout_tail_reads_real_event_msg_rate_limits_and_numeric_reset() {
     assert_eq!(cards.client_id, "codex");
     assert_eq!(cards.windows[0].used_percent, 37.0);
     assert_eq!(cards.windows[0].resets_at.as_deref(), Some("1787197821"));
+}
+
+#[test]
+fn codex_rollout_scan_skips_archived_directories_and_missing_root() {
+    let missing = load_codex_quota_from_sessions(std::path::Path::new(
+        "Z:\\definitely-not-a-real-cccog-bar-quota-path",
+    ));
+    assert!(missing.is_err());
+
+    let root = tempfile::tempdir().expect("sessions fixture");
+    let archived = root.path().join("cccg-archive").join("2026");
+    std::fs::create_dir_all(&archived).unwrap();
+    std::fs::write(
+        archived.join("rollout-archived.jsonl"),
+        "{\"type\":\"event_msg\",\"payload\":{\"info\":{\"rate_limits\":{\"primary\":{\"used_percent\":5.0}}}}}\n",
+    )
+    .unwrap();
+    let only_archived = load_codex_quota_from_sessions(root.path());
+    assert!(only_archived.is_err());
 }

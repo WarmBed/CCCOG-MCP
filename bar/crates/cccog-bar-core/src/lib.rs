@@ -8,6 +8,5 @@ pub mod graph;
 pub mod inbox;
 pub mod owners;
 pub mod privacy;
-pub mod quota;
 pub mod refresh;
 pub mod usage;

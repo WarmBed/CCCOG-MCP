@@ -65,9 +65,19 @@ name = "cccog-bar-ffi"
 version = "0.1.0"
 dependencies = [
  "cccog-bar-core",
+ "cccog-bar-quota",
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cccog-bar-quota"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

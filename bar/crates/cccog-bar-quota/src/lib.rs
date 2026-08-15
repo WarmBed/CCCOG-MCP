@@ -1,8 +1,24 @@
 //! Provider quota cards with an injected, tightly bounded HTTP boundary.
 //!
-//! The core never owns a network implementation.  Production will provide a
-//! read-only client; tests provide a recorder/fake and therefore never contact
-//! provider endpoints.
+//! The crate never owns a network implementation.  Production callers (the
+//! FFI layer) provide a read-only HTTP client; tests provide a
+//! recorder/fake and therefore never contact provider endpoints.  This is a
+//! consolidated, standalone crate (see the workspace `SYNC.md` for the
+//! TokenBar-Windows derivation this grew from) so the CCCOG-Bar shell can
+//! depend on quota polling without pulling in the flow/graph core.
+//!
+//! Scope, one per provider:
+//! - Codex: local rollout `rate_limits` tail (file-only, no network).
+//! - Claude: `GET api.anthropic.com/api/oauth/usage`, with a
+//!   `platform.claude.com` OAuth token refresh when the local credential has
+//!   expired; a `403` means the token is inference-only and the card
+//!   reports `Unavailable`, never a probe of `/messages`.
+//! - Grok: `GET cli-chat-proxy.grok.com/v1/billing?format=credits` using the
+//!   `https://auth.x.ai::*` OIDC entry only; a foreign bearer token in the
+//!   same JSON file is never sent.
+//!
+//! Failures always carry a concrete, short diagnostic string (e.g. `HTTP
+//! 401`, `token refresh rejected`) — never a vague "unavailable".
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -85,6 +101,19 @@ impl OAuthCredential {
 pub struct PollGate {
     minimum_seconds: u64,
     last_poll: Option<u64>,
+}
+
+/// Same client id TokenBar-Windows sends on Claude's `platform.claude.com`
+/// refresh call; the endpoint has been observed to require it. See SYNC.md.
+const CLAUDE_REFRESH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// A dispatch/session directory component that marks an archived branch; the
+/// same convention `cccog-bar-core::owners::is_archived_path` uses.  Kept as
+/// a tiny local copy so this crate has no dependency on the flow/graph core.
+fn is_archived_path(path: &Path) -> bool {
+    path.to_string_lossy()
+        .split(['\\', '/'])
+        .any(|component| component.eq_ignore_ascii_case("cccg-archive"))
 }
 
 /// Read Claude's local OAuth JSON without modifying it.  `expiresAt` is the
@@ -245,7 +274,7 @@ fn collect_rollouts(root: &Path, files: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if crate::owners::is_archived_path(&path) {
+        if is_archived_path(&path) {
             continue;
         }
         if path.is_dir() {
@@ -285,6 +314,22 @@ fn modified_time(path: &Path) -> Option<u128> {
         .map(|duration| duration.as_millis() as u128)
 }
 
+/// Percent-encode a small fixed set of form fields.  Values here are always
+/// opaque bearer/refresh tokens or a constant client id, so a conservative
+/// unreserved-character allowlist is sufficient without pulling in a URL crate.
+fn form_urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 pub fn fetch_claude_quota<C: HttpClient>(
     client: &mut C,
     credential: &OAuthCredential,
@@ -296,23 +341,28 @@ pub fn fetch_claude_quota<C: HttpClient>(
         .is_some_and(|expires_at| expires_at <= now)
     {
         if let Some(refresh_token) = credential.refresh_token.as_deref() {
+            let body = format!(
+                "grant_type=refresh_token&refresh_token={}&client_id={}",
+                form_urlencode(refresh_token),
+                form_urlencode(CLAUDE_REFRESH_CLIENT_ID)
+            );
             let refresh = client.send(HttpRequest {
                 method: "POST".to_owned(),
                 url: "https://platform.claude.com/v1/oauth/token".to_owned(),
                 bearer: None,
-                body: Some(format!("refresh_token={}", refresh_token)),
+                body: Some(body),
             });
             let Ok(response) = refresh else {
-                return Some(stale("claude", "OAuth refresh failed"));
+                return Some(stale("claude", "token refresh failed"));
             };
             if response.status != 200 {
-                return Some(stale("claude", "OAuth refresh rejected"));
+                return Some(stale("claude", "token refresh rejected"));
             }
             let Ok(body) = serde_json::from_str::<Value>(&response.body) else {
-                return Some(stale("claude", "OAuth refresh response malformed"));
+                return Some(stale("claude", "token refresh response malformed"));
             };
             let Some(token) = body.get("access_token").and_then(Value::as_str) else {
-                return Some(stale("claude", "OAuth refresh returned no access token"));
+                return Some(stale("claude", "token refresh returned no access token"));
             };
             access_token = token.to_owned();
         }
@@ -331,7 +381,7 @@ pub fn fetch_claude_quota<C: HttpClient>(
         return Some(unavailable("claude", "OAuth token is inference-only"));
     }
     if response.status != 200 {
-        return Some(stale("claude", format!("quota HTTP {}", response.status)));
+        return Some(stale("claude", format!("HTTP {}", response.status)));
     }
     let Ok(value) = serde_json::from_str::<Value>(&response.body) else {
         return Some(stale("claude", "quota response malformed"));
@@ -361,7 +411,7 @@ pub fn fetch_grok_quota<C: HttpClient>(client: &mut C, token: Option<&str>) -> O
         return Some(stale("grok", "quota request failed"));
     };
     if response.status != 200 {
-        return Some(stale("grok", format!("quota HTTP {}", response.status)));
+        return Some(stale("grok", format!("HTTP {}", response.status)));
     }
     let Ok(value) = serde_json::from_str::<Value>(&response.body) else {
         return Some(stale("grok", "quota response malformed"));
