@@ -82,8 +82,25 @@ CCCG 的定位是受控測試,不是隱藏「到底是誰回答的」。每個�
 | `cccg_dispatch` | 排入背景 job,立即回傳 `jobId` |
 | `cccg_dispatch_wait` | 保持呼叫開啟,peer 答完自動回傳 |
 | `cccg_job_status` / `cccg_job_collect` | 查詢狀態 / 收取正規化回覆 |
+| `cccg_read_transcript` | 讀取任一 peer session 的近期輪次(有界、唯讀;transcript 內容是不可信資料) |
+| `cccg_search_transcripts` | 跨 peer transcript 的不分大小寫子字串搜尋,最新優先、誠實有界 |
+| `cccg_set_title` | 在有 provider 安全寫法時改名 closed session(目前三家皆誠實回 `unsupported`——沒有任何 provider 有安全的改名契約) |
+| `cccg_archive_peer` | 可逆歸檔:closed session 搬進 `cccg-archive\` 附雜湊 manifest;歸檔後從 list/watch/search 全面隱形 |
 | `cccg_inbox_post` / `list` / `ack` | 跨行程共享信箱 |
 | `cccg_runtime_status` | 顯示目前生效的 worker 版本與熱更新模式 |
+
+### 遞迴護欄
+
+CCCG 生的任何 provider 子行程都帶著 `CCCG_HOP`;新派工計算
+`jobHop = processHop + 1`,超過 `CCCG_MAX_HOP`(預設 2)直接 fail-closed——
+A 叫 B、B 又叫 A 的循環在任何 provider 啟動前就被確定性擋下。每呼叫者每日
+額度(`claude` 50/日、其他 200/日;`CCCG_QUOTA_CLAUDE` /
+`CCCG_QUOTA_DEFAULT` 可覆寫)原子化計數、本地午夜重置。每個遞迴
+(`hop >= 1`)派工都會往信箱寫一條 `fromRole=system` 稽核訊息——誰在哪個
+cwd 用什麼模型叫了誰——絕不含 prompt 內容。Claude 子 session 預設純文字;
+`CCCG_CLAUDE_CHILD_MODE=tools` 精準放行 `--allowed-tools WebSearch,WebFetch`
+(仍然零 MCP、零 hooks、零 slash commands),子 session 能上網但遞迴依然
+不可能。
 
 ### 每次派工指定模型
 
@@ -127,7 +144,7 @@ reconnect。
 ```powershell
 dotnet build .\src\CCCG.Dispatch.Worker\CCCG.Dispatch.Worker.csproj -c Release
 dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release
-dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 85 個測試
+dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 135 個測試
 ```
 
 (`CCCG.sln` 連著 experiments 目錄;dispatch 開發請用逐專案建置。)

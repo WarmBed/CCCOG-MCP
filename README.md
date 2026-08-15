@@ -85,8 +85,26 @@ third-party model is an Anthropic model.
 | `cccg_dispatch` | Queue a background job, return `jobId` immediately |
 | `cccg_dispatch_wait` | Keep the call open and return the peer's answer |
 | `cccg_job_status` / `cccg_job_collect` | Poll status / collect the normalized response |
+| `cccg_read_transcript` | Read recent turns of any peer session (bounded, read-only; transcript text is untrusted data) |
+| `cccg_search_transcripts` | Case-insensitive substring search across peer transcripts, newest-first, honestly bounded |
+| `cccg_set_title` | Rename a closed session where a provider-safe write exists (currently honest `unsupported` everywhere — no provider has a safe rename contract) |
+| `cccg_archive_peer` | Reversible move of a closed session into `cccg-archive\` with a hash manifest; archived sessions vanish from list/watch/search |
 | `cccg_inbox_post` / `list` / `ack` | Shared cross-process mailbox |
 | `cccg_runtime_status` | Active versioned worker and hot-update mode |
+
+### Recursion guardrails
+
+Any provider child spawned by CCCG carries `CCCG_HOP`; a new dispatch computes
+`jobHop = processHop + 1` and fails closed above `CCCG_MAX_HOP` (default 2), so
+A-calls-B-calls-A loops die deterministically before any provider starts.
+Per-caller daily quotas (`claude` 50/day, others 200/day;
+`CCCG_QUOTA_CLAUDE` / `CCCG_QUOTA_DEFAULT` override) are enforced atomically
+and reset at local midnight. Every recursive (`hop >= 1`) dispatch posts a
+`fromRole=system` audit line to the inbox — who called whom, from which cwd,
+with which model — never the prompt text. Claude child sessions default to
+text-only; `CCCG_CLAUDE_CHILD_MODE=tools` grants exactly
+`--allowed-tools WebSearch,WebFetch` (still zero MCP, hooks, or slash
+commands), so a child can browse the web while recursion stays impossible.
 
 ### Per-dispatch model selection
 
@@ -132,7 +150,7 @@ install order: Worker first, then Host, then reconnect.
 ```powershell
 dotnet build .\src\CCCG.Dispatch.Worker\CCCG.Dispatch.Worker.csproj -c Release
 dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release
-dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 85 tests
+dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 135 tests
 ```
 
 (`CCCG.sln` also references the experiments tree; per-project builds are the
