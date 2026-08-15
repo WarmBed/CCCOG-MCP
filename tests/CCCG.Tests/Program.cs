@@ -165,7 +165,13 @@ var tests = new (string Name, Action Run)[]
     ("search provider filter limits sources", SearchProviderFilterLimitsSources),
     ("search tail first and honest file byte cap", SearchTailFirstAndHonestFileByteCap),
     ("search stops at total session and output caps", SearchStopsAtTotalSessionAndOutputCaps),
-    ("search warning treats transcript as data", SearchWarningTreatsTranscriptAsData)
+    ("search warning treats transcript as data", SearchWarningTreatsTranscriptAsData),
+    ("set title Claude closed appends native custom title", SetTitleClaudeClosedAppendsNativeCustomTitle),
+    ("set title Claude CLI recognition disposable copy", SetTitleClaudeCliRecognitionDisposableCopy),
+    ("set title Codex returns unsupported without index write", SetTitleCodexReturnsUnsupportedWithoutIndexWrite),
+    ("set title Grok returns unsupported without summary write", SetTitleGrokReturnsUnsupportedWithoutSummaryWrite),
+    ("set title refuses live writer for every provider", SetTitleRefusesLiveWriterForEveryProvider),
+    ("set title rejects control characters and oversize title", SetTitleRejectsControlCharactersAndOversizeTitle)
 };
 
 var failures = 0;
@@ -3169,6 +3175,150 @@ static void SearchWarningTreatsTranscriptAsData()
     {
         TryDelete(root);
     }
+}
+
+static void SetTitleClaudeClosedAppendsNativeCustomTitle()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-title-claude-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "79999999-9999-4999-8999-999999999999";
+        var project = Path.Combine(root, "projects", "D--code-app");
+        Directory.CreateDirectory(project);
+        var path = Path.Combine(project, sessionId + ".jsonl");
+        File.WriteAllText(path,
+            "{\"type\":\"user\",\"sessionId\":\"" + sessionId + "\",\"cwd\":\"D:\\\\code\\\\app\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n");
+        var before = File.ReadAllText(path);
+        var service = new PeerMutationService(
+            claudeHome: root,
+            liveProbe: (_, _) => false,
+            ownerProbe: (_, _) => false,
+            cliReadBack: (_, title) => title == "Renamed Claude");
+        var result = service.SetTitle("claude", sessionId, "Renamed Claude");
+        Equal("updated", result.Status);
+        True(result.CliReadBack);
+        True(File.ReadAllText(path).StartsWith(before, StringComparison.Ordinal));
+        var reread = new TranscriptService(claudeHome: root).Read(
+            new TranscriptReadRequest("claude", sessionId));
+        Equal("Renamed Claude", reread.Title);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void SetTitleClaudeCliRecognitionDisposableCopy()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-title-readback-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "7a999999-9999-4999-8999-999999999999";
+        var project = Path.Combine(root, "projects", "D--code-app");
+        Directory.CreateDirectory(project);
+        var path = Path.Combine(project, sessionId + ".jsonl");
+        File.WriteAllText(path,
+            "{\"type\":\"user\",\"sessionId\":\"" + sessionId + "\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n");
+        var service = new PeerMutationService(
+            claudeHome: root,
+            liveProbe: (_, _) => false,
+            ownerProbe: (_, _) => false);
+        var result = service.SetTitle("claude", sessionId, "No CLI proof");
+        Equal("unsupported", result.Status);
+        True(result.Message.Contains("read-back", StringComparison.OrdinalIgnoreCase));
+        True(!File.ReadAllText(path).Contains("No CLI proof", StringComparison.Ordinal));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void SetTitleCodexReturnsUnsupportedWithoutIndexWrite()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-title-codex-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "7b999999-9999-4999-8999-999999999999";
+        WriteCodexTranscript(root, id, "Original Codex", "hello");
+        var index = Path.Combine(root, "session_index.jsonl");
+        var before = File.ReadAllText(index);
+        var result = new PeerMutationService(
+            codexHome: root,
+            liveProbe: (_, _) => false,
+            ownerProbe: (_, _) => false).SetTitle("codex", id, "New Codex");
+        Equal("unsupported", result.Status);
+        True(result.Message.Contains("rename", StringComparison.OrdinalIgnoreCase));
+        Equal(before, File.ReadAllText(index));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void SetTitleGrokReturnsUnsupportedWithoutSummaryWrite()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-title-grok-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "7c999999-9999-4999-8999-999999999999";
+        var dir = Path.Combine(root, "sessions", "D%3A%5Ccode%5Capp", id);
+        Directory.CreateDirectory(dir);
+        var summary = Path.Combine(dir, "summary.json");
+        File.WriteAllText(summary,
+            $$"""{"info":{"id":"{{id}}"},"generated_title":"Original Grok"}""");
+        var before = File.ReadAllText(summary);
+        var result = new PeerMutationService(
+            grokHome: root,
+            liveProbe: (_, _) => false,
+            ownerProbe: (_, _) => false).SetTitle("grok", id, "New Grok");
+        Equal("unsupported", result.Status);
+        True(result.Message.Contains("Grok", StringComparison.OrdinalIgnoreCase));
+        Equal(before, File.ReadAllText(summary));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void SetTitleRefusesLiveWriterForEveryProvider()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-title-live-{Guid.NewGuid():N}");
+    try
+    {
+        var claudeId = "7d999999-9999-4999-8999-999999999999";
+        var project = Path.Combine(root, "projects", "D--code-app");
+        Directory.CreateDirectory(project);
+        File.WriteAllText(Path.Combine(project, claudeId + ".jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"" + claudeId + "\",\"message\":{\"role\":\"user\",\"content\":\"x\"}}\n");
+        var service = new PeerMutationService(
+            codexHome: root,
+            grokHome: root,
+            claudeHome: root,
+            liveProbe: (_, _) => true,
+            ownerProbe: (_, _) => false,
+            cliReadBack: (_, _) => true);
+        foreach (var provider in new[] { "codex", "grok", "claude" })
+        {
+            var result = service.SetTitle(provider, claudeId, "blocked");
+            Equal("live_refused", result.Status);
+        }
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void SetTitleRejectsControlCharactersAndOversizeTitle()
+{
+    var service = new PeerMutationService(
+        liveProbe: (_, _) => false,
+        ownerProbe: (_, _) => false);
+    Throws<ArgumentException>(() => service.SetTitle("claude", "id", "bad\nname"));
+    Throws<ArgumentException>(() => service.SetTitle("claude", "id", new string('x', 300)));
 }
 
 static void WriteCodexTranscript(string root, string sessionId, string title, string content)
