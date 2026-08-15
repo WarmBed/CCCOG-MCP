@@ -33,6 +33,15 @@ public sealed class DispatchJob
     [JsonPropertyName("reasoningEffort")]
     public string? ReasoningEffort { get; set; }
 
+    [JsonPropertyName("hopCount")]
+    public int? HopCount { get; set; }
+
+    [JsonPropertyName("hopSource")]
+    public string? HopSource { get; set; }
+
+    [JsonPropertyName("hopChain")]
+    public string? HopChain { get; set; }
+
     [JsonPropertyName("action")]
     public string Action { get; set; } = "";
 
@@ -91,4 +100,5 @@ public sealed class DispatchJob
 public sealed record LaunchCommand(
     string FileName,
     IReadOnlyList<string> Arguments,
-    string WorkingDirectory);
+    string WorkingDirectory,
+    IReadOnlyDictionary<string, string>? Environment = null);

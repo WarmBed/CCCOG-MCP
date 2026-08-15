@@ -110,7 +110,12 @@ var tests = new (string Name, Action Run)[]
     ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
     ("binding store marks and prefers the bound peer", BindingStorePrefersBoundPeer),
     ("inbox ledger posts lists and acks for Claude", InboxLedgerRoundTrips),
-    ("inbox ledger preserves concurrent posts", InboxLedgerPreservesConcurrentPosts)
+    ("inbox ledger preserves concurrent posts", InboxLedgerPreservesConcurrentPosts),
+    ("recursion context defaults and computes first job hop", RecursionContextDefaultsAndJobHop),
+    ("recursion context allows nested hops", RecursionContextAllowsNestedHops),
+    ("recursion context rejects exceeded hop", RecursionContextRejectsExceededHop),
+    ("recursion context rejects malformed environment", RecursionContextRejectsMalformedEnvironment),
+    ("dispatch job store round-trips hop metadata", DispatchJobStoreRoundTripsHopMetadata)
 };
 
 var failures = 0;
@@ -2267,6 +2272,91 @@ static void DispatchDeliverEmptyReplySucceedsWithPlaceholder()
     Equal("(empty response)", posted.Content);
 }
 
+static void RecursionContextDefaultsAndJobHop()
+{
+    var context = RecursionContext.FromEnvironment(_ => null);
+    Equal(0, context.ProcessHop);
+    Equal(2, context.MaxHop);
+    Equal(1, context.JobHop);
+    True(context.HopSource.StartsWith("user:", StringComparison.Ordinal));
+    Equal("human", context.HopChain);
+    Equal("1", context.ProviderEnvironment("claude")["CCCG_HOP"]);
+}
+
+static void RecursionContextAllowsNestedHops()
+{
+    var context = new RecursionContext(
+        processHop: 1,
+        maxHop: 2,
+        hopSource: "user:test@machine",
+        hopChain: "human>codex");
+    Equal(2, context.JobHop);
+    var environment = context.ProviderEnvironment("claude");
+    Equal("2", environment["CCCG_HOP"]);
+    Equal("user:test@machine", environment["CCCG_HOP_SOURCE"]);
+    Equal("human>codex>claude", environment["CCCG_HOP_CHAIN"]);
+}
+
+static void RecursionContextRejectsExceededHop()
+{
+    var context = new RecursionContext(
+        processHop: 2,
+        maxHop: 2,
+        hopSource: "user:test@machine",
+        hopChain: "human>claude>codex");
+    var exception = Throws<InvalidOperationException>(() => context.ValidateNewJob());
+    True(exception.Message.Contains("hopCount=3", StringComparison.Ordinal));
+    True(exception.Message.Contains("maxHop=2", StringComparison.Ordinal));
+    True(exception.Message.Contains("human>claude>codex", StringComparison.Ordinal));
+}
+
+static void RecursionContextRejectsMalformedEnvironment()
+{
+    var values = new Dictionary<string, string?>
+    {
+        ["CCCG_HOP"] = "not-an-int"
+    };
+    var exception = Throws<InvalidOperationException>(() =>
+        RecursionContext.FromEnvironment(name => values.GetValueOrDefault(name)));
+    True(exception.Message.Contains("CCCG_HOP", StringComparison.Ordinal));
+
+    values["CCCG_HOP"] = "0";
+    values["CCCG_MAX_HOP"] = "0";
+    exception = Throws<InvalidOperationException>(() =>
+        RecursionContext.FromEnvironment(name => values.GetValueOrDefault(name)));
+    True(exception.Message.Contains("CCCG_MAX_HOP", StringComparison.Ordinal));
+}
+
+static void DispatchJobStoreRoundTripsHopMetadata()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-hop-job-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    try
+    {
+        var job = new DispatchJob
+        {
+            JobId = "hop-job",
+            Provider = "claude",
+            HopCount = 2,
+            HopSource = "user:test@machine",
+            HopChain = "human>codex",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        store.Write(job);
+        var loaded = store.Require(job.JobId);
+        Equal(2, loaded.HopCount);
+        Equal("user:test@machine", loaded.HopSource);
+        Equal("human>codex", loaded.HopChain);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
 static void GrokResumeReadBackPasses()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-readback-ok-{Guid.NewGuid():N}");
@@ -2310,15 +2400,15 @@ static void GrokResumeReadBackFails()
     Equal(4, done.PeerTurnsAfter);
 }
 
-static void Throws<T>(Action action) where T : Exception
+static T Throws<T>(Action action) where T : Exception
 {
     try
     {
         action();
     }
-    catch (T)
+    catch (T exception)
     {
-        return;
+        return exception;
     }
 
     throw new InvalidOperationException($"Expected {typeof(T).Name}.");
