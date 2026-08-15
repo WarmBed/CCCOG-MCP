@@ -147,7 +147,13 @@ var tests = new (string Name, Action Run)[]
     ("audit failure fails closed", AuditFailureFailsClosed),
     ("owner daemon rebuilds transport when hop changes", OwnerDaemonRebuildsTransportWhenHopChanges),
     ("Claude child mode defaults to text-only", ClaudeChildModeDefaultsToTextOnly),
-    ("Claude child tools mode allows web tools without MCP", ClaudeChildToolsModeAllowsWebWithoutMcp)
+    ("Claude child tools mode allows web tools without MCP", ClaudeChildToolsModeAllowsWebWithoutMcp),
+    ("read Codex rollout user assistant rounds", ReadCodexRolloutUserAssistantRounds),
+    ("read Grok chat history beside summary", ReadGrokChatHistoryBesideSummary),
+    ("read Claude JSONL custom title and turns", ReadClaudeJsonlCustomTitleAndTurns),
+    ("read uses shared read write delete and is read only", ReadUsesReadWriteDeleteAndIsReadOnly),
+    ("read paginates before marker", ReadPaginatesBeforeMarker),
+    ("read caps output at 50 KiB with honest continuation", ReadCapsOutputAt50KiBWithHonestContinuation)
 };
 
 var failures = 0;
@@ -2839,6 +2845,182 @@ static void ClaudeChildToolsModeAllowsWebWithoutMcp()
     }
 }
 
+static void ReadCodexRolloutUserAssistantRounds()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-transcript-codex-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "11111111-1111-4111-8111-111111111111";
+        var day = Path.Combine(root, "sessions", "2026", "08", "15");
+        Directory.CreateDirectory(day);
+        var path = Path.Combine(day, $"rollout-2026-08-15T00-00-00-{sessionId}.jsonl");
+        File.WriteAllText(path,
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + sessionId + "\",\"cwd\":\"D:\\\\code\\\\app\",\"thread_source\":\"user\",\"model_provider\":\"openai\"}}\n" +
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"old\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"user\",\"content\":\"first question\"}}\n" +
+            "{\"type\":\"reasoning\",\"payload\":{\"text\":\"ignore\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"assistant\",\"content\":\"first answer\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second question\"}]}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"assistant\",\"content\":\"second answer\"}}\n");
+        File.WriteAllText(Path.Combine(root, "session_index.jsonl"),
+            "{\"id\":\"" + sessionId + "\",\"thread_name\":\"Codex fixture\"}\n");
+
+        var result = new TranscriptService(codexHome: root).Read(
+            new TranscriptReadRequest("codex", sessionId, 2));
+        True(result.Rendered.Contains("first question", StringComparison.Ordinal));
+        True(result.Rendered.Contains("second answer", StringComparison.Ordinal));
+        True(!result.Rendered.Contains("ignore", StringComparison.Ordinal));
+        Equal("Codex fixture", result.Title);
+        Equal(2, result.ReturnedRounds);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ReadGrokChatHistoryBesideSummary()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-transcript-grok-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "22222222-2222-4222-8222-222222222222";
+        var dir = Path.Combine(root, "sessions", "D%3A%5Ccode%5Capp", sessionId);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "summary.json"), $$"""
+            {"info":{"id":"{{sessionId}}","cwd":"D:\\code\\app"},"generated_title":"Grok fixture","updated_at":"2026-08-15T00:00:00Z","last_active_at":"2026-08-15T00:00:00Z"}
+            """);
+        File.WriteAllText(Path.Combine(dir, "chat_history.jsonl"),
+            "{\"type\":\"system\",\"content\":\"do not render\"}\n" +
+            "{\"type\":\"user\",\"content\":\"hello Grok\"}\n" +
+            "{\"type\":\"assistant\",\"content\":\"hello human\"}\n");
+        File.WriteAllText(Path.Combine(dir, "system_prompt.txt"), "never expose this");
+
+        var result = new TranscriptService(grokHome: root).Read(
+            new TranscriptReadRequest("grok", sessionId, 20));
+        Equal("Grok fixture", result.Title);
+        True(result.Rendered.Contains("hello Grok", StringComparison.Ordinal));
+        True(!result.Rendered.Contains("never expose", StringComparison.Ordinal));
+        Equal(1, result.ReturnedRounds);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ReadClaudeJsonlCustomTitleAndTurns()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-transcript-claude-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "33333333-3333-4333-8333-333333333333";
+        var project = Path.Combine(root, "projects", "D--code-app");
+        Directory.CreateDirectory(project);
+        File.WriteAllText(Path.Combine(project, sessionId + ".jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"" + sessionId + "\",\"cwd\":\"D:\\\\code\\\\app\",\"message\":{\"role\":\"user\",\"content\":\"question\"}}\n" +
+            "{\"type\":\"custom-title\",\"customTitle\":\"Claude fixture\",\"sessionId\":\"" + sessionId + "\"}\n" +
+            "{\"type\":\"assistant\",\"sessionId\":\"" + sessionId + "\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet\",\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n");
+
+        var result = new TranscriptService(claudeHome: root).Read(
+            new TranscriptReadRequest("claude", sessionId, 20));
+        Equal("Claude fixture", result.Title);
+        True(result.Rendered.Contains("question", StringComparison.Ordinal));
+        True(result.Rendered.Contains("answer", StringComparison.Ordinal));
+        Equal(1, result.ReturnedRounds);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ReadUsesReadWriteDeleteAndIsReadOnly()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-transcript-share-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "44444444-4444-4444-8444-444444444444";
+        var day = Path.Combine(root, "sessions", "2026", "08", "15");
+        Directory.CreateDirectory(day);
+        var path = Path.Combine(day, $"rollout-2026-08-15T00-00-00-{sessionId}.jsonl");
+        var original = "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + sessionId + "\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"user\",\"content\":\"shared\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"assistant\",\"content\":\"read only\"}}\n";
+        File.WriteAllText(path, original);
+        using (var writer = new FileStream(path, FileMode.Open, FileAccess.ReadWrite,
+            FileShare.ReadWrite | FileShare.Delete))
+        {
+            var result = new TranscriptService(codexHome: root).Read(
+                new TranscriptReadRequest("codex", sessionId, 20));
+            True(result.Rendered.Contains("read only", StringComparison.Ordinal));
+        }
+        Equal(original, File.ReadAllText(path));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ReadPaginatesBeforeMarker()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-transcript-page-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "55555555-5555-4555-8555-555555555555";
+        var day = Path.Combine(root, "sessions", "2026", "08", "15");
+        Directory.CreateDirectory(day);
+        var path = Path.Combine(day, $"rollout-2026-08-15T00-00-00-{sessionId}.jsonl");
+        var text = "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + sessionId + "\"}}\n";
+        for (var i = 1; i <= 4; i++)
+        {
+            text += "{\"type\":\"message\",\"payload\":{\"role\":\"user\",\"content\":\"q" + i + "\"}}\n";
+            text += "{\"type\":\"message\",\"payload\":{\"role\":\"assistant\",\"content\":\"a" + i + "\"}}\n";
+        }
+        File.WriteAllText(path, text);
+        var service = new TranscriptService(codexHome: root);
+        var first = service.Read(new TranscriptReadRequest("codex", sessionId, 1));
+        True(first.HasMore);
+        True(!string.IsNullOrWhiteSpace(first.BeforeMarker));
+        True(first.Rendered.Contains("q4", StringComparison.Ordinal));
+        var second = service.Read(new TranscriptReadRequest("codex", sessionId, 1, first.BeforeMarker));
+        True(second.Rendered.Contains("q3", StringComparison.Ordinal));
+        True(!second.Rendered.Contains("q4", StringComparison.Ordinal));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ReadCapsOutputAt50KiBWithHonestContinuation()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-transcript-cap-{Guid.NewGuid():N}");
+    try
+    {
+        var sessionId = "66666666-6666-4666-8666-666666666666";
+        var day = Path.Combine(root, "sessions", "2026", "08", "15");
+        Directory.CreateDirectory(day);
+        var path = Path.Combine(day, $"rollout-2026-08-15T00-00-00-{sessionId}.jsonl");
+        var huge = new string('x', 70_000);
+        File.WriteAllText(path,
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + sessionId + "\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"user\",\"content\":\"" + huge + "\"}}\n" +
+            "{\"type\":\"message\",\"payload\":{\"role\":\"assistant\",\"content\":\"tail\"}}\n");
+        var result = new TranscriptService(codexHome: root).Read(
+            new TranscriptReadRequest("codex", sessionId, 20));
+        True(result.Truncated);
+        True(result.HasMore);
+        True(!string.IsNullOrWhiteSpace(result.BeforeMarker));
+        True(System.Text.Encoding.UTF8.GetByteCount(result.Rendered) <= 50 * 1024);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
 static void GrokResumeReadBackPasses()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-readback-ok-{Guid.NewGuid():N}");
@@ -2894,6 +3076,20 @@ static T Throws<T>(Action action) where T : Exception
     }
 
     throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+static void TryDelete(string path)
+{
+    try
+    {
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, recursive: true);
+        }
+    }
+    catch (IOException)
+    {
+    }
 }
 
 sealed class GrokHomeFixture : IDisposable
