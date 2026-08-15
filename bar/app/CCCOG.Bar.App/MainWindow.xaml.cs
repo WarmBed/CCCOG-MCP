@@ -33,7 +33,7 @@ public sealed partial class MainWindow : Window
         presenter.IsAlwaysOnTop = true;
         presenter.IsResizable = true;
         presenter.SetBorderAndTitleBar(true, true);
-        AppWindow.Resize(new SizeInt32(1800, 820));
+        AppWindow.Resize(new SizeInt32(1100, 760));
         AppWindow.IsShownInSwitchers = true;
         _refreshTimer = DispatcherQueue.CreateTimer();
         _refreshTimer.Interval = TimeSpan.FromMilliseconds(250);
@@ -62,6 +62,11 @@ public sealed partial class MainWindow : Window
 
     public void ShowDashboard()
     {
+        var work = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+        var size = AppWindow.Size;
+        AppWindow.Move(new PointInt32(
+            work.X + Math.Max(0, (work.Width - size.Width) / 2),
+            work.Y + Math.Max(0, (work.Height - size.Height) / 2)));
         AppWindow.Show();
         AppWindow.MoveInZOrderAtTop();
         RefreshView();

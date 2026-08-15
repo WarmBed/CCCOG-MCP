@@ -8,7 +8,8 @@ namespace CCCOG.Bar.App;
 
 public partial class App : Application
 {
-    private MainWindow? _window;
+    private MainWindow? _fullGraph;
+    private FlyoutWindow? _flyout;
     private TaskbarIcon? _tray;
     private DispatcherQueue? _uiQueue;
 
@@ -21,40 +22,43 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         _uiQueue = DispatcherQueue.GetForCurrentThread();
-        _window = new MainWindow();
+        _flyout = new FlyoutWindow(OpenFullGraph);
         _tray = new TaskbarIcon
         {
-            ToolTipText = "CCCOG-Bar — control graph and quotas",
-            LeftClickCommand = new DelegateCommand(_ => ToggleWindow()),
+            ToolTipText = "CCCOG-Bar - control graph and quotas",
+            LeftClickCommand = new DelegateCommand(_ => ToggleFlyout()),
         };
         _tray.ForceCreate();
-        _window.Closed += (_, _) => _tray.Dispose();
-        _window.ShowDashboard();
+        _flyout.ShowFlyout();
     }
 
-    private void ToggleWindow()
+    private void ToggleFlyout()
     {
         if (_uiQueue is { HasThreadAccess: false })
         {
-            _uiQueue.TryEnqueue(ToggleWindowCore);
+            _uiQueue.TryEnqueue(ToggleFlyoutCore);
             return;
         }
-        ToggleWindowCore();
+        ToggleFlyoutCore();
     }
 
-    private void ToggleWindowCore()
+    private void ToggleFlyoutCore()
     {
-        if (_window is null)
+        _flyout?.ToggleFlyout();
+    }
+
+    private void OpenFullGraph()
+    {
+        if (_uiQueue is { HasThreadAccess: false })
         {
+            _uiQueue.TryEnqueue(OpenFullGraph);
             return;
         }
-        if (_window.AppWindow.IsVisible)
+        _flyout?.HideFlyout();
+        if (_fullGraph is null || !_fullGraph.AppWindow.IsVisible)
         {
-            _window.AppWindow.Hide();
-        }
-        else
-        {
-            _window.ShowDashboard();
+            _fullGraph = new MainWindow();
+            _fullGraph.ShowDashboard();
         }
     }
 
