@@ -74,10 +74,13 @@ public sealed partial class FlyoutWindow : Window
             _quotaTimer.Stop();
         };
 
+        // Deliberately do NOT read the dispatch root here: the constructor
+        // must return so the caller can call AppWindow.Show() as early as
+        // possible (performance contract: window visible < 1s cold). The
+        // file read — milliseconds, per docs/plans/2026-08-16-cccog-bar-v2-slim.md
+        // — happens once ShowFlyout() calls RefreshView() after Show().
         _viewReady = true;
         StartFileWatcher();
-        RefreshView();
-        _quotaTimer.Start();
     }
 
     public bool IsFlyoutVisible => AppWindow.IsVisible;
@@ -94,6 +97,8 @@ public sealed partial class FlyoutWindow : Window
         }
     }
 
+    private bool _quotaTimerStarted;
+
     public void ShowFlyout()
     {
         if (_closing)
@@ -106,6 +111,11 @@ public sealed partial class FlyoutWindow : Window
         Activate();
         _ = SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
         RefreshView();
+        if (!_quotaTimerStarted)
+        {
+            _quotaTimerStarted = true;
+            _quotaTimer.Start();
+        }
     }
 
     public void HideFlyout()

@@ -22,13 +22,15 @@ public partial class App : Application
     {
         _uiQueue = DispatcherQueue.GetForCurrentThread();
         _flyout = new FlyoutWindow();
+        // Show as early as possible — the performance contract is window
+        // visible < 1s cold; tray icon registration happens after.
+        _flyout.ShowFlyout();
         _tray = new TaskbarIcon
         {
             ToolTipText = "CCCOG-Bar - quota and flow",
             LeftClickCommand = new DelegateCommand(_ => ToggleFlyout()),
         };
         _tray.ForceCreate();
-        _flyout.ShowFlyout();
     }
 
     private void ToggleFlyout()
