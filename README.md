@@ -1,110 +1,166 @@
 # CCCG
 
-CCCG is a local interoperability experiment that translates a small, documented
-subset of Claude Code's stream-JSON process protocol into explicit backend
-adapters. It is designed for controlled testing, not for concealing which
-provider answered.
+CCCG (Claude / Codex / Grok) is a local multi-agent interoperability toolkit for
+Windows. Its core is the **Dispatch MCP**: Claude (Desktop or Code) stays the
+coordinator and delegates work to Grok, Codex, or safe-mode Claude sessions —
+including sessions the human originally opened themselves — with durable jobs,
+real delivery receipts, per-dispatch model selection, and hot-updatable workers.
 
-Every generated answer is prefixed with the actual provider and backend model.
-CCCG does not patch Claude binaries, reuse Claude credentials, bypass billing or
-authentication, suppress product updates, or claim that a third-party model is
-an Anthropic model.
+CCCG is designed for controlled testing, not for concealing which provider
+answered. Every generated answer is labeled with the actual provider and
+backend model. CCCG does not patch Claude binaries, reuse Claude credentials,
+bypass billing or authentication, suppress product updates, or claim that a
+third-party model is an Anthropic model.
 
-## Current milestone: monitor plus reversible Desktop experiment
+## Architecture
 
-- live tail of Claude Desktop `main.log` lifecycle events
-- session metadata changes without title, cwd, prompt, or response content
-- transcript file activity by size/timestamp
-- optional local capture of newly appended user prompts and visible assistant text
-- tool request/result and stop-hook lifecycle observation, including WebSearch classification
-- Claude Desktop/engine process start and exit observation
-- stable pseudonymous session correlation across monitor runs
-- duplicate-log suppression
-- payload-free test markers
-- normalized local JSONL datasets and an interactive terminal dashboard
-- supervised monitor worker updates without restarting Claude Desktop
+```text
+ Claude Desktop / Claude Code  (MCP client, coordinator)
+        |
+        |  cccg_list_peers . cccg_inspect_peer . cccg_watch_peers
+        |  cccg_dispatch / cccg_dispatch_wait (model?, reasoningEffort?)
+        |  cccg_job_status / cccg_job_collect . cccg_inbox_post/list/ack
+        v
+ +---------------------------+
+ | cccg-dispatch.exe         |  MCP Host - owns the fixed tool contract
+ |  (stable, reconnect-bound)|  (schema changes need one MCP reconnect)
+ +---------------------------+
+        | per tool call: read worker-current.json, verify SHA-256, spawn
+        v
+ +---------------------------+     %LOCALAPPDATA%\CCCG\dispatch\
+ | cccg-dispatch-worker.exe  |     +-- workers\<version>\   (immutable)
+ |  (versioned, HOT-SWAP)    |     +-- worker-current.json  (atomic switch)
+ +---------------------------+     +-- jobs\<jobId>\        (status, prompt,
+        |                          |                         stdout, receipts)
+        |                          +-- bindings\ leases\ owners\ inbox.jsonl
+        |
+        +--> Peer directories: enumerate Grok / Codex / Claude session stores
+        |      list, inspect, watch + diff (found / status / pid)
+        |
+        +--> Job store + FIFO leases: cross-process serialization per
+        |      provider|cwd; background jobs run in a detached worker that
+        |      SURVIVES the MCP Host; dead-PID jobs fail instead of hanging
+        |
+        +--> Resume / Create path (one-shot CLI per turn)
+        |      grok  --model X --reasoning-effort Y  -r <sessionId>
+        |      codex exec --json --model X -c model_reasoning_effort=Y resume <id>
+        |      claude -p --safe-mode (text-only child, no tools/MCP/hooks)
+        |
+        +--> PATH A Deliver path (owned live sessions)
+               owner registry (DeleteOnClose lease = crash-safe staleness)
+                    |
+                    v
+             run-owner daemon ---- spool: incoming\ -> processing\ -> receipts\
+                    |               receipt written ONLY after the turn
+                    v               completes (true delivery semantics)
+             codex app-server (stdin kept open, per-turn model/effort,
+                               kill-on-close job object, transport rebuild)
 
-Content capture is disabled by default. `watch --capture-content` writes prompt
-and visible response text to a separate `content.jsonl`; it does not capture
-thinking, tool inputs/results, attachments, cwd, credentials, or historical
-transcript contents. Local datasets are ignored by source control and must not
-be published.
+ --------------------------------------------------------------------------
+ Separate read-only observation plane (never launches or modifies Claude):
 
-`cccg-host` can supervise the monitor and hand off to a new immutable worker
-version after readiness and dataset validation. See the
-[hot-update guide](docs/hot-update.md) and
-[validation evidence](docs/hot-update-validation.md).
+ Claude Desktop files/process metadata
+        |  read-only
+        v
+ cccg-monitor worker  <-- ready-before-stop handoff -->  next worker
+        ^
+        |  cccg-host supervisor (SHA-256 staged, immutable versions)
+```
 
-The router implements deterministic mock and Codex app-server vertical slices.
-The verified mapping recognizes both `claude-haiku-4-5` and the Desktop alias
-`claude-haiku-4-5-20251001`, and sends those aliases to Codex
-`gpt-5.6-luna`. Every answer discloses the actual provider and model.
+## Dispatch MCP
 
-An explicitly authorized, reversible Windows host experiment is packaged but
-is not installed automatically. It preserves the existing cross-session bridge
-shim as a sidecar, routes only Haiku to Luna, and passes every other invocation
-through byte-for-byte. See the
-[Desktop Luna experiment guide](docs/desktop-luna-experiment.md).
+| Tool | Purpose |
+|---|---|
+| `cccg_list_peers` | List Grok / Codex / Claude sessions and bindings |
+| `cccg_inspect_peer` | Title, model, cwd, writer state for one session |
+| `cccg_watch_peers` | Snapshot a list of session ids and diff against the previous snapshot |
+| `cccg_dispatch` | Queue a background job, return `jobId` immediately |
+| `cccg_dispatch_wait` | Keep the call open and return the peer's answer |
+| `cccg_job_status` / `cccg_job_collect` | Poll status / collect the normalized response |
+| `cccg_inbox_post` / `list` / `ack` | Shared cross-process mailbox |
+| `cccg_runtime_status` | Active versioned worker and hot-update mode |
 
-The separate Claude Desktop `2.1.229` cross-session recovery Shim is maintained
-under [experiments/claude-desktop-bridge-shim](experiments/claude-desktop-bridge-shim/README.md).
-It is a reversible local workaround for issue `#86012`, not an upstream fix and
-not part of the model-routing experiment. Its installer is fail-closed on
-version, SHA-256, Authenticode, live Claude processes, and recovery readiness.
+### Per-dispatch model selection
+
+`cccg_dispatch` and `cccg_dispatch_wait` accept optional `model` and
+`reasoningEffort` strings that apply to that turn only:
+
+```text
+cccg_dispatch(provider="codex", model="gpt-5.6-luna", reasoningEffort="xhigh", ...)
+cccg_dispatch(provider="grok",  model="grok-4.6",     reasoningEffort="high",  ...)
+```
+
+Values pass straight through to the provider CLI (`--model`,
+`-c model_reasoning_effort=` / `--reasoning-effort`) and, on the owner path, to
+the per-turn app-server params. Omitted values keep the provider defaults.
+There are no CCCG aliases: pass whatever the installed CLI accepts. Setting
+either field with `provider=claude` fails closed. See
+[dispatch](docs/dispatch.md).
+
+### Delivery model
+
+| Peer state | Behavior |
+|---|---|
+| CCCG-owned live session (PATH A) | Write into the owner spool; receipt only after the provider turn completes |
+| Closed / resumable | Start the provider CLI with the existing session id; Grok resume is verified by a `num_messages` read-back |
+| Live session **not** owned by CCCG | Fail closed with relaunch guidance (keyboard injection is deprecated) |
+| Active Claude Desktop session | Route via Desktop's own `send_message`; never CLI-resumed |
+
+### Hot update
+
+The Host owns the MCP contract; every tool call re-resolves the Worker through
+`worker-current.json` (SHA-256 verified, immutable per-version directories):
+
+```powershell
+.\scripts\install-dispatch-worker.ps1 -Version 0.6.0
+```
+
+Worker-only changes apply on the next tool call with no restart. Adding or
+changing MCP tools/parameters is Host-schema and needs one MCP reconnect —
+install order: Worker first, then Host, then reconnect.
 
 ## Build and test
 
 ```powershell
-dotnet build .\CCCG.sln -c Release
-dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release
+dotnet build .\src\CCCG.Dispatch.Worker\CCCG.Dispatch.Worker.csproj -c Release
+dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release
+dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 85 tests
 ```
 
-Start the supervised monitor:
+(`CCCG.sln` also references the experiments tree; per-project builds are the
+supported path for dispatch work.)
 
-```powershell
-cccg-host.exe run --worker .\cccg-monitor.exe --capture-content
-```
+## Other planes
 
-Apply a later monitor build without restarting Claude:
+- **Monitor** — read-only tail of Claude Desktop lifecycle/session metadata,
+  content capture off by default, supervised hot handoff via `cccg-host`. See
+  [monitor](docs/monitor.md) and [hot-update](docs/hot-update.md).
+- **Router (Luna experiment)** — deterministic vertical slice that maps a
+  Claude model alias to Codex app-server with full provider disclosure;
+  packaged, reversible, not auto-installed. See
+  [Desktop Luna experiment](docs/desktop-luna-experiment.md) and
+  [provider adapters](docs/provider-adapters.md).
+- **Bridge shim** — reversible local workaround for Desktop issue `#86012`,
+  maintained under
+  [experiments/claude-desktop-bridge-shim](experiments/claude-desktop-bridge-shim/README.md).
 
-```powershell
-cccg-host.exe update --worker D:\path\to\new\cccg-monitor.exe
-```
+## Docs
 
-Mock smoke test:
+[dispatch](docs/dispatch.md) ·
+[PATH A owned sessions](docs/path-a-owned-sessions.md) ·
+[dispatch validation](docs/dispatch-validation.md) ·
+[architecture](docs/architecture.md) ·
+[monitor](docs/monitor.md) ·
+[test plan](docs/test-plan.md) ·
+[safety boundaries](docs/safety.md)
 
-```powershell
-dotnet .\src\CCCG.Router\bin\Release\net8.0\cccg-router.dll `
-  --model claude-haiku-4-5 `
-  --cccg-config .\config\routes.mock.json
-```
+## Limitations
 
-The isolated Codex Luna route is in `config/routes.luna.json`. See
-[provider adapters](docs/provider-adapters.md) for the exact protocol and
-verification evidence.
-
-Add a test marker immediately before a synthetic cross-session test:
-
-```powershell
-dotnet run --project .\src\CCCG.Monitor\CCCG.Monitor.csproj -c Release -- \
-  mark --label CROSS-IDLE-001
-```
-
-The Dispatch MCP keeps Claude as coordinator and delegates to versioned Codex
-or Grok workers. It supports deterministic new-session binding, cross-process
-FIFO dispatch, background survival, automatic wait-and-return, and Worker hot
-updates. See [dispatch](docs/dispatch.md) and
-[dispatch validation](docs/dispatch-validation.md).
-
-See the [monitor guide](docs/monitor.md), [architecture](docs/architecture.md),
-[provider adapters](docs/provider-adapters.md), [test plan](docs/test-plan.md),
-the [Desktop Luna experiment](docs/desktop-luna-experiment.md), and
-[safety boundaries](docs/safety.md).
-
-## Important limitation
-
-The standalone route and passthrough chain are verified. Acceptance inside the
-currently installed Claude Desktop release still requires a manual A/B after
-Claude is fully stopped and the reversible wrapper is installed. The Luna route
-currently supports text turns, interrupt/error lifecycle, and attribution; it
-does not reproduce Claude tools, hooks, web search, or session resume semantics.
+- PATH A owner transport is implemented for Codex (app-server). The Grok owner
+  transport is a fail-closed stub until the ACP contract is wired; Grok
+  model/effort apply to the resume/create CLI path only.
+- The Luna route supports text turns, interrupt/error lifecycle, and
+  attribution; it does not reproduce Claude tools, hooks, web search, or
+  session resume semantics.
+- Live sessions opened by the human outside CCCG cannot receive dispatches
+  until relaunched through an owned path; the mailbox remains the fallback.
