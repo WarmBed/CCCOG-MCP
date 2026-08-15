@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 
 namespace CCCG.Core.Dispatch;
@@ -87,6 +88,18 @@ public sealed class RecursionContext
             [SourceVariable] = HopSource,
             [ChainVariable] = AppendChain(HopChain, provider)
         };
+
+    public static void ApplyEnvironment(
+        ProcessStartInfo startInfo,
+        IReadOnlyDictionary<string, string> environment)
+    {
+        ArgumentNullException.ThrowIfNull(startInfo);
+        ArgumentNullException.ThrowIfNull(environment);
+        foreach (var (name, value) in environment)
+        {
+            startInfo.Environment[name] = value;
+        }
+    }
 
     public static string AppendChain(string chain, string provider)
     {

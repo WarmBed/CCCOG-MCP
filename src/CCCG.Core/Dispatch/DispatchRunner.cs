@@ -36,6 +36,7 @@ public sealed class DispatchRunner
     private readonly TimeSpan writerWaitTimeout;
     private readonly TimeSpan deliverWaitTimeout;
     private readonly TimeSpan readBackTimeout;
+    private readonly RecursionContext recursion;
 
     public DispatchRunner(
         DispatchJobStore store,
@@ -51,7 +52,8 @@ public sealed class DispatchRunner
         ILiveInputInjector? injector = null,
         OwnerRegistry? owners = null,
         TimeSpan? deliverWaitTimeout = null,
-        TimeSpan? readBackTimeout = null)
+        TimeSpan? readBackTimeout = null,
+        RecursionContext? recursion = null)
     {
         this.store = store;
         this.listPeers = listPeers;
@@ -67,6 +69,7 @@ public sealed class DispatchRunner
         this.writerWaitTimeout = writerWaitTimeout ?? TimeSpan.FromHours(2);
         this.deliverWaitTimeout = deliverWaitTimeout ?? TimeSpan.FromHours(2);
         this.readBackTimeout = readBackTimeout ?? TimeSpan.FromSeconds(5);
+        this.recursion = recursion ?? RecursionContext.FromEnvironment();
     }
 
     public DispatchJob Enqueue(
@@ -80,6 +83,7 @@ public sealed class DispatchRunner
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
         provider = NormalizeProvider(provider);
+        recursion.ValidateNewJob();
         var binding = bindings?.Load(provider, cwd);
         var selection = Select(provider, sessionId, cwd, allowNew, binding);
         var job = store.Create(selection, prompt);
@@ -87,6 +91,9 @@ public sealed class DispatchRunner
         job.AllowNew = allowNew;
         job.Model = NormalizeOverride(model);
         job.ReasoningEffort = NormalizeOverride(reasoningEffort);
+        job.HopCount = recursion.JobHop;
+        job.HopSource = recursion.HopSource;
+        job.HopChain = recursion.HopChain;
         job.AffinityKey = BuildAffinityKey(
             provider,
             sessionId ?? binding?.SessionId,
@@ -247,8 +254,12 @@ public sealed class DispatchRunner
                     selection.Cwd ?? Environment.CurrentDirectory,
                     store.PromptPath(job.JobId),
                     codexCommand,
-                    job.Model,
-                    job.ReasoningEffort)
+                     job.Model,
+                     job.ReasoningEffort)
+             };
+            command = command with
+            {
+                Environment = recursion.ProviderEnvironment(selection.Provider)
             };
             var stdin = selection.Provider is "codex" or "claude"
                 ? store.PromptPath(job.JobId)
@@ -778,6 +789,11 @@ public sealed class FileProcessLauncher : IProcessLauncher
         foreach (var argument in command.Arguments)
         {
             info.ArgumentList.Add(argument);
+        }
+
+        if (command.Environment is not null)
+        {
+            RecursionContext.ApplyEnvironment(info, command.Environment);
         }
 
         var process = new Process { StartInfo = info, EnableRaisingEvents = true };

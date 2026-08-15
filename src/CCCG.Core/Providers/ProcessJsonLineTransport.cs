@@ -20,7 +20,8 @@ public sealed partial class ProcessJsonLineTransport : IJsonLineTransport
 
     public static Task<IJsonLineTransport> StartCodexAsync(
         Action<string>? diagnostic = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -30,25 +31,7 @@ public sealed partial class ProcessJsonLineTransport : IJsonLineTransport
             executable = OperatingSystem.IsWindows() ? "codex.cmd" : "codex";
         }
 
-        // Explicit UTF-8 on every redirected stream: without this the console
-        // codepage (cp950 on zh-TW Windows) garbles Chinese text both ways.
-        // Mirrors the 0.4.6 FileProcessLauncher fix in DispatchRunner.cs.
-        var utf8 = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = executable,
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardInputEncoding = utf8,
-            StandardOutputEncoding = utf8,
-            StandardErrorEncoding = utf8,
-            CreateNoWindow = true
-        };
-        startInfo.ArgumentList.Add("app-server");
-        startInfo.ArgumentList.Add("--listen");
-        startInfo.ArgumentList.Add("stdio://");
+        var startInfo = BuildStartInfo(executable, environment);
 
         var process = new Process { StartInfo = startInfo };
         if (!process.Start())
@@ -64,6 +47,37 @@ public sealed partial class ProcessJsonLineTransport : IJsonLineTransport
         var jobHandle = KillOnCloseJob.TryAssign(process, diagnostic);
         return Task.FromResult<IJsonLineTransport>(
             new ProcessJsonLineTransport(process, diagnostic, jobHandle));
+    }
+
+    public static ProcessStartInfo BuildStartInfo(
+        string executable,
+        IReadOnlyDictionary<string, string>? environment = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(executable);
+        // Explicit UTF-8 on every redirected stream: without this the console
+        // codepage (cp950 on zh-TW Windows) garbles Chinese text both ways.
+        var utf8 = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardInputEncoding = utf8,
+            StandardOutputEncoding = utf8,
+            StandardErrorEncoding = utf8,
+            CreateNoWindow = true
+        };
+        if (environment is not null)
+        {
+            CCCG.Core.Dispatch.RecursionContext.ApplyEnvironment(startInfo, environment);
+        }
+
+        startInfo.ArgumentList.Add("app-server");
+        startInfo.ArgumentList.Add("--listen");
+        startInfo.ArgumentList.Add("stdio://");
+        return startInfo;
     }
 
     public async ValueTask WriteLineAsync(

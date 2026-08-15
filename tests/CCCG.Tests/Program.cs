@@ -115,7 +115,10 @@ var tests = new (string Name, Action Run)[]
     ("recursion context allows nested hops", RecursionContextAllowsNestedHops),
     ("recursion context rejects exceeded hop", RecursionContextRejectsExceededHop),
     ("recursion context rejects malformed environment", RecursionContextRejectsMalformedEnvironment),
-    ("dispatch job store round-trips hop metadata", DispatchJobStoreRoundTripsHopMetadata)
+    ("dispatch job store round-trips hop metadata", DispatchJobStoreRoundTripsHopMetadata),
+    ("dispatch runner injects hop environment on resume and create", DispatchRunnerInjectsHopEnvironment),
+    ("owner provider child receives hop environment", OwnerProviderChildReceivesHopEnvironment),
+    ("host worker preserves inherited hop environment", HostWorkerPreservesInheritedHopEnvironment)
 };
 
 var failures = 0;
@@ -2355,6 +2358,103 @@ static void DispatchJobStoreRoundTripsHopMetadata()
             Directory.Delete(root, recursive: true);
         }
     }
+}
+
+static void DispatchRunnerInjectsHopEnvironment()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-hop-launch-{Guid.NewGuid():N}");
+    try
+    {
+        var peers = new[]
+        {
+            new Peer("codex", "thread-1", PeerStatus.Resumable, "D:\\code\\app", "Peer", null, null, null, null, null, null)
+        };
+        var launcher = new RecordingProcessLauncher(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"OK\"}}" );
+        var context = new RecursionContext(
+            processHop: 0,
+            maxHop: 2,
+            hopSource: "user:test@machine",
+            hopChain: "human",
+            quotaRoot: Path.Combine(root, "quotas"));
+        var runner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(root, "jobs")),
+            _ => peers,
+            launcher,
+            codexCommand: "codex.exe",
+            owners: new OwnerRegistry(Path.Combine(root, "owners")),
+            recursion: context);
+
+        var resume = runner.Enqueue("codex", "resume", "thread-1", "D:\\code\\app", allowNew: false);
+        Equal(1, resume.HopCount);
+        runner.Run(resume.JobId);
+        Equal("1", launcher.LastCommand!.Environment![RecursionContext.HopVariable]);
+        Equal("user:test@machine", launcher.LastCommand.Environment[RecursionContext.SourceVariable]);
+        True(launcher.LastCommand.Environment[RecursionContext.ChainVariable].EndsWith(">codex", StringComparison.Ordinal));
+
+        var createRoot = Path.Combine(root, "create");
+        var createLauncher = new RecordingProcessLauncher(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"OK\"}}" );
+        var createRunner = new DispatchRunner(
+            new DispatchJobStore(Path.Combine(createRoot, "jobs")),
+            _ => Array.Empty<Peer>(),
+            createLauncher,
+            codexCommand: "codex.exe",
+            owners: new OwnerRegistry(Path.Combine(createRoot, "owners")),
+            recursion: new RecursionContext(
+                0, 2, "user:test@machine", "human", Path.Combine(createRoot, "quotas")));
+        // A create has no existing peer, so the command is exercised by the
+        // same runner path after selection accepts a new session.
+        var created = createRunner.Enqueue("codex", "create", cwd: "D:\\code\\app");
+        var createdDone = createRunner.Run(created.JobId);
+        Equal(DispatchJobStatus.Failed, createdDone.Status);
+        // The fake output intentionally lacks a Codex thread id; the launch
+        // still happened and captured the same child environment.
+        Equal("1", createLauncher.LastCommand!.Environment![RecursionContext.HopVariable]);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void OwnerProviderChildReceivesHopEnvironment()
+{
+    var info = ProcessJsonLineTransport.BuildStartInfo(
+        "codex",
+        new Dictionary<string, string>
+        {
+            [RecursionContext.HopVariable] = "1",
+            [RecursionContext.SourceVariable] = "user:test@machine",
+            [RecursionContext.ChainVariable] = "human>codex"
+        });
+    Equal("1", info.Environment[RecursionContext.HopVariable]);
+    Equal("user:test@machine", info.Environment[RecursionContext.SourceVariable]);
+    Equal("human>codex", info.Environment[RecursionContext.ChainVariable]);
+    True(info.ArgumentList.SequenceEqual(new[] { "app-server", "--listen", "stdio://" }));
+}
+
+static void HostWorkerPreservesInheritedHopEnvironment()
+{
+    var info = new System.Diagnostics.ProcessStartInfo
+    {
+        FileName = "worker.exe",
+        UseShellExecute = false
+    };
+    RecursionContext.ApplyEnvironment(
+        info,
+        new Dictionary<string, string>
+        {
+            [RecursionContext.HopVariable] = "1",
+            [RecursionContext.SourceVariable] = "user:test@machine",
+            [RecursionContext.ChainVariable] = "human>claude"
+        });
+    Equal("1", info.Environment[RecursionContext.HopVariable]);
+    Equal("user:test@machine", info.Environment[RecursionContext.SourceVariable]);
+    Equal("human>claude", info.Environment[RecursionContext.ChainVariable]);
 }
 
 static void GrokResumeReadBackPasses()
