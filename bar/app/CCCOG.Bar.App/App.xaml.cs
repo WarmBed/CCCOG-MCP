@@ -8,7 +8,6 @@ namespace CCCOG.Bar.App;
 
 public partial class App : Application
 {
-    private MainWindow? _fullGraph;
     private FlyoutWindow? _flyout;
     private TaskbarIcon? _tray;
     private DispatcherQueue? _uiQueue;
@@ -22,10 +21,10 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         _uiQueue = DispatcherQueue.GetForCurrentThread();
-        _flyout = new FlyoutWindow(OpenFullGraph);
+        _flyout = new FlyoutWindow();
         _tray = new TaskbarIcon
         {
-            ToolTipText = "CCCOG-Bar - control graph and quotas",
+            ToolTipText = "CCCOG-Bar - quota and flow",
             LeftClickCommand = new DelegateCommand(_ => ToggleFlyout()),
         };
         _tray.ForceCreate();
@@ -45,21 +44,6 @@ public partial class App : Application
     private void ToggleFlyoutCore()
     {
         _flyout?.ToggleFlyout();
-    }
-
-    private void OpenFullGraph()
-    {
-        if (_uiQueue is { HasThreadAccess: false })
-        {
-            _uiQueue.TryEnqueue(OpenFullGraph);
-            return;
-        }
-        _flyout?.HideFlyout();
-        if (_fullGraph is null || !_fullGraph.AppWindow.IsVisible)
-        {
-            _fullGraph = new MainWindow();
-            _fullGraph.ShowDashboard();
-        }
     }
 
     private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs args)
