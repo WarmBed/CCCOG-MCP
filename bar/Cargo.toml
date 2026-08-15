@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/cccog-bar-core"]
+
+[profile.release]
+lto = true
+strip = "debuginfo"
