@@ -4,6 +4,7 @@
 //! file snapshots and returns data-only values for a later graph reducer.
 
 pub mod dispatch;
+pub mod graph;
 pub mod inbox;
 pub mod owners;
 pub mod privacy;
