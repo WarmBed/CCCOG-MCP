@@ -1,0 +1,82 @@
+<Window
+    x:Class="CCCOG.Bar.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid Padding="16" Background="#F9131824">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Spacing="2">
+                <TextBlock Text="CCCOG-Bar" FontSize="24" FontWeight="SemiBold" />
+                <TextBlock Text="Live control graph · read-only local snapshot" Opacity="0.72" />
+            </StackPanel>
+            <ComboBox x:Name="ProviderFilter" Grid.Column="1" Width="130"
+                      Header="Provider" SelectedIndex="0"
+                      SelectionChanged="ProviderFilter_SelectionChanged">
+                <ComboBoxItem Content="All" Tag="all" />
+                <ComboBoxItem Content="Claude" Tag="claude" />
+                <ComboBoxItem Content="Codex" Tag="codex" />
+                <ComboBoxItem Content="Grok" Tag="grok" />
+            </ComboBox>
+            <Button Grid.Column="2" Content="Refresh" Click="Refresh_Click" />
+        </Grid>
+
+        <Grid Grid.Row="1" Margin="0,16,0,12" ColumnSpacing="14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*" />
+                <ColumnDefinition Width="*" MinWidth="250" />
+            </Grid.ColumnDefinitions>
+            <Border Grid.Column="0" BorderBrush="#405B6B7A" BorderThickness="1" CornerRadius="8" Padding="10">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Text="Control flow" FontSize="17" FontWeight="SemiBold" />
+                    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                        <Canvas x:Name="GraphCanvas" Width="640" Height="430" />
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+            <Border Grid.Column="1" BorderBrush="#405B6B7A" BorderThickness="1" CornerRadius="8" Padding="10">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Quota" FontSize="17" FontWeight="SemiBold" />
+                    <TextBlock Text="Provider cards use local usage files or approved read-only quota endpoints."
+                               Opacity="0.72" />
+                    <ItemsControl x:Name="QuotaCardsList">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Spacing="4" Margin="0,4,0,6">
+                                    <Grid>
+                                        <TextBlock Text="{Binding Label}" FontWeight="SemiBold" />
+                                        <TextBlock Grid.Column="1" Text="{Binding UsedText}" HorizontalAlignment="Right" />
+                                    </Grid>
+                                    <ProgressBar Maximum="100" Value="{Binding UsedPercent}" Height="8" />
+                                    <Grid>
+                                        <TextBlock Text="{Binding ResetText}" FontSize="11" Opacity="0.72" />
+                                        <TextBlock Grid.Column="1" Text="{Binding StateText}" HorizontalAlignment="Right"
+                                                   FontSize="11" Opacity="0.72" />
+                                    </Grid>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <Grid Grid.Row="2">
+            <TextBlock x:Name="StatusText" Text="Loading snapshot…" Opacity="0.72" />
+            <TextBlock Grid.Column="1" Text="Tokens only · no cost calculation" HorizontalAlignment="Right" Opacity="0.72" />
+        </Grid>
+    </Grid>
+</Window>
