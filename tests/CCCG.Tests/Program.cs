@@ -114,6 +114,8 @@ var tests = new (string Name, Action Run)[]
     ("provider command omits Grok model flags when unset", ProviderCommandOmitsGrokModelFlagsWhenUnset),
     ("dispatch job store round-trips model and effort", DispatchJobStoreRoundTripsModelAndEffort),
     ("dispatch job store ignores missing model fields", DispatchJobStoreIgnoresMissingModelFields),
+    ("dispatch job store round-trips caller label", DispatchJobStoreRoundTripsCallerLabel),
+    ("dispatch job store ignores missing caller label", DispatchJobStoreIgnoresMissingCallerLabel),
     ("provider command preassigns a new Grok session id", ProviderCommandPreassignsGrokId),
     ("provider output parses Claude session and normalized answer", ProviderOutputParsesClaude),
     ("provider output strips Grok thought and usage metadata", ProviderOutputNormalizesGrok),
@@ -183,6 +185,9 @@ var tests = new (string Name, Action Run)[]
     ("Host tool descriptions warn transcript is untrusted", HostToolDescriptionsWarnUntrustedContent),
     ("Worker dispatches read search title archive operations", WorkerDispatchesReadSearchTitleArchiveOperations),
     ("Host payload round trips all four operations", HostPayloadRoundTripsAllFourOperations)
+    ,
+    ("Host dispatch tools expose optional caller label", HostDispatchToolsExposeCallerLabel),
+    ("worker dispatch persists caller label", WorkerDispatchPersistsCallerLabel)
 };
 
 var failures = 0;
@@ -1269,6 +1274,57 @@ static void DispatchJobStoreIgnoresMissingModelFields()
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+}
+
+static void DispatchJobStoreRoundTripsCallerLabel()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-job-caller-{Guid.NewGuid():N}");
+    try
+    {
+        var store = new DispatchJobStore(root);
+        var job = new DispatchJob
+        {
+            JobId = "caller-job",
+            Provider = "codex",
+            CallerLabel = " Claude/session-7 ",
+            CreatedAt = DateTimeOffset.UtcNow
+        };
+        store.Write(job);
+        var loaded = store.Require(job.JobId);
+        Equal(" Claude/session-7 ", loaded.CallerLabel);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void DispatchJobStoreIgnoresMissingCallerLabel()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-old-caller-{Guid.NewGuid():N}");
+    const string jobId = "pre-caller-job";
+    try
+    {
+        var directory = Path.Combine(root, jobId);
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, "status.json"), $$"""
+            {
+              "jobId": "{{jobId}}",
+              "provider": "codex",
+              "action": "resume",
+              "status": "queued",
+              "createdAt": "2026-08-15T00:00:00+00:00",
+              "promptChars": 5
+            }
+            """);
+
+        var loaded = new DispatchJobStore(root).Require(jobId);
+        True(loaded.CallerLabel is null);
+    }
+    finally
+    {
+        TryDelete(root);
     }
 }
 
@@ -3743,6 +3799,35 @@ static void HostPayloadRoundTripsAllFourOperations()
         Equal(operation, roundTrip?.Operation);
         True(roundTrip?.Arguments.ValueKind == System.Text.Json.JsonValueKind.Object);
     }
+}
+
+static void HostDispatchToolsExposeCallerLabel()
+{
+    var dispatch = typeof(DispatchTools).GetMethod(nameof(DispatchTools.Dispatch))
+        ?? throw new InvalidOperationException("Dispatch tool method is missing.");
+    var wait = typeof(DispatchTools).GetMethod(nameof(DispatchTools.DispatchWait))
+        ?? throw new InvalidOperationException("Dispatch-wait tool method is missing.");
+    True(dispatch.GetParameters().Any(parameter => parameter.Name == "callerLabel"));
+    True(wait.GetParameters().Any(parameter => parameter.Name == "callerLabel"));
+}
+
+static void WorkerDispatchPersistsCallerLabel()
+{
+    using var home = new CodexHomeFixture();
+    home.WriteIndex("caller-thread", "Caller label fixture");
+    home.WriteRollout("caller-thread", "D:\\code\\app", DateTimeOffset.UtcNow, subagent: false);
+    var response = WorkerRpc(home.Root, "dispatch", new
+        {
+            provider = "codex",
+            prompt = "synthetic caller-label fixture",
+            sessionId = "caller-thread",
+            cwd = "D:\\code\\app",
+            allowNew = false,
+            callerLabel = "  Claude/session-7  "
+        });
+        True(response.Contains("callerLabel", StringComparison.Ordinal));
+        True(response.Contains("Claude/session-7", StringComparison.Ordinal));
+        True(!response.Contains("  Claude/session-7  ", StringComparison.Ordinal));
 }
 
 static string WorkerRpc(string codexHome, string operation, object arguments)

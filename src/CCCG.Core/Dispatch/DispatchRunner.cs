@@ -82,10 +82,12 @@ public sealed class DispatchRunner
         string? cwd = null,
         bool allowNew = true,
         string? model = null,
-        string? reasoningEffort = null)
+        string? reasoningEffort = null,
+        string? callerLabel = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
         provider = NormalizeProvider(provider);
+        callerLabel = NormalizeCallerLabel(callerLabel);
         recursion.ValidateNewJob();
         var binding = bindings?.Load(provider, cwd);
         var selection = Select(provider, sessionId, cwd, allowNew, binding);
@@ -106,6 +108,7 @@ public sealed class DispatchRunner
             job.HopCount = recursion.JobHop;
             job.HopSource = recursion.HopSource;
             job.HopChain = recursion.HopChain;
+            job.CallerLabel = callerLabel;
             job.AffinityKey = BuildAffinityKey(
                 provider,
                 sessionId ?? binding?.SessionId,
@@ -141,6 +144,7 @@ public sealed class DispatchRunner
                     "claude",
                     "CCCG audit: source=" + recursion.HopSource
                     + " chain=" + recursion.HopChain
+                    + (callerLabel is null ? "" : " caller=" + callerLabel)
                     + " cwd=" + auditCwd
                     + " model=" + auditModel
                     + " called provider=" + provider
@@ -187,7 +191,8 @@ public sealed class DispatchRunner
         string? cwd = null,
         bool allowNew = true,
         string? model = null,
-        string? reasoningEffort = null)
+        string? reasoningEffort = null,
+        string? callerLabel = null)
     {
         var job = Enqueue(
             provider,
@@ -196,7 +201,8 @@ public sealed class DispatchRunner
             cwd,
             allowNew,
             model,
-            reasoningEffort);
+            reasoningEffort,
+            callerLabel);
         ThreadPool.QueueUserWorkItem(_ => Run(job.JobId));
         return job;
     }
@@ -473,6 +479,7 @@ public sealed class DispatchRunner
             job.Cwd,
             job.Model,
             job.ReasoningEffort,
+            job.CallerLabel,
             job.Action,
             job.Status,
             job.Reason,
@@ -812,6 +819,34 @@ public sealed class DispatchRunner
 
     private static string? NormalizeOverride(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static string? NormalizeCallerLabel(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var chars = value.Trim()
+            .Select(character => char.IsControl(character) ? '\uFFFD' : character)
+            .ToArray();
+        var normalized = new string(chars);
+        var bytes = Encoding.UTF8.GetBytes(normalized);
+        if (bytes.Length <= 128)
+        {
+            return normalized;
+        }
+
+        var length = 128;
+        while (length > 0
+            && length < bytes.Length
+            && (bytes[length] & 0xC0) == 0x80)
+        {
+            length--;
+        }
+
+        return Encoding.UTF8.GetString(bytes, 0, length);
+    }
 
     private static bool IsTerminal(string status) =>
         status is DispatchJobStatus.Succeeded or DispatchJobStatus.Failed;

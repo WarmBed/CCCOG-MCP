@@ -79,7 +79,9 @@ public sealed class DispatchTools
         [Description("Optional backend model id for this turn only. Codex: gpt-5.6-luna (human nickname \"Luna\"), gpt-5.6-sol (\"Sol\"). Grok: grok-4.6, grok-4.5 (\"Luna\" is NOT a Grok model). Passed through verbatim.")]
         string? model = null,
         [Description("Optional reasoning intensity for this turn only, passed through verbatim (medium, high, xhigh). Human nickname \"Max\" (e.g. \"Luna Max\") means xhigh.")]
-        string? reasoningEffort = null) =>
+        string? reasoningEffort = null,
+        [Description("Optional display label for the caller session; bounded and recorded for control-graph attribution.")]
+        string? callerLabel = null) =>
         Invoke("dispatch", new
         {
             prompt,
@@ -88,7 +90,8 @@ public sealed class DispatchTools
             cwd,
             allowNew,
             model,
-            reasoningEffort
+            reasoningEffort,
+            callerLabel
         });
 
     [McpServerTool(Name = "cccg_dispatch_wait"),
@@ -102,7 +105,9 @@ public sealed class DispatchTools
         [Description("Optional backend model id for this turn only. Codex: gpt-5.6-luna (human nickname \"Luna\"), gpt-5.6-sol (\"Sol\"). Grok: grok-4.6, grok-4.5 (\"Luna\" is NOT a Grok model). Passed through verbatim.")]
         string? model = null,
         [Description("Optional reasoning intensity for this turn only, passed through verbatim (medium, high, xhigh). Human nickname \"Max\" (e.g. \"Luna Max\") means xhigh.")]
-        string? reasoningEffort = null) =>
+        string? reasoningEffort = null,
+        [Description("Optional display label for the caller session; bounded and recorded for control-graph attribution.")]
+        string? callerLabel = null) =>
         Invoke("dispatchWait", new
         {
             prompt,
@@ -111,7 +116,8 @@ public sealed class DispatchTools
             cwd,
             allowNew,
             model,
-            reasoningEffort
+            reasoningEffort,
+            callerLabel
         });
 
     [McpServerTool(Name = "cccg_job_status"), Description("Read queued/running/succeeded/failed status.")]

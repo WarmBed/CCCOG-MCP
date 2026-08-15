@@ -42,6 +42,9 @@ public sealed class DispatchJob
     [JsonPropertyName("hopChain")]
     public string? HopChain { get; set; }
 
+    [JsonPropertyName("callerLabel")]
+    public string? CallerLabel { get; set; }
+
     [JsonPropertyName("action")]
     public string Action { get; set; } = "";
 

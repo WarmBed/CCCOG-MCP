@@ -337,7 +337,8 @@ sealed class WorkerRuntime
             String(arguments, "cwd"),
             Boolean(arguments, "allowNew", true),
             String(arguments, "model"),
-            String(arguments, "reasoningEffort"));
+            String(arguments, "reasoningEffort"),
+            String(arguments, "callerLabel"));
         if (wait)
         {
             Runner.Run(job.JobId);
