@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -427,8 +428,118 @@ public sealed class PeerArchiveService
         }
     }
 
-    private bool IsLive(string provider, string sessionId) =>
-        liveProbe?.Invoke(provider, sessionId) ?? false;
+    private bool IsLive(string provider, string sessionId)
+    {
+        if (liveProbe is not null)
+        {
+            return liveProbe(provider, sessionId);
+        }
+
+        return provider switch
+        {
+            "codex" => CodexLockIsHeld(sessionId),
+            "grok" => ActivePidIsAlive(Path.Combine(grokHome, "active_sessions.json"), sessionId),
+            "claude" => ActivePidIsAlive(Path.Combine(claudeHome, "sessions"), sessionId),
+            _ => false
+        };
+    }
+
+    private bool CodexLockIsHeld(string sessionId)
+    {
+        var path = Path.Combine(codexHome, "thread-writer-locks", sessionId + ".lock");
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite,
+                FileShare.None);
+            return false;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    private static bool ActivePidIsAlive(string path, string sessionId)
+    {
+        if (Directory.Exists(path))
+        {
+            foreach (var file in Directory.EnumerateFiles(path, "*.json"))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(file));
+                    var root = document.RootElement;
+                    if (string.Equals(String(root, "sessionId"), sessionId,
+                            StringComparison.OrdinalIgnoreCase)
+                        && PidIsAlive(root))
+                    {
+                        return true;
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or JsonException)
+                {
+                }
+            }
+
+            return false;
+        }
+
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            foreach (var row in document.RootElement.EnumerateArray())
+            {
+                if (string.Equals(String(row, "session_id"), sessionId,
+                        StringComparison.OrdinalIgnoreCase)
+                    && PidIsAlive(row))
+                {
+                    return true;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or JsonException)
+        {
+        }
+
+        return false;
+    }
+
+    private static bool PidIsAlive(JsonElement row)
+    {
+        if (!row.TryGetProperty("pid", out var pid) || !pid.TryGetInt32(out var processId))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
 
     private bool IsOwned(string provider, string sessionId) =>
         ownerProbe?.Invoke(provider, sessionId)

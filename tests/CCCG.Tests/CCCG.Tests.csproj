@@ -4,6 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\CCCG.Core\CCCG.Core.csproj" />
+    <ProjectReference Include="..\..\src\CCCG.Dispatch\CCCG.Dispatch.csproj" />
     <ProjectReference Include="..\..\src\CCCG.Monitor\CCCG.Monitor.csproj" />
     <ProjectReference Include="..\..\src\CCCG.Host\CCCG.Host.csproj" />
   </ItemGroup>

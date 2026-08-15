@@ -243,6 +243,9 @@ sealed class WorkerRuntime
     private readonly DispatchBindingStore bindings = new();
     private readonly InboxLedger inbox = new();
     private readonly PeerWatcher watcher;
+    private readonly TranscriptService transcripts = new();
+    private readonly PeerMutationService mutations = new();
+    private readonly PeerArchiveService archives = new();
 
     public WorkerRuntime()
     {
@@ -276,6 +279,22 @@ sealed class WorkerRuntime
             "watchPeers" => Serialize(watcher.Watch(
                 Required(request.Arguments, "sessionIds"),
                 String(request.Arguments, "provider") ?? "all")),
+            "readTranscript" => Serialize(transcripts.Read(new TranscriptReadRequest(
+                Required(request.Arguments, "provider"),
+                Required(request.Arguments, "sessionId"),
+                Integer(request.Arguments, "limit", 20),
+                String(request.Arguments, "beforeMarker")))),
+            "searchTranscripts" => Serialize(transcripts.Search(new TranscriptSearchRequest(
+                Required(request.Arguments, "query"),
+                String(request.Arguments, "provider") ?? "all",
+                Integer(request.Arguments, "limit", 10)))),
+            "setTitle" => Serialize(mutations.SetTitle(
+                Required(request.Arguments, "provider"),
+                Required(request.Arguments, "sessionId"),
+                Required(request.Arguments, "title"))),
+            "archivePeer" => Serialize(archives.Archive(
+                Required(request.Arguments, "provider"),
+                Required(request.Arguments, "sessionId"))),
             "dispatch" => Dispatch(request.Arguments, wait: false),
             "dispatchWait" => Dispatch(request.Arguments, wait: true),
             "jobStatus" => Serialize(Runner.Status(Required(request.Arguments, "jobId"))),

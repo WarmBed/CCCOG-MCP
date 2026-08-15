@@ -2,8 +2,12 @@ using CCCG.Core;
 using CCCG.Core.Dispatch;
 using CCCG.Core.Monitoring;
 using CCCG.Core.Providers;
+using CCCG.Dispatch;
 using CCCG.Monitor;
 using CCCG.Host;
+using ModelContextProtocol.Server;
+using System.ComponentModel;
+using System.Reflection;
 
 if (args is ["--emit-utf8-grok-json"])
 {
@@ -177,7 +181,11 @@ var tests = new (string Name, Action Run)[]
     ("archive Claude moves transcript and sidecars", ArchiveClaudeMovesTranscriptAndSidecars),
     ("archive is manually restorable from manifest", ArchiveIsManuallyRestorableFromManifest),
     ("archive refuses live or CCCG owned peer", ArchiveRefusesLiveOrCccgOwnedPeer),
-    ("archive collision or manifest failure leaves source intact", ArchiveCollisionOrManifestFailureLeavesSourceIntact)
+    ("archive collision or manifest failure leaves source intact", ArchiveCollisionOrManifestFailureLeavesSourceIntact),
+    ("Host registers all CCD parity tools", HostRegistersAllCcdParityTools),
+    ("Host tool descriptions warn transcript is untrusted", HostToolDescriptionsWarnUntrustedContent),
+    ("Worker dispatches read search title archive operations", WorkerDispatchesReadSearchTitleArchiveOperations),
+    ("Host payload round trips all four operations", HostPayloadRoundTripsAllFourOperations)
 };
 
 var failures = 0;
@@ -3472,6 +3480,164 @@ static void ArchiveCollisionOrManifestFailureLeavesSourceIntact()
     {
         TryDelete(root);
     }
+}
+
+static void HostRegistersAllCcdParityTools()
+{
+    var names = typeof(DispatchTools)
+        .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        .Select(method => method.GetCustomAttribute<McpServerToolAttribute>()?.Name)
+        .Where(name => !string.IsNullOrWhiteSpace(name))
+        .ToHashSet(StringComparer.Ordinal);
+    foreach (var name in new[]
+    {
+        "cccg_read_transcript",
+        "cccg_search_transcripts",
+        "cccg_set_title",
+        "cccg_archive_peer"
+    })
+    {
+        True(names.Contains(name));
+    }
+}
+
+static void HostToolDescriptionsWarnUntrustedContent()
+{
+    var methods = typeof(DispatchTools)
+        .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        .Where(method => method.GetCustomAttribute<McpServerToolAttribute>()?.Name is
+            "cccg_read_transcript" or "cccg_search_transcripts" or "cccg_set_title" or "cccg_archive_peer")
+        .ToList();
+    Equal(4, methods.Count);
+    foreach (var method in methods)
+    {
+        var description = method.GetCustomAttribute<DescriptionAttribute>()?.Description ?? "";
+        True(description.Contains("untrusted", StringComparison.OrdinalIgnoreCase));
+        True(description.Contains("not instructions", StringComparison.OrdinalIgnoreCase));
+    }
+}
+
+static void WorkerDispatchesReadSearchTitleArchiveOperations()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-worker-parity-{Guid.NewGuid():N}");
+    try
+    {
+        var id = "84999999-9999-4999-8999-999999999999";
+        WriteCodexTranscript(root, id, "Worker parity", "worker unique needle");
+        var read = WorkerRpc(root, "readTranscript", new
+        {
+            provider = "codex",
+            sessionId = id,
+            limit = 20
+        });
+        True(read.Contains("worker unique needle", StringComparison.Ordinal));
+        var search = WorkerRpc(root, "searchTranscripts", new
+        {
+            query = "needle",
+            provider = "codex",
+            limit = 10
+        });
+        True(search.Contains(id, StringComparison.Ordinal));
+        var title = WorkerRpc(root, "setTitle", new
+        {
+            provider = "codex",
+            sessionId = id,
+            title = "worker title"
+        });
+        True(title.Contains("unsupported", StringComparison.Ordinal));
+        var archive = WorkerRpc(root, "archivePeer", new
+        {
+            provider = "codex",
+            sessionId = id
+        });
+        True(archive.Contains("archived", StringComparison.Ordinal));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void HostPayloadRoundTripsAllFourOperations()
+{
+    var cases = new (string Operation, object Arguments)[]
+    {
+        ("readTranscript", new { provider = "codex", sessionId = "s", limit = 20, beforeMarker = (string?)null }),
+        ("searchTranscripts", new { query = "ab", provider = "all", limit = 10 }),
+        ("setTitle", new { provider = "claude", sessionId = "s", title = "title" }),
+        ("archivePeer", new { provider = "grok", sessionId = "s" })
+    };
+    foreach (var (operation, arguments) in cases)
+    {
+        var request = new DispatchBackendRequest
+        {
+            Operation = operation,
+            Arguments = System.Text.Json.JsonSerializer.SerializeToElement(arguments)
+        };
+        var roundTrip = System.Text.Json.JsonSerializer.Deserialize<DispatchBackendRequest>(
+            System.Text.Json.JsonSerializer.Serialize(request));
+        Equal(operation, roundTrip?.Operation);
+        True(roundTrip?.Arguments.ValueKind == System.Text.Json.JsonValueKind.Object);
+    }
+}
+
+static string WorkerRpc(string codexHome, string operation, object arguments)
+{
+    var repo = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+    var project = Path.Combine(repo, "src", "CCCG.Dispatch.Worker", "CCCG.Dispatch.Worker.csproj");
+    var info = new System.Diagnostics.ProcessStartInfo
+    {
+        FileName = "dotnet",
+        WorkingDirectory = repo,
+        UseShellExecute = false,
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true
+    };
+    info.ArgumentList.Add("run");
+    info.ArgumentList.Add("--project");
+    info.ArgumentList.Add(project);
+    info.ArgumentList.Add("-c");
+    info.ArgumentList.Add("Release");
+    info.ArgumentList.Add("--no-restore");
+    info.Environment["CODEX_HOME"] = codexHome;
+    info.Environment["GROK_HOME"] = Path.Combine(codexHome, "grok");
+    info.Environment["CCCG_QUOTA_CLAUDE"] = "1000000";
+    info.Environment["CCCG_QUOTA_DEFAULT"] = "1000000";
+    using var process = System.Diagnostics.Process.Start(info)
+        ?? throw new InvalidOperationException("Unable to start worker RPC.");
+    var request = new DispatchBackendRequest
+    {
+        Operation = operation,
+        Arguments = System.Text.Json.JsonSerializer.SerializeToElement(arguments)
+    };
+    process.StandardInput.WriteLine(System.Text.Json.JsonSerializer.Serialize(request));
+    process.StandardInput.Close();
+    var stdout = process.StandardOutput.ReadToEnd();
+    var stderr = process.StandardError.ReadToEnd();
+    if (!process.WaitForExit(30_000))
+    {
+        process.Kill(entireProcessTree: true);
+        throw new TimeoutException("Worker RPC timed out.");
+    }
+
+    var line = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+        .LastOrDefault(value => value.TrimStart().StartsWith("{", StringComparison.Ordinal));
+    if (line is null)
+    {
+        throw new InvalidOperationException("Worker RPC returned no JSON: " + stderr);
+    }
+
+    var response = System.Text.Json.JsonSerializer.Deserialize<DispatchBackendResponse>(line,
+        new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+        ?? throw new InvalidDataException("Worker RPC response is invalid.");
+    if (!response.Ok)
+    {
+        throw new InvalidOperationException((response.Error ?? "Worker RPC failed.") + " stderr=" + stderr);
+    }
+
+    return response.Payload ?? "";
 }
 
 static void WriteCodexTranscript(string root, string sessionId, string title, string content)

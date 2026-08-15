@@ -76,10 +76,10 @@ public sealed class TranscriptService
             marker ??= EncodeMarker(provider, request.SessionId, begin);
         }
 
-        return new TranscriptReadResult(
+        return FitReadResult(new TranscriptReadResult(
             provider,
             request.SessionId.Trim(),
-            source.Title,
+            TrimMetadata(source.Title),
             source.UpdatedAt,
             rendered,
             selected.Count(record => record.Role == "user"),
@@ -87,7 +87,7 @@ public sealed class TranscriptService
             marker,
             outputTruncated || loaded.Truncated,
             loaded.SkippedRecords,
-            UntrustedContentWarning);
+            UntrustedContentWarning));
     }
 
     public TranscriptSearchResult Search(TranscriptSearchRequest request)
@@ -157,7 +157,7 @@ public sealed class TranscriptService
             hits.Add(new TranscriptSearchHit(
                 source.Provider,
                 source.SessionId,
-                loaded.Title ?? source.Title,
+                TrimMetadata(loaded.Title ?? source.Title),
                 loaded.UpdatedAt ?? source.UpdatedAt,
                 excerpt,
                 match.index));
@@ -192,7 +192,7 @@ public sealed class TranscriptService
             truncationReason ??= "output-byte-cap";
         }
 
-        return new TranscriptSearchResult(
+        return FitSearchResult(new TranscriptSearchResult(
             query,
             provider,
             hits,
@@ -201,8 +201,76 @@ public sealed class TranscriptService
             truncated,
             truncationReason,
             serializedByteCount,
-            UntrustedContentWarning);
+            UntrustedContentWarning));
     }
+
+    private TranscriptReadResult FitReadResult(TranscriptReadResult result)
+    {
+        var candidate = result;
+        var budget = Math.Max(0, options.MaxOutputBytes - 2048);
+        while (JsonSerializer.SerializeToUtf8Bytes(candidate).Length > options.MaxOutputBytes)
+        {
+            var next = Utf8Prefix(candidate.Rendered, Math.Max(0, budget));
+            if (next == candidate.Rendered && budget > 0)
+            {
+                budget = Math.Max(0, budget - 1024);
+                continue;
+            }
+
+            candidate = candidate with
+            {
+                Rendered = next,
+                Title = TrimMetadata(candidate.Title, 256),
+                Truncated = true,
+                HasMore = true
+            };
+            if (budget == 0 && JsonSerializer.SerializeToUtf8Bytes(candidate).Length > options.MaxOutputBytes)
+            {
+                candidate = candidate with { Title = null };
+                break;
+            }
+        }
+
+        return candidate;
+    }
+
+    private TranscriptSearchResult FitSearchResult(TranscriptSearchResult result)
+    {
+        var hits = result.Hits.ToList();
+        var candidate = result with { Hits = hits, SerializedByteCount = 0 };
+        while (true)
+        {
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(candidate);
+            if (bytes.Length <= options.MaxOutputBytes)
+            {
+                return candidate with { SerializedByteCount = bytes.Length };
+            }
+
+            if (hits.Count == 0)
+            {
+                return candidate with
+                {
+                    Truncated = true,
+                    TruncationReason = candidate.TruncationReason ?? "output-byte-cap",
+                    SerializedByteCount = options.MaxOutputBytes
+                };
+            }
+
+            hits.RemoveAt(hits.Count - 1);
+            candidate = candidate with
+            {
+                Hits = hits,
+                MatchedSessions = hits.Count,
+                Truncated = true,
+                TruncationReason = candidate.TruncationReason ?? "output-byte-cap"
+            };
+        }
+    }
+
+    private static string? TrimMetadata(string? value, int max = 512) =>
+        string.IsNullOrWhiteSpace(value)
+            ? value
+            : value.Length <= max ? value : value[..max];
 
     private TranscriptSource? FindSource(string provider, string sessionId)
     {
