@@ -178,6 +178,8 @@ public static class ProviderCommand
         {
             args.Insert(8, "WebSearch,WebFetch");
             args.Insert(8, "--tools");
+            args.Insert(10, "WebSearch,WebFetch");
+            args.Insert(10, "--allowed-tools");
         }
         else
         {

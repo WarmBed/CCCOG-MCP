@@ -24,6 +24,23 @@ if (args is ["--echo-utf8-stdin"])
     return 0;
 }
 
+// The regression suite models a human-root test process.  A real CCCG
+// dispatch may launch this executable with inherited guard variables; clear
+// them here so the legacy fixtures do not accidentally become recursive jobs.
+foreach (var variable in new[]
+{
+    RecursionContext.HopVariable,
+    RecursionContext.SourceVariable,
+    RecursionContext.ChainVariable,
+    RecursionContext.MaxHopVariable,
+    "CCCG_QUOTA_CLAUDE",
+    "CCCG_QUOTA_DEFAULT",
+    "CCCG_CLAUDE_CHILD_MODE"
+})
+{
+    Environment.SetEnvironmentVariable(variable, null);
+}
+
 var tests = new (string Name, Action Run)[]
 {
     ("arguments parse split and inline values", ArgumentsParse),
@@ -2805,6 +2822,9 @@ static void ClaudeChildToolsModeAllowsWebWithoutMcp()
         var toolsIndex = IndexOf(command.Arguments, "--tools");
         True(toolsIndex >= 0);
         Equal("WebSearch,WebFetch", command.Arguments[toolsIndex + 1]);
+        var allowedIndex = IndexOf(command.Arguments, "--allowed-tools");
+        True(allowedIndex >= 0);
+        Equal("WebSearch,WebFetch", command.Arguments[allowedIndex + 1]);
         True(!command.Arguments.Contains("--tools="));
         True(!command.Arguments.Contains("--mcp-config"));
         True(command.Arguments.Contains("--safe-mode"));
