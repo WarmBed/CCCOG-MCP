@@ -7,6 +7,11 @@ public static class ProviderCommand
         + "Never use, describe, simulate, or request tools. Never read or write files, memory, settings, network, or external systems. "
         + "Do not delegate. Return only the final textual answer.";
 
+    public const string ClaudeToolsSystemPrompt =
+        "You are a CCCG tool-enabled peer. Answer only the task in the user message. "
+        + "Use only the explicitly enabled built-in WebSearch and WebFetch tools when they materially help. "
+        + "Never use MCP, hooks, project commands, slash commands, or delegation. Return only the final textual answer.";
+
     public static LaunchCommand Build(
         string provider,
         DispatchAction action,
@@ -142,6 +147,20 @@ public static class ProviderCommand
         var file = string.IsNullOrWhiteSpace(claudeCommand)
             ? ResolveClaude()
             : claudeCommand;
+        var childMode = Environment.GetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE")
+            ?.Trim()
+            .ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(childMode))
+        {
+            childMode = "text-only";
+        }
+
+        if (childMode is not ("text-only" or "tools"))
+        {
+            throw new InvalidOperationException(
+                "CCCG_CLAUDE_CHILD_MODE must be text-only or tools.");
+        }
+
         var args = new List<string>
         {
             "-p",
@@ -149,12 +168,21 @@ public static class ProviderCommand
             "--verbose",
             "--safe-mode",
             "--disable-slash-commands",
-            "--system-prompt", ClaudeTextOnlySystemPrompt,
-            "--tools=",
+            "--system-prompt",
+            childMode == "tools" ? ClaudeToolsSystemPrompt : ClaudeTextOnlySystemPrompt,
             "--strict-mcp-config",
             "--setting-sources=",
             "--permission-mode", "dontAsk"
         };
+        if (childMode == "tools")
+        {
+            args.Insert(8, "WebSearch,WebFetch");
+            args.Insert(8, "--tools");
+        }
+        else
+        {
+            args.Insert(8, "--tools=");
+        }
         if (action == DispatchAction.Create)
         {
             if (string.IsNullOrWhiteSpace(newSessionId))

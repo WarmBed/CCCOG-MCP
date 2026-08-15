@@ -140,7 +140,7 @@ public sealed class RecursionContext
 
     private static int ParseNonNegative(string? value, string variable, int fallback)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        if (value is null || value.Length == 0)
         {
             return fallback;
         }
@@ -157,7 +157,7 @@ public sealed class RecursionContext
 
     private static int ParsePositive(string? value, string variable, int fallback)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        if (value is null || value.Length == 0)
         {
             return fallback;
         }

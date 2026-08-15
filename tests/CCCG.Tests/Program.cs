@@ -128,7 +128,9 @@ var tests = new (string Name, Action Run)[]
     ("recursive enqueue posts a system audit", RecursiveEnqueuePostsSystemAudit),
     ("human root enqueue has no recursive audit", HumanRootEnqueueHasNoRecursiveAudit),
     ("audit failure fails closed", AuditFailureFailsClosed),
-    ("owner daemon rebuilds transport when hop changes", OwnerDaemonRebuildsTransportWhenHopChanges)
+    ("owner daemon rebuilds transport when hop changes", OwnerDaemonRebuildsTransportWhenHopChanges),
+    ("Claude child mode defaults to text-only", ClaudeChildModeDefaultsToTextOnly),
+    ("Claude child tools mode allows web tools without MCP", ClaudeChildToolsModeAllowsWebWithoutMcp)
 };
 
 var failures = 0;
@@ -2759,6 +2761,61 @@ static void OwnerDaemonRebuildsTransportWhenHopChanges()
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+}
+
+static void ClaudeChildModeDefaultsToTextOnly()
+{
+    var previous = Environment.GetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE");
+    try
+    {
+        Environment.SetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE", null);
+        var command = ProviderCommand.BuildClaude(
+            DispatchAction.Create,
+            null,
+            "D:\\code\\app",
+            "D:\\tmp\\prompt.txt",
+            "claude.exe",
+            "11111111-1111-4111-8111-111111111111");
+        True(command.Arguments.Contains("--tools="));
+        True(command.Arguments.Contains(ProviderCommand.ClaudeTextOnlySystemPrompt));
+        True(command.Arguments.Contains("--safe-mode"));
+        True(command.Arguments.Contains("--strict-mcp-config"));
+        True(command.Arguments.Contains("--setting-sources="));
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE", previous);
+    }
+}
+
+static void ClaudeChildToolsModeAllowsWebWithoutMcp()
+{
+    var previous = Environment.GetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE");
+    try
+    {
+        Environment.SetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE", "tools");
+        var command = ProviderCommand.BuildClaude(
+            DispatchAction.Create,
+            null,
+            "D:\\code\\app",
+            "D:\\tmp\\prompt.txt",
+            "claude.exe",
+            "11111111-1111-4111-8111-111111111111");
+        var toolsIndex = IndexOf(command.Arguments, "--tools");
+        True(toolsIndex >= 0);
+        Equal("WebSearch,WebFetch", command.Arguments[toolsIndex + 1]);
+        True(!command.Arguments.Contains("--tools="));
+        True(!command.Arguments.Contains("--mcp-config"));
+        True(command.Arguments.Contains("--safe-mode"));
+        True(command.Arguments.Contains("--strict-mcp-config"));
+        True(command.Arguments.Contains("--setting-sources="));
+        True(command.Arguments.Contains("--disable-slash-commands"));
+        True(!command.Arguments.Contains(ProviderCommand.ClaudeTextOnlySystemPrompt));
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("CCCG_CLAUDE_CHILD_MODE", previous);
     }
 }
 
