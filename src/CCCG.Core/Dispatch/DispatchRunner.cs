@@ -37,6 +37,7 @@ public sealed class DispatchRunner
     private readonly TimeSpan deliverWaitTimeout;
     private readonly TimeSpan readBackTimeout;
     private readonly RecursionContext recursion;
+    private readonly QuotaLedger quota;
 
     public DispatchRunner(
         DispatchJobStore store,
@@ -53,7 +54,8 @@ public sealed class DispatchRunner
         OwnerRegistry? owners = null,
         TimeSpan? deliverWaitTimeout = null,
         TimeSpan? readBackTimeout = null,
-        RecursionContext? recursion = null)
+        RecursionContext? recursion = null,
+        QuotaLedger? quota = null)
     {
         this.store = store;
         this.listPeers = listPeers;
@@ -70,6 +72,7 @@ public sealed class DispatchRunner
         this.deliverWaitTimeout = deliverWaitTimeout ?? TimeSpan.FromHours(2);
         this.readBackTimeout = readBackTimeout ?? TimeSpan.FromSeconds(5);
         this.recursion = recursion ?? RecursionContext.FromEnvironment();
+        this.quota = quota ?? new QuotaLedger(this.recursion.QuotaRoot);
     }
 
     public DispatchJob Enqueue(
@@ -86,29 +89,43 @@ public sealed class DispatchRunner
         recursion.ValidateNewJob();
         var binding = bindings?.Load(provider, cwd);
         var selection = Select(provider, sessionId, cwd, allowNew, binding);
-        var job = store.Create(selection, prompt);
-        job.RequestedSessionId = sessionId;
-        job.AllowNew = allowNew;
-        job.Model = NormalizeOverride(model);
-        job.ReasoningEffort = NormalizeOverride(reasoningEffort);
-        job.HopCount = recursion.JobHop;
-        job.HopSource = recursion.HopSource;
-        job.HopChain = recursion.HopChain;
-        job.AffinityKey = BuildAffinityKey(
-            provider,
-            sessionId ?? binding?.SessionId,
-            selection.Cwd ?? cwd);
-        store.Write(job);
+        var reservation = quota.TryConsume(recursion.HopSource, provider);
+        if (!reservation.Allowed)
+        {
+            throw new InvalidOperationException(reservation.Message);
+        }
 
-        inbox?.Post(
-            "claude",
-            provider,
-            prompt,
-            fromProvider: "claude",
-            toProvider: provider,
-            toSessionId: selection.SessionId,
-            jobId: job.JobId);
-        return job;
+        try
+        {
+            var job = store.Create(selection, prompt);
+            job.RequestedSessionId = sessionId;
+            job.AllowNew = allowNew;
+            job.Model = NormalizeOverride(model);
+            job.ReasoningEffort = NormalizeOverride(reasoningEffort);
+            job.HopCount = recursion.JobHop;
+            job.HopSource = recursion.HopSource;
+            job.HopChain = recursion.HopChain;
+            job.AffinityKey = BuildAffinityKey(
+                provider,
+                sessionId ?? binding?.SessionId,
+                selection.Cwd ?? cwd);
+            store.Write(job);
+
+            inbox?.Post(
+                "claude",
+                provider,
+                prompt,
+                fromProvider: "claude",
+                toProvider: provider,
+                toSessionId: selection.SessionId,
+                jobId: job.JobId);
+            return job;
+        }
+        catch
+        {
+            quota.Release(reservation);
+            throw;
+        }
     }
 
     public DispatchJob Dispatch(
