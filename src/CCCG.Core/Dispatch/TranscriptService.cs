@@ -30,7 +30,10 @@ public sealed class TranscriptService
         this.options = options ?? new TranscriptReaderOptions();
         if (this.options.MaxFileBytes <= 0
             || this.options.MaxOutputBytes <= 0
-            || this.options.TailBytes <= 0)
+            || this.options.TailBytes <= 0
+            || this.options.MaxSessions <= 0
+            || this.options.MaxTotalBytes <= 0
+            || this.options.SearchExcerptCharacters <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(options));
         }
@@ -87,6 +90,120 @@ public sealed class TranscriptService
             UntrustedContentWarning);
     }
 
+    public TranscriptSearchResult Search(TranscriptSearchRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var query = (request.Query ?? "").Trim();
+        if (query.EnumerateRunes().Count() < 2)
+        {
+            throw new ArgumentException("query must contain at least two characters.", nameof(request));
+        }
+
+        var provider = NormalizeProvider(request.Provider ?? "all");
+        if (provider is not ("all" or "codex" or "grok" or "claude"))
+        {
+            throw new ArgumentException("Provider must be codex, grok, claude, or all.");
+        }
+
+        var limit = Math.Clamp(request.Limit <= 0 ? 10 : request.Limit, 1, 100);
+        var sources = EnumerateSources(provider == "all" ? null : provider)
+            .GroupBy(source => source.Provider + "\n" + source.SessionId,
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderByDescending(source => source.UpdatedAt).First())
+            .OrderByDescending(source => source.UpdatedAt ?? DateTimeOffset.MinValue)
+            .ToList();
+        var hits = new List<TranscriptSearchHit>();
+        var scannedSessions = 0;
+        var scannedBytes = 0L;
+        var truncated = false;
+        string? truncationReason = null;
+
+        foreach (var source in sources)
+        {
+            if (scannedSessions >= options.MaxSessions)
+            {
+                truncated = true;
+                truncationReason = "session-cap";
+                break;
+            }
+
+            var fileLength = File.Exists(source.Path) ? new FileInfo(source.Path).Length : 0;
+            var estimatedBytes = Math.Min(fileLength, options.MaxFileBytes);
+            if (scannedBytes + estimatedBytes > options.MaxTotalBytes)
+            {
+                truncated = true;
+                truncationReason = "total-byte-cap";
+                break;
+            }
+
+            scannedBytes += estimatedBytes;
+            scannedSessions++;
+            var loaded = LoadRecords(source);
+            if (loaded.Truncated)
+            {
+                truncated = true;
+                truncationReason ??= "file-byte-cap";
+            }
+
+            var match = loaded.Records
+                .Select(record => (record, index: record.Text.IndexOf(query, StringComparison.OrdinalIgnoreCase)))
+                .FirstOrDefault(item => item.index >= 0);
+            if (match.record is null)
+            {
+                continue;
+            }
+
+            var excerpt = Excerpt(match.record.Text, match.index);
+            hits.Add(new TranscriptSearchHit(
+                source.Provider,
+                source.SessionId,
+                loaded.Title ?? source.Title,
+                loaded.UpdatedAt ?? source.UpdatedAt,
+                excerpt,
+                match.index));
+            if (hits.Count >= limit)
+            {
+                if (sources.Count > scannedSessions)
+                {
+                    truncated = true;
+                    truncationReason ??= "result-limit";
+                }
+
+                break;
+            }
+
+            var estimatedResultBytes = hits.Sum(hit =>
+                Encoding.UTF8.GetByteCount(hit.Excerpt) + 160);
+            if (estimatedResultBytes > options.MaxOutputBytes)
+            {
+                hits.RemoveAt(hits.Count - 1);
+                truncated = true;
+                truncationReason = "output-byte-cap";
+                break;
+            }
+        }
+
+        var serializedByteCount = Encoding.UTF8.GetByteCount(
+            string.Join("\n", hits.Select(hit => hit.Excerpt))) + 256;
+        if (serializedByteCount > options.MaxOutputBytes)
+        {
+            serializedByteCount = options.MaxOutputBytes;
+            truncated = true;
+            truncationReason ??= "output-byte-cap";
+        }
+
+        return new TranscriptSearchResult(
+            query,
+            provider,
+            hits,
+            scannedSessions,
+            hits.Count,
+            truncated,
+            truncationReason,
+            serializedByteCount,
+            UntrustedContentWarning);
+    }
+
     private TranscriptSource? FindSource(string provider, string sessionId)
     {
         return provider switch
@@ -96,6 +213,141 @@ public sealed class TranscriptService
             "claude" => FindClaude(sessionId),
             _ => throw new ArgumentException("Provider must be codex, grok, or claude.")
         };
+    }
+
+    private IEnumerable<TranscriptSource> EnumerateSources(string? provider)
+    {
+        if (provider is null or "codex")
+        {
+            var root = Path.Combine(codexHome, "sessions");
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (Directory.Exists(root))
+            {
+                foreach (var path in EnumerateFilesSafe(root, "rollout-*.jsonl"))
+                {
+                    TranscriptSource? candidate = null;
+                    try
+                    {
+                        using var document = JsonDocument.Parse(ReadFirstLine(path));
+                        if (!document.RootElement.TryGetProperty("payload", out var payload))
+                        {
+                            continue;
+                        }
+
+                        var sessionId = String(payload, "session_id");
+                        if (string.IsNullOrWhiteSpace(sessionId) || !seen.Add(sessionId))
+                        {
+                            continue;
+                        }
+
+                        candidate = new TranscriptSource(
+                            "codex", sessionId, path, ReadCodexTitle(sessionId),
+                            File.GetLastWriteTimeUtc(path));
+                    }
+                    catch (Exception exception) when (exception is IOException or JsonException)
+                    {
+                    }
+
+                    if (candidate is not null)
+                    {
+                        yield return candidate;
+                    }
+                }
+            }
+        }
+
+        if (provider is null or "grok")
+        {
+            var root = Path.Combine(grokHome, "sessions");
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (Directory.Exists(root))
+            {
+                foreach (var summaryPath in EnumerateFilesSafe(root, "summary.json"))
+                {
+                    TranscriptSource? candidate = null;
+                    try
+                    {
+                        using var document = JsonDocument.Parse(ReadAllTextShared(summaryPath));
+                        var info = document.RootElement.TryGetProperty("info", out var value)
+                            ? value
+                            : default;
+                        var sessionId = String(info, "id")
+                            ?? Path.GetFileName(Path.GetDirectoryName(summaryPath) ?? "");
+                        if (string.IsNullOrWhiteSpace(sessionId) || !seen.Add(sessionId))
+                        {
+                            continue;
+                        }
+
+                        var sessionDir = Path.GetDirectoryName(summaryPath)!;
+                        var history = Path.Combine(sessionDir, "chat_history.jsonl");
+                        if (!File.Exists(history))
+                        {
+                            history = Path.Combine(sessionDir, "events.jsonl");
+                        }
+
+                        candidate = new TranscriptSource(
+                            "grok", sessionId, history,
+                            String(document.RootElement, "generated_title")
+                                ?? String(document.RootElement, "session_summary"),
+                            Timestamp(document.RootElement, "last_active_at")
+                                ?? Timestamp(document.RootElement, "updated_at"));
+                    }
+                    catch (Exception exception) when (exception is IOException or JsonException)
+                    {
+                    }
+
+                    if (candidate is not null)
+                    {
+                        yield return candidate;
+                    }
+                }
+            }
+        }
+
+        if (provider is null or "claude")
+        {
+            var root = Path.Combine(claudeHome, "projects");
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (Directory.Exists(root))
+            {
+                foreach (var path in EnumerateFilesSafe(root, "*.jsonl"))
+                {
+                    var sessionId = Path.GetFileNameWithoutExtension(path);
+                    if (!Guid.TryParse(sessionId, out _) || !seen.Add(sessionId))
+                    {
+                        continue;
+                    }
+
+                    var source = new TranscriptSource("claude", sessionId, path, null,
+                        File.GetLastWriteTimeUtc(path));
+                    var loaded = LoadRecords(source);
+                    yield return source with
+                    {
+                        Title = loaded.Title,
+                        UpdatedAt = loaded.UpdatedAt ?? source.UpdatedAt
+                    };
+                }
+            }
+        }
+    }
+
+    private string Excerpt(string text, int matchIndex)
+    {
+        var radius = Math.Max(20, options.SearchExcerptCharacters / 2);
+        var start = Math.Max(0, matchIndex - radius);
+        var length = Math.Min(text.Length - start, options.SearchExcerptCharacters);
+        var excerpt = text.Substring(start, length).Trim();
+        if (start > 0)
+        {
+            excerpt = "…" + excerpt;
+        }
+
+        if (start + length < text.Length)
+        {
+            excerpt += "…";
+        }
+
+        return excerpt;
     }
 
     private TranscriptSource? FindCodex(string sessionId)
