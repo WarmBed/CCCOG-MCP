@@ -10,10 +10,10 @@ extern "C" {
 #endif
 
 /* Returns an owned UTF-8 JSON string. Release it with cccog_bar_free_string. */
-char *cccg_bar_snapshot_json(const char *input_json);
+char *cccog_bar_snapshot_json(const char *input_json);
 /* Input: {"claudeCredentialPath":...,"grokAuthPath":...,"now":...}. */
-char *cccg_bar_poll_quotas(const char *input_json);
-void cccg_bar_free_string(char *value);
+char *cccog_bar_poll_quotas(const char *input_json);
+void cccog_bar_free_string(char *value);
 
 #ifdef __cplusplus
 }
