@@ -44,9 +44,9 @@ public sealed class DispatchTools
         [Description("Existing live, resumable, or CCCG-managed session id.")] string? sessionId = null,
         [Description("Workspace/cwd.")] string? cwd = null,
         [Description("Create a new bound session if none matches.")] bool allowNew = true,
-        [Description("Optional backend model id for this turn only (codex/grok). Example: gpt-5.6-luna.")]
+        [Description("Optional backend model id for this turn only. Codex: gpt-5.6-luna (human nickname \"Luna\"), gpt-5.6-sol (\"Sol\"). Grok: grok-4.6, grok-4.5 (\"Luna\" is NOT a Grok model). Passed through verbatim.")]
         string? model = null,
-        [Description("Optional reasoning intensity for this turn only (codex/grok). Passed through to the provider. Example: medium, high, xhigh.")]
+        [Description("Optional reasoning intensity for this turn only, passed through verbatim (medium, high, xhigh). Human nickname \"Max\" (e.g. \"Luna Max\") means xhigh.")]
         string? reasoningEffort = null) =>
         Invoke("dispatch", new
         {
@@ -67,9 +67,9 @@ public sealed class DispatchTools
         [Description("Existing live, resumable, or CCCG-managed session id.")] string? sessionId = null,
         [Description("Workspace/cwd.")] string? cwd = null,
         [Description("Create a new bound session if none matches.")] bool allowNew = true,
-        [Description("Optional backend model id for this turn only (codex/grok). Example: gpt-5.6-luna.")]
+        [Description("Optional backend model id for this turn only. Codex: gpt-5.6-luna (human nickname \"Luna\"), gpt-5.6-sol (\"Sol\"). Grok: grok-4.6, grok-4.5 (\"Luna\" is NOT a Grok model). Passed through verbatim.")]
         string? model = null,
-        [Description("Optional reasoning intensity for this turn only (codex/grok). Passed through to the provider. Example: medium, high, xhigh.")]
+        [Description("Optional reasoning intensity for this turn only, passed through verbatim (medium, high, xhigh). Human nickname \"Max\" (e.g. \"Luna Max\") means xhigh.")]
         string? reasoningEffort = null) =>
         Invoke("dispatchWait", new
         {
