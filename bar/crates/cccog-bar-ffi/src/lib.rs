@@ -5,7 +5,7 @@
 //! a panic or process abort.
 
 use cccog_bar_core::graph::GraphSnapshot;
-use cccog_bar_core::quota::{
+use cccog_bar_quota::{
     fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_codex_quota_from_sessions,
     load_grok_token, HttpClient, HttpRequest, HttpResponse, PollGate, QuotaCards, QuotaState,
 };
