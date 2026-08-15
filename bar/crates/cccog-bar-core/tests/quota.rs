@@ -1,7 +1,7 @@
 use cccog_bar_core::quota::{
-    fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_grok_token,
-    parse_codex_rate_limits, HttpClient, HttpRequest, HttpResponse, OAuthCredential, PollGate,
-    QuotaState,
+    fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_codex_quota_from_sessions,
+    load_grok_token, parse_codex_rate_limits, HttpClient, HttpRequest, HttpResponse,
+    OAuthCredential, PollGate, QuotaState,
 };
 
 #[derive(Default)]
@@ -148,4 +148,23 @@ fn credential_loaders_are_read_only_and_restrict_grok_issuer() {
         Some("grok-access")
     );
     assert_eq!(std::fs::read(&grok_path).unwrap(), grok_before);
+}
+
+#[test]
+fn codex_rollout_tail_reads_real_event_msg_rate_limits_and_numeric_reset() {
+    let root = tempfile::tempdir().expect("sessions fixture");
+    let nested = root.path().join("2026").join("08").join("15");
+    std::fs::create_dir_all(&nested).unwrap();
+    let path = nested.join("rollout-fixture.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"timestamp\":\"2026-08-15T13:04:28Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\"}}}}\n{{\"timestamp\":\"2026-08-15T13:04:28Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"rate_limits\":{{\"primary\":{{\"used_percent\":37.0,\"window_minutes\":10080,\"resets_at\":1787197821}},\"secondary\":null}}}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    let cards = load_codex_quota_from_sessions(root.path()).expect("rate limits");
+    assert_eq!(cards.client_id, "codex");
+    assert_eq!(cards.windows[0].used_percent, 37.0);
+    assert_eq!(cards.windows[0].resets_at.as_deref(), Some("1787197821"));
 }

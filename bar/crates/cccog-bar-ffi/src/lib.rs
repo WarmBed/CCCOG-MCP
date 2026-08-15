@@ -6,8 +6,8 @@
 
 use cccog_bar_core::graph::GraphSnapshot;
 use cccog_bar_core::quota::{
-    fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_grok_token, HttpClient,
-    HttpRequest, HttpResponse, PollGate, QuotaCards,
+    fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_codex_quota_from_sessions,
+    load_grok_token, HttpClient, HttpRequest, HttpResponse, PollGate, QuotaCards, QuotaState,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -173,25 +173,82 @@ pub fn poll_remote_quotas(
     grok_auth_path: Option<&Path>,
     now: u64,
 ) -> Vec<QuotaCards> {
-    let Ok(mut client) = ReqwestHttpClient::new() else {
-        return vec![];
-    };
+    poll_remote_quotas_with_codex(None, claude_credential_path, grok_auth_path, now)
+}
+
+pub fn poll_remote_quotas_with_codex(
+    codex_sessions_path: Option<&Path>,
+    claude_credential_path: Option<&Path>,
+    grok_auth_path: Option<&Path>,
+    now: u64,
+) -> Vec<QuotaCards> {
     let mut cards = Vec::new();
+    if let Some(path) = codex_sessions_path {
+        cards.push(match load_codex_quota_from_sessions(path) {
+            Ok(card) => card,
+            Err(reason) => diagnostic_card("codex", QuotaState::Unavailable, reason),
+        });
+    }
+
+    let wants_remote = claude_credential_path.is_some() || grok_auth_path.is_some();
+    let mut client = wants_remote.then(|| ReqwestHttpClient::new());
     if let Some(path) = claude_credential_path {
-        if let Ok(Some(credential)) = load_claude_credential(path) {
-            if let Some(card) = fetch_claude_quota(&mut client, &credential, now) {
-                cards.push(card);
+        match load_claude_credential(path) {
+            Ok(Some(credential)) => {
+                if let Some(Ok(client)) = client.as_mut() {
+                    if let Some(card) = fetch_claude_quota(client, &credential, now) {
+                        cards.push(card);
+                    }
+                } else {
+                    cards.push(diagnostic_card(
+                        "claude",
+                        QuotaState::Stale,
+                        "Claude quota HTTP client unavailable".to_owned(),
+                    ));
+                }
             }
+            Ok(None) => cards.push(diagnostic_card(
+                "claude",
+                QuotaState::Unavailable,
+                "Claude OAuth credential not found".to_owned(),
+            )),
+            Err(reason) => cards.push(diagnostic_card("claude", QuotaState::Unavailable, reason)),
         }
     }
     if let Some(path) = grok_auth_path {
-        if let Ok(token) = load_grok_token(path) {
-            if let Some(card) = fetch_grok_quota(&mut client, token.as_deref()) {
-                cards.push(card);
+        match load_grok_token(path) {
+            Ok(Some(token)) => {
+                if let Some(Ok(client)) = client.as_mut() {
+                    if let Some(card) = fetch_grok_quota(client, Some(&token)) {
+                        cards.push(card);
+                    }
+                } else {
+                    cards.push(diagnostic_card(
+                        "grok",
+                        QuotaState::Stale,
+                        "Grok quota HTTP client unavailable".to_owned(),
+                    ));
+                }
             }
+            Ok(None) => cards.push(diagnostic_card(
+                "grok",
+                QuotaState::Unavailable,
+                "Grok auth credential not found".to_owned(),
+            )),
+            Err(reason) => cards.push(diagnostic_card("grok", QuotaState::Unavailable, reason)),
         }
     }
     cards
+}
+
+fn diagnostic_card(client_id: &str, state: QuotaState, diagnostic: String) -> QuotaCards {
+    QuotaCards {
+        client_id: client_id.to_owned(),
+        windows: Vec::new(),
+        state,
+        observed_at: None,
+        diagnostic: Some(diagnostic),
+    }
 }
 
 /// Background-safe coordinator for the shell.  The minimum is clamped by the
@@ -223,11 +280,32 @@ impl BackgroundQuotaPoller {
         self.last_cards = poll_remote_quotas(claude_credential_path, grok_auth_path, now);
         Some(self.last_cards.clone())
     }
+
+    pub fn poll_with_codex(
+        &mut self,
+        now: u64,
+        codex_sessions_path: Option<&Path>,
+        claude_credential_path: Option<&Path>,
+        grok_auth_path: Option<&Path>,
+    ) -> Option<Vec<QuotaCards>> {
+        if !self.gate.due(now) {
+            return None;
+        }
+        self.gate.mark(now);
+        self.last_cards = poll_remote_quotas_with_codex(
+            codex_sessions_path,
+            claude_credential_path,
+            grok_auth_path,
+            now,
+        );
+        Some(self.last_cards.clone())
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QuotaPollInput {
+    codex_sessions_path: Option<String>,
     claude_credential_path: Option<String>,
     grok_auth_path: Option<String>,
     now: Option<u64>,
@@ -238,7 +316,8 @@ pub fn poll_remote_quotas_json(input: &str) -> String {
         Ok(value) => value,
         Err(error) => return error_json(format!("quota input is malformed: {error}")),
     };
-    let cards = poll_remote_quotas(
+    let cards = poll_remote_quotas_with_codex(
+        parsed.codex_sessions_path.as_deref().map(Path::new),
         parsed.claude_credential_path.as_deref().map(Path::new),
         parsed.grok_auth_path.as_deref().map(Path::new),
         parsed.now.unwrap_or(0),

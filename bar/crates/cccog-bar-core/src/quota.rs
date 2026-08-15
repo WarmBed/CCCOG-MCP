@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -176,6 +177,17 @@ pub fn parse_codex_rate_limits(input: &str) -> Result<QuotaCards, String> {
     let root = value
         .get("rate_limits")
         .or_else(|| value.get("rate_limit"))
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("rate_limits"))
+        })
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("info"))
+                .and_then(|info| info.get("rate_limits"))
+        })
         .unwrap_or(&value);
     let mut windows = Vec::new();
     if let Some(used) = percent(root, "used_percent") {
@@ -197,6 +209,80 @@ pub fn parse_codex_rate_limits(input: &str) -> Result<QuotaCards, String> {
         observed_at: None,
         diagnostic: None,
     })
+}
+
+/// Read only the newest bounded tail of Codex rollout files.  `rate_limits`
+/// is emitted as an `event_msg` near the end of each JSONL rollout, so there
+/// is no need to reread the full transcript or inspect prompt content.
+pub fn load_codex_quota_from_sessions(root: &Path) -> Result<QuotaCards, String> {
+    let mut files = Vec::new();
+    collect_rollouts(root, &mut files);
+    files.sort_by(|left, right| {
+        modified_time(right)
+            .cmp(&modified_time(left))
+            .then_with(|| right.cmp(left))
+    });
+    for path in files {
+        let Ok(tail) = read_tail(&path, 256 * 1024) else {
+            continue;
+        };
+        for line in tail.lines().rev() {
+            if !line.contains("\"rate_limits\"") {
+                continue;
+            }
+            if let Ok(mut cards) = parse_codex_rate_limits(line) {
+                cards.observed_at = modified_time(&path).map(|time| time as u64);
+                return Ok(cards);
+            }
+        }
+    }
+    Err("Codex rollout rate_limits not found in bounded tails".to_owned())
+}
+
+fn collect_rollouts(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if crate::owners::is_archived_path(&path) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_rollouts(&path, files);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn read_tail(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|_| "Codex rollout unavailable".to_owned())?;
+    let length = file
+        .metadata()
+        .map_err(|_| "Codex rollout metadata unavailable".to_owned())?
+        .len();
+    let start = length.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| "Codex rollout seek failed".to_owned())?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| "Codex rollout tail read failed".to_owned())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn modified_time(path: &Path) -> Option<u128> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u128)
 }
 
 pub fn fetch_claude_quota<C: HttpClient>(
@@ -311,11 +397,16 @@ fn window(id: &str, label: &str, used: f64, value: &Value) -> QuotaWindow {
         label: label.to_owned(),
         used_percent: used,
         remaining_percent: (100.0 - used).max(0.0),
-        resets_at: value
-            .get("resets_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        resets_at: value.get("resets_at").and_then(reset_value),
     }
+}
+
+fn reset_value(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_u64().map(|seconds| seconds.to_string()))
+        .or_else(|| value.as_f64().map(|seconds| (seconds as u64).to_string()))
 }
 
 fn label_for(id: &str, value: &Value) -> String {

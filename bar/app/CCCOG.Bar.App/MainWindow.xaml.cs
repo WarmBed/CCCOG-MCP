@@ -23,6 +23,7 @@ public sealed partial class MainWindow : Window
     private bool _closing;
     private bool _viewReady;
     private string _provider = "all";
+    private string _timeFilter = "2h";
 
     public MainWindow()
     {
@@ -32,7 +33,7 @@ public sealed partial class MainWindow : Window
         presenter.IsAlwaysOnTop = true;
         presenter.IsResizable = true;
         presenter.SetBorderAndTitleBar(true, true);
-        AppWindow.Resize(new SizeInt32(900, 600));
+        AppWindow.Resize(new SizeInt32(1800, 820));
         AppWindow.IsShownInSwitchers = true;
         _refreshTimer = DispatcherQueue.CreateTimer();
         _refreshTimer.Interval = TimeSpan.FromMilliseconds(250);
@@ -75,6 +76,15 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void TimeFilter_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (TimeFilter.SelectedItem is ComboBoxItem item && item.Tag is string tag)
+        {
+            _timeFilter = tag;
+            RefreshView();
+        }
+    }
+
     private void Refresh_Click(object sender, RoutedEventArgs e) => RefreshView();
 
     private void RefreshView()
@@ -83,17 +93,27 @@ public sealed partial class MainWindow : Window
         {
             return;
         }
-        var snapshot = _reader.Read(_provider);
+        var snapshot = _reader.Read(_provider, _timeFilter, DateTimeOffset.Now);
         StopAnimations();
         GraphCanvas.Children.Clear();
         var positions = new Dictionary<string, (double X, double Y)>(StringComparer.Ordinal);
-        var index = 0;
-        foreach (var node in snapshot.Nodes)
+        var leftNodes = snapshot.Nodes.Where(node => node.Provider is "caller" or "owner").ToArray();
+        var rightNodes = snapshot.Nodes.Where(node => node.Provider is not ("caller" or "owner")).ToArray();
+        var leftY = 20d;
+        foreach (var node in leftNodes)
         {
-            var x = node.Provider == "caller" ? 25 : 320;
-            var y = 20 + (index++ % 9) * 44;
-            positions[node.Id] = (x, y);
+            positions[node.Id] = (10, leftY);
+            leftY += NodeHeight(node) + 12;
         }
+        var rightY = 20d;
+        foreach (var node in rightNodes)
+        {
+            positions[node.Id] = (210, rightY);
+            rightY += NodeHeight(node) + 12;
+        }
+        GraphCanvas.Width = 400;
+        GraphCanvas.Height = Math.Max(430, Math.Max(leftY, rightY) + 30);
+        var edgeSlot = 0;
         foreach (var edge in snapshot.Edges)
         {
             if (!positions.TryGetValue(edge.SourceNodeId, out var source) ||
@@ -101,23 +121,40 @@ public sealed partial class MainWindow : Window
             {
                 continue;
             }
-            var line = new Line
+            var path = new Microsoft.UI.Xaml.Shapes.Path
             {
-                X1 = source.X + 185, Y1 = source.Y + 20, X2 = target.X, Y2 = target.Y + 20,
-                Stroke = new SolidColorBrush(Windows.UI.Color.FromArgb(180, 92, 190, 255)),
-                StrokeThickness = 2,
+                Data = Curve(source, target, edgeSlot++),
+                Stroke = new SolidColorBrush(StatusColor(edge.Status)),
+                StrokeThickness = edge.Count > 1 ? 4 : 2,
+                IsHitTestVisible = true,
             };
-            GraphCanvas.Children.Add(line);
-            var task = new TextBlock
+            var task = edge.DetailSummaries.Count == 0
+                ? "No task summary"
+                : string.Join(Environment.NewLine, edge.DetailSummaries.Take(4));
+            ToolTipService.SetToolTip(path, task);
+            path.Tapped += (_, _) =>
             {
-                Text = edge.TaskSummary,
-                FontSize = 10,
-                MaxWidth = 260,
-                Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(220, 210, 220, 230)),
+                DetailsText.Text = $"{edge.Kind} - {edge.Status} - {edge.Count} job(s): {task}";
             };
-            Canvas.SetLeft(task, 205);
-            Canvas.SetTop(task, Math.Min(source.Y, target.Y) + 1);
-            GraphCanvas.Children.Add(task);
+            GraphCanvas.Children.Add(path);
+            if (!string.IsNullOrEmpty(edge.BadgeText))
+            {
+                var badge = new Border
+                {
+                    Background = new SolidColorBrush(Windows.UI.Color.FromArgb(220, 20, 27, 36)),
+                    Padding = new Thickness(3, 1, 3, 1),
+                    Child = new TextBlock
+                    {
+                        Text = edge.BadgeText,
+                        FontSize = 11,
+                        FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                        Foreground = new SolidColorBrush(StatusColor(edge.Status)),
+                    },
+                };
+                Canvas.SetLeft(badge, 185);
+                Canvas.SetTop(badge, Math.Min(source.Y, target.Y) + 4);
+                GraphCanvas.Children.Add(badge);
+            }
         }
         foreach (var node in snapshot.Nodes)
         {
@@ -127,8 +164,8 @@ public sealed partial class MainWindow : Window
             }
             var card = new Border
             {
-                Width = 185,
-                Height = 40,
+                Width = 175,
+                Height = NodeHeight(node),
                 Padding = new Thickness(8, 4, 8, 4),
                 CornerRadius = new CornerRadius(6),
                 Background = new SolidColorBrush(node.Provider == "caller"
@@ -138,7 +175,7 @@ public sealed partial class MainWindow : Window
                 {
                     Children =
                     {
-                        new TextBlock { Text = $"{node.Provider} · {node.Label}", FontSize = 12 },
+                        new TextBlock { Text = $"{node.Provider} - {node.Label}", FontSize = 12 },
                         new TextBlock { Text = node.State, FontSize = 10, Opacity = 0.75 },
                     },
                 },
@@ -163,8 +200,37 @@ public sealed partial class MainWindow : Window
         }
 
         RefreshQuotaCards();
-        StatusText.Text = $"{snapshot.Jobs} dispatch records · refreshed {DateTime.Now:HH:mm:ss}";
+        StatusText.Text = $"{snapshot.Jobs} visible edges - {_timeFilter} - refreshed {DateTime.Now:HH:mm:ss}";
     }
+
+    private static double NodeHeight(GraphNodeViewModel node) => node.Label.Length > 22 ? 64 : 48;
+
+    private static Microsoft.UI.Xaml.Media.Geometry Curve(
+        (double X, double Y) source,
+        (double X, double Y) target,
+        int slot)
+    {
+        var start = new Windows.Foundation.Point(source.X + 175, source.Y + 24);
+        var end = new Windows.Foundation.Point(target.X, target.Y + 24);
+        var bend = ((slot % 5) - 2) * 22;
+        var control = new Windows.Foundation.Point(
+            (start.X + end.X) / 2,
+            (start.Y + end.Y) / 2 + bend);
+        var figure = new PathFigure { StartPoint = start, IsClosed = false };
+        figure.Segments.Add(new QuadraticBezierSegment { Point1 = control, Point2 = end });
+        var geometry = new PathGeometry();
+        geometry.Figures.Add(figure);
+        return geometry;
+    }
+
+    private static Windows.UI.Color StatusColor(string status) => status.ToLowerInvariant() switch
+    {
+        "succeeded" or "live" => Windows.UI.Color.FromArgb(230, 74, 196, 120),
+        "failed" => Windows.UI.Color.FromArgb(230, 240, 104, 104),
+        "running" or "working" => Windows.UI.Color.FromArgb(230, 247, 190, 76),
+        "queued" or "starting" => Windows.UI.Color.FromArgb(230, 105, 175, 245),
+        _ => Windows.UI.Color.FromArgb(210, 150, 165, 180),
+    };
 
     private void StopAnimations()
     {
@@ -268,6 +334,7 @@ internal static class NativeQuotaClient
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var input = JsonSerializer.Serialize(new
         {
+            codexSessionsPath = IOPath.Combine(profile, ".codex", "sessions"),
             claudeCredentialPath = IOPath.Combine(profile, ".claude", ".credentials.json"),
             grokAuthPath = IOPath.Combine(profile, ".grok", "auth.json"),
             now = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -323,11 +390,28 @@ internal static class NativeQuotaClient
             var result = new List<QuotaCardViewModel>();
             foreach (var card in cards.EnumerateArray())
             {
+                var clientId = card.TryGetProperty("clientId", out var clientValue)
+                    ? clientValue.GetString() ?? "provider"
+                    : "provider";
                 var state = card.TryGetProperty("state", out var stateValue)
                     ? stateValue.GetString() ?? "stale"
                     : "stale";
                 if (!card.TryGetProperty("windows", out var windows))
                 {
+                    continue;
+                }
+                if (windows.GetArrayLength() == 0)
+                {
+                    var diagnostic = card.TryGetProperty("diagnostic", out var diagnosticValue)
+                        ? diagnosticValue.GetString() ?? "no quota data"
+                        : "no quota data";
+                    result.Add(new QuotaCardViewModel
+                    {
+                        Label = $"{clientId} quota",
+                        UsedPercent = 0,
+                        ResetText = "Reset time unavailable",
+                        StateText = $"{state.ToLowerInvariant()}: {diagnostic}",
+                    });
                     continue;
                 }
                 foreach (var window in windows.EnumerateArray())
@@ -343,9 +427,9 @@ internal static class NativeQuotaClient
                         : "Reset time unavailable";
                     result.Add(new QuotaCardViewModel
                     {
-                        Label = label,
+                        Label = $"{clientId} - {label}",
                         UsedPercent = Math.Clamp(used, 0, 100),
-                        ResetText = reset,
+                        ResetText = FormatReset(reset),
                         StateText = state.Equals("fresh", StringComparison.OrdinalIgnoreCase)
                             ? "fresh"
                             : "stale",
@@ -358,5 +442,20 @@ internal static class NativeQuotaClient
         {
             return [];
         }
+    }
+
+    private static string FormatReset(string value)
+    {
+        if (long.TryParse(value, out var epoch))
+        {
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(epoch).ToLocalTime().ToString("g");
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+            }
+        }
+        return string.IsNullOrWhiteSpace(value) ? "Reset time unavailable" : value;
     }
 }

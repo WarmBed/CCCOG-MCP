@@ -20,6 +20,11 @@ public sealed class GraphEdgeViewModel
     public required string Kind { get; init; }
     public string TaskSummary { get; init; } = "";
     public string Status { get; init; } = "unknown";
+    public int Count { get; init; } = 1;
+    public bool IsActive { get; init; }
+    public DateTimeOffset? UpdatedAt { get; init; }
+    public IReadOnlyList<string> DetailSummaries { get; init; } = [];
+    public string BadgeText => Count > 1 ? $"×{Count}" : string.Empty;
 }
 
 public sealed class QuotaCardViewModel
@@ -42,10 +47,14 @@ internal sealed class LocalSnapshotReader
             "CCCG", "dispatch");
     }
 
-    public (IReadOnlyList<GraphNodeViewModel> Nodes, IReadOnlyList<GraphEdgeViewModel> Edges, int Jobs) Read(string provider)
+    public (IReadOnlyList<GraphNodeViewModel> Nodes, IReadOnlyList<GraphEdgeViewModel> Edges, int Jobs) Read(
+        string provider,
+        string timeFilter = "2h",
+        DateTimeOffset? now = null)
     {
         var nodes = new Dictionary<string, GraphNodeViewModel>(StringComparer.Ordinal);
         var edges = new List<GraphEdgeViewModel>();
+        var referenceTime = now ?? DateTimeOffset.Now;
         var jobsRoot = Path.Combine(_dispatchRoot, "jobs");
         if (!Directory.Exists(jobsRoot))
         {
@@ -71,6 +80,15 @@ internal sealed class LocalSnapshotReader
                 var sessionId = String(root, "sessionId") ?? String(root, "requestedSessionId") ?? "unknown";
                 var target = $"{jobProvider}:{sessionId}";
                 var status = String(root, "status") ?? "unknown";
+                var updatedAt = ParseTime(root, "finishedAt") ??
+                                ParseTime(root, "startedAt") ??
+                                ParseTime(root, "createdAt") ??
+                                File.GetLastWriteTimeUtc(statusPath);
+                var active = IsActive(status);
+                if (!ShouldInclude(timeFilter, active, updatedAt, referenceTime))
+                {
+                    continue;
+                }
                 if (!nodes.ContainsKey(target))
                 {
                     nodes[target] = new GraphNodeViewModel
@@ -95,6 +113,8 @@ internal sealed class LocalSnapshotReader
                     Id = $"job:{jobId}", SourceNodeId = source, TargetNodeId = target,
                     Kind = "dispatch", TaskSummary = summary,
                     Status = status,
+                    Count = 1, IsActive = active, UpdatedAt = updatedAt,
+                    DetailSummaries = summary.Length == 0 ? [] : [summary],
                 });
             }
             catch (IOException)
@@ -146,6 +166,7 @@ internal sealed class LocalSnapshotReader
                     {
                         Id = ownerId, SourceNodeId = ownerId, TargetNodeId = target,
                         Kind = "path_a_owner", TaskSummary = "PATH A owner", Status = "live",
+                        IsActive = true, DetailSummaries = ["PATH A owner"],
                     });
                 }
                 catch (IOException)
@@ -156,7 +177,8 @@ internal sealed class LocalSnapshotReader
                 }
             }
         }
-        return (nodes.Values.ToArray(), edges, edges.Count);
+        var reduced = ReduceEdges(edges);
+        return (nodes.Values.ToArray(), reduced, reduced.Count);
     }
 
     private static string? String(JsonElement root, string name) =>
@@ -181,5 +203,71 @@ internal sealed class LocalSnapshotReader
         {
             return "";
         }
+    }
+
+    private static DateTimeOffset? ParseTime(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+        return DateTimeOffset.TryParse(value.GetString(), out var parsed) ? parsed : null;
+    }
+
+    private static bool IsActive(string status) => status.Equals("running", StringComparison.OrdinalIgnoreCase) ||
+                                                   status.Equals("queued", StringComparison.OrdinalIgnoreCase) ||
+                                                   status.Equals("starting", StringComparison.OrdinalIgnoreCase) ||
+                                                   status.Equals("working", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldInclude(
+        string filter,
+        bool active,
+        DateTimeOffset updatedAt,
+        DateTimeOffset now)
+    {
+        if (filter.Equals("all", StringComparison.OrdinalIgnoreCase) || active)
+        {
+            return true;
+        }
+        var window = filter.Equals("24h", StringComparison.OrdinalIgnoreCase)
+            ? TimeSpan.FromHours(24)
+            : TimeSpan.FromHours(2);
+        return now - updatedAt.ToLocalTime() <= window;
+    }
+
+    private static IReadOnlyList<GraphEdgeViewModel> ReduceEdges(IEnumerable<GraphEdgeViewModel> input)
+    {
+        var dispatch = input.Where(edge => edge.Kind == "dispatch").ToList();
+        var owners = input.Where(edge => edge.Kind != "dispatch").ToList();
+        var reduced = new List<GraphEdgeViewModel>();
+        foreach (var active in dispatch.Where(edge => edge.IsActive))
+        {
+            reduced.Add(active);
+        }
+        foreach (var group in dispatch.Where(edge => !edge.IsActive)
+                     .GroupBy(edge => (edge.SourceNodeId, edge.TargetNodeId)))
+        {
+            var items = group.OrderByDescending(edge => edge.UpdatedAt).ToList();
+            if (items.Count == 1)
+            {
+                reduced.Add(items[0]);
+                continue;
+            }
+            var latest = items[0];
+            reduced.Add(new GraphEdgeViewModel
+            {
+                Id = $"aggregate:{group.Key.SourceNodeId}->{group.Key.TargetNodeId}",
+                SourceNodeId = group.Key.SourceNodeId,
+                TargetNodeId = group.Key.TargetNodeId,
+                Kind = "dispatch",
+                TaskSummary = latest.TaskSummary,
+                Status = latest.Status,
+                Count = items.Count,
+                UpdatedAt = latest.UpdatedAt,
+                DetailSummaries = items.SelectMany(edge => edge.DetailSummaries).ToArray(),
+            });
+        }
+        reduced.AddRange(owners);
+        return reduced.OrderBy(edge => edge.SourceNodeId).ThenBy(edge => edge.TargetNodeId).ThenBy(edge => edge.Id).ToArray();
     }
 }
