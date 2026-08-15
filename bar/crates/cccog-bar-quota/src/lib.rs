@@ -51,6 +51,11 @@ pub struct QuotaCards {
     pub state: QuotaState,
     pub observed_at: Option<u64>,
     pub diagnostic: Option<String>,
+    /// Set only on an HTTP 429 that carried a `Retry-After` header (seconds
+    /// form) — the caller's backoff scheduling honors this over its own
+    /// default when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +70,10 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
+    /// Parsed `Retry-After` response header, seconds form only (an
+    /// HTTP-date form parses to `None` — the caller's own default backoff
+    /// applies instead, never a guess at the date's meaning).
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl HttpResponse {
@@ -72,6 +81,15 @@ impl HttpResponse {
         Self {
             status,
             body: body.to_owned(),
+            retry_after_seconds: None,
+        }
+    }
+
+    pub fn json_with_retry_after(status: u16, body: &str, retry_after_seconds: u64) -> Self {
+        Self {
+            status,
+            body: body.to_owned(),
+            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 }
@@ -237,6 +255,7 @@ pub fn parse_codex_rate_limits(input: &str) -> Result<QuotaCards, String> {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        retry_after_seconds: None,
     })
 }
 
@@ -381,7 +400,7 @@ pub fn fetch_claude_quota<C: HttpClient>(
         return Some(unavailable("claude", "OAuth token is inference-only"));
     }
     if response.status != 200 {
-        return Some(stale("claude", format!("HTTP {}", response.status)));
+        return Some(stale_rate_limited("claude", response.status, response.retry_after_seconds));
     }
     let Ok(value) = serde_json::from_str::<Value>(&response.body) else {
         return Some(stale("claude", "quota response malformed"));
@@ -396,6 +415,7 @@ pub fn fetch_claude_quota<C: HttpClient>(
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        retry_after_seconds: None,
     })
 }
 
@@ -411,7 +431,7 @@ pub fn fetch_grok_quota<C: HttpClient>(client: &mut C, token: Option<&str>) -> O
         return Some(stale("grok", "quota request failed"));
     };
     if response.status != 200 {
-        return Some(stale("grok", format!("HTTP {}", response.status)));
+        return Some(stale_rate_limited("grok", response.status, response.retry_after_seconds));
     }
     let Ok(value) = serde_json::from_str::<Value>(&response.body) else {
         return Some(stale("grok", "quota response malformed"));
@@ -425,6 +445,7 @@ pub fn fetch_grok_quota<C: HttpClient>(client: &mut C, token: Option<&str>) -> O
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        retry_after_seconds: None,
     })
 }
 
@@ -489,6 +510,18 @@ fn stale(client_id: &str, diagnostic: impl Into<String>) -> QuotaCards {
         state: QuotaState::Stale,
         observed_at: None,
         diagnostic: Some(diagnostic.into()),
+        retry_after_seconds: None,
+    }
+}
+
+/// Same as `stale`, but carries the response's `Retry-After` (when the
+/// caller sent one) so a backoff scheduler downstream can honor it instead
+/// of guessing a default wait — only meaningful for the caller when
+/// `status == 429`, but harmless to attach for any non-200.
+fn stale_rate_limited(client_id: &str, status: u16, retry_after_seconds: Option<u64>) -> QuotaCards {
+    QuotaCards {
+        retry_after_seconds,
+        ..stale(client_id, format!("HTTP {status}"))
     }
 }
 
@@ -499,6 +532,7 @@ fn unavailable(client_id: &str, diagnostic: impl Into<String>) -> QuotaCards {
         state: QuotaState::Unavailable,
         observed_at: None,
         diagnostic: Some(diagnostic.into()),
+        retry_after_seconds: None,
     }
 }
 

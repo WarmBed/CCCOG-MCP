@@ -1,7 +1,9 @@
 use cccog_bar_core::graph::{build_snapshot, DispatchRecord, GraphInput};
 use cccog_bar_ffi::{
-    enrich_quota_cards, envelope_from_json, envelope_from_parts, BackgroundQuotaPoller,
-    CCCOG_BAR_SCHEMA_VERSION,
+    enrich_quota_cards, envelope_from_json, envelope_from_parts, postprocess_http_provider,
+    precheck_http_provider, render_with_cache_fallback, BackgroundQuotaPoller,
+    QuotaResilienceCache, CCCOG_BAR_SCHEMA_VERSION, CLAUDE_GROK_TTL_SECS,
+    MANUAL_REFRESH_MIN_INTERVAL_SECS,
 };
 use cccog_bar_quota::{QuotaCards, QuotaState, QuotaWindow};
 use serde_json::Value;
@@ -92,6 +94,7 @@ fn synthetic_quota_cards() -> Vec<QuotaCards> {
             state: QuotaState::Unavailable,
             observed_at: None,
             diagnostic: Some("Codex rollout rate_limits not found in bounded tails".to_owned()),
+            retry_after_seconds: None,
         },
         QuotaCards {
             client_id: "claude".to_owned(),
@@ -99,6 +102,7 @@ fn synthetic_quota_cards() -> Vec<QuotaCards> {
             state: QuotaState::Stale,
             observed_at: None,
             diagnostic: Some("HTTP 401".to_owned()),
+            retry_after_seconds: None,
         },
         QuotaCards {
             client_id: "grok".to_owned(),
@@ -106,6 +110,7 @@ fn synthetic_quota_cards() -> Vec<QuotaCards> {
             state: QuotaState::Unavailable,
             observed_at: None,
             diagnostic: Some("Grok auth credential not found".to_owned()),
+            retry_after_seconds: None,
         },
     ]
 }
@@ -162,6 +167,7 @@ fn codex_card(observed_at_ms: Option<u64>) -> QuotaCards {
         state: QuotaState::Fresh,
         observed_at: observed_at_ms,
         diagnostic: None,
+        retry_after_seconds: None,
     }
 }
 
@@ -292,6 +298,7 @@ fn job_failure_override_applies_to_grok_and_is_skipped_without_a_match() {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        retry_after_seconds: None,
     };
     let overridden = enrich_quota_cards(vec![grok_card.clone()], Some(root.path()), NOW_SECONDS);
     assert_eq!(overridden[0].windows[0].used_percent, 100.0);
@@ -337,6 +344,7 @@ fn job_failure_override_is_scoped_to_codex_and_grok_only() {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        retry_after_seconds: None,
     };
     let result = enrich_quota_cards(vec![claude_card], Some(root.path()), NOW_SECONDS);
     assert_eq!(result[0].windows[0].used_percent, 6.0, "claude is out of scope for this cross-check");
@@ -401,4 +409,137 @@ fn control_snapshot_json_windows_and_aggregates_a_real_dispatch_root() {
         serde_json::from_str(unsafe { CStr::from_ptr(null) }.to_str().unwrap()).unwrap();
     assert_eq!(error["ok"], false);
     unsafe { cccog_bar_ffi::cccog_bar_free_string(null) };
+}
+
+// ── HTTP quota resilience: TTL cache, stale-on-failure fallback, backoff ──
+
+fn fresh_claude_card() -> QuotaCards {
+    QuotaCards {
+        client_id: "claude".to_owned(),
+        windows: vec![QuotaWindow {
+            card_id: "five_hour".to_owned(),
+            label: "Five hour".to_owned(),
+            used_percent: 6.0,
+            remaining_percent: 94.0,
+            resets_at: None,
+        }],
+        state: QuotaState::Fresh,
+        observed_at: None,
+        diagnostic: None,
+        retry_after_seconds: None,
+    }
+}
+
+fn failed_429_card(retry_after_seconds: Option<u64>) -> QuotaCards {
+    QuotaCards {
+        client_id: "claude".to_owned(),
+        windows: vec![],
+        state: QuotaState::Stale,
+        observed_at: None,
+        diagnostic: Some("HTTP 429".to_owned()),
+        retry_after_seconds,
+    }
+}
+
+#[test]
+fn cached_fallback_render_keeps_bars_and_labels_stale_with_the_cached_time() {
+    // Exactly the operator's screenshot: a 429 must not wipe the five-hour/
+    // seven-day bars — the last successful card renders unchanged, relabeled.
+    let cache = QuotaResilienceCache::empty().with_success("claude", fresh_claude_card(), 1786795200);
+    let rendered = render_with_cache_fallback("claude", "HTTP 429", &cache, 1786795320);
+    assert_eq!(rendered.state, QuotaState::Stale);
+    assert_eq!(rendered.windows.len(), 1, "bars must survive the failure");
+    assert_eq!(rendered.windows[0].used_percent, 6.0, "the cached value, unchanged");
+    assert_eq!(
+        rendered.diagnostic.as_deref(),
+        Some("stale · HTTP 429 · data from 12:00")
+    );
+}
+
+#[test]
+fn never_succeeded_case_renders_the_bare_failure_not_a_fabricated_cache_hit() {
+    let cache = QuotaResilienceCache::empty(); // no prior success recorded
+    let rendered = render_with_cache_fallback("claude", "HTTP 429", &cache, 1786795200);
+    assert_eq!(rendered.state, QuotaState::Unavailable);
+    assert!(rendered.windows.is_empty());
+    assert_eq!(rendered.diagnostic.as_deref(), Some("HTTP 429"));
+}
+
+#[test]
+fn postprocess_success_populates_the_cache_and_clears_any_backoff() {
+    let mut cache = QuotaResilienceCache::empty().with_backoff("claude", 1786795500, "HTTP 429");
+    let rendered = postprocess_http_provider("claude", fresh_claude_card(), &mut cache, 1786795200);
+    assert_eq!(rendered.state, QuotaState::Fresh);
+    assert!(!cache.is_backed_off("claude", 1786795200), "success clears the backoff");
+    // The cache now has a success to fall back to on a later failure.
+    let later = render_with_cache_fallback("claude", "timeout", &cache, 1786795500);
+    assert_eq!(later.windows.len(), 1);
+}
+
+#[test]
+fn postprocess_429_schedules_backoff_honoring_retry_after_else_five_minutes() {
+    let mut with_header = QuotaResilienceCache::empty();
+    postprocess_http_provider("claude", failed_429_card(Some(120)), &mut with_header, 1786795200);
+    assert!(with_header.is_backed_off("claude", 1786795200 + 119));
+    assert!(!with_header.is_backed_off("claude", 1786795200 + 121), "honors the header's 120s, not the 300s default");
+
+    let mut without_header = QuotaResilienceCache::empty();
+    postprocess_http_provider("claude", failed_429_card(None), &mut without_header, 1786795200);
+    assert!(without_header.is_backed_off("claude", 1786795200 + 299));
+    assert!(!without_header.is_backed_off("claude", 1786795200 + 301), "defaults to 5 minutes");
+}
+
+#[test]
+fn postprocess_non_429_failure_never_schedules_a_backoff() {
+    let mut cache = QuotaResilienceCache::empty();
+    let timeout_card = QuotaCards {
+        diagnostic: Some("quota request failed".to_owned()),
+        ..failed_429_card(None)
+    };
+    postprocess_http_provider("claude", timeout_card, &mut cache, 1786795200);
+    assert!(!cache.is_backed_off("claude", 1786795200), "a timeout isn't a rate-limit signal");
+}
+
+#[test]
+fn precheck_backoff_wins_over_the_ttl_and_renders_the_stale_fallback() {
+    let cache = QuotaResilienceCache::empty()
+        .with_success("claude", fresh_claude_card(), 1786794000)
+        .with_backoff("claude", 1786795500, "HTTP 429")
+        .with_last_attempt("claude", 1786795000);
+    let skip = precheck_http_provider("claude", false, &cache, 1786795100);
+    let card = skip.expect("an active backoff must skip the network");
+    assert_eq!(card.state, QuotaState::Stale);
+    assert_eq!(card.windows.len(), 1, "still shows the cached bars while backed off");
+}
+
+#[test]
+fn precheck_auto_tick_honors_the_300s_ttl_manual_bypasses_but_is_capped_at_60s() {
+    let cache = QuotaResilienceCache::empty()
+        .with_success("claude", fresh_claude_card(), 1786795000)
+        .with_last_attempt("claude", 1786795000);
+
+    // Automatic tick well inside the 300s TTL: served from cache, no fetch.
+    let auto_hit = precheck_http_provider("claude", false, &cache, 1786795000 + 100);
+    assert!(auto_hit.is_some(), "inside TTL: cache hit, no network");
+    assert_eq!(auto_hit.unwrap().state, QuotaState::Fresh, "a TTL hit is not a stale render");
+
+    // Automatic tick at/after the 300s TTL: must fetch again.
+    let auto_expired = precheck_http_provider("claude", false, &cache, 1786795000 + CLAUDE_GROK_TTL_SECS);
+    assert!(auto_expired.is_none(), "TTL expired: go fetch");
+
+    // Manual click 30s after the last attempt: still rate-limited to 60s.
+    let manual_too_soon = precheck_http_provider("claude", true, &cache, 1786795000 + 30);
+    assert!(manual_too_soon.is_some(), "manual bypass is capped at 60s, not instant");
+
+    // Manual click 60s after the last attempt: allowed through, even though
+    // the 300s auto TTL hasn't expired.
+    let manual_allowed = precheck_http_provider("claude", true, &cache, 1786795000 + MANUAL_REFRESH_MIN_INTERVAL_SECS);
+    assert!(manual_allowed.is_none(), "manual bypass reaches the network at 60s");
+}
+
+#[test]
+fn precheck_never_attempted_always_goes_to_the_network() {
+    let cache = QuotaResilienceCache::empty();
+    assert!(precheck_http_provider("claude", false, &cache, 1786795200).is_none());
+    assert!(precheck_http_provider("claude", true, &cache, 1786795200).is_none());
 }

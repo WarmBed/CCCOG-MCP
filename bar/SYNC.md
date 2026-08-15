@@ -121,3 +121,52 @@ corrected (a second, independently-discovered real failure, job
 `20260815T045341Z_c0d1a224`: `stdout.log` carried `"API error (status 402
 Payment Required): Grok Build usage balance exhausted"`, no date present, so
 `"resets unknown"`).
+
+## 2026-08-16 quota HTTP resilience: cache, stale-on-failure, TTL, backoff
+
+A live HTTP 429 on claude's `oauth/usage` endpoint wiped its card down to a
+bare `"claude / HTTP 429"` — the five-hour/seven-day bars vanished, breaking
+the stale-on-failure rule the rest of this shell already follows for
+file-based quota. Root cause: claude/grok were polled live over HTTP on
+every refresh (~60s, plus repeated app relaunches during testing) with no
+cache, and no throttling — self-inflicted rate-limiting.
+
+Fixed in `cccog-bar-ffi` (a new module in `src/lib.rs`, not a separate
+file — see its own header comment) with two upstream-derived pieces:
+
+- **TTL layering**, adopted from TokenBar-Windows' actual behavior
+  (`crates/tb_core_ffi/src/agent_usage.rs`'s `CLAUDE_HEADER_TTL_SECS`):
+  TokenBar does not hit its quota HTTP endpoints on every UI tick — a
+  successful Claude fetch is cached for 300 seconds, with the UI's own
+  refresh only re-reading local files in between. `precheck_http_provider`
+  reproduces the same layering: claude/grok live fetches sit behind a 300s
+  TTL; the manual Refresh button may bypass the TTL but is itself capped to
+  once per 60s (`MANUAL_REFRESH_MIN_INTERVAL_SECS`) — threaded from a new
+  `manual` field on the FFI's quota-poll input, set only by
+  `DashboardView`'s Refresh-button click (`FlyoutWindow.xaml.cs`). Codex is
+  unaffected — it was already a local file-tail read, not an HTTP call, so
+  it stays on the 60s UI tick.
+- **Stale-on-failure + backoff**: `postprocess_http_provider` caches the
+  last successful card per provider (`QuotaResilienceCache.last_success`,
+  mirrored to `%LOCALAPPDATA%\CCCG\bar-quota-cache.json` so a fresh app
+  launch right after a 429 still shows real numbers, not a blank card).
+  Any non-Fresh result renders via `render_with_cache_fallback`: the cached
+  bars/values unchanged, relabeled `"stale · {reason} · data from HH:MM"` —
+  the bare failure only ever shows when there has never been a successful
+  fetch. An HTTP 429 additionally schedules a backoff
+  (`QuotaResilienceCache.backoff`), honoring the response's `Retry-After`
+  header (`HttpResponse.retry_after_seconds`, new) when present, else
+  defaulting to 5 minutes; a timeout or other non-429 failure does not
+  trigger a backoff (only a 429 explicitly says "wait").
+
+Verified end to end against a real, live 429 (not a synthetic fixture) by
+relaunching the built app: the claude card rendered
+
+```
+five hour   13% used   stale · HTTP 429 · data from 20:26
+seven day   100% used  stale · HTTP 429 · data from 20:26
+```
+
+with the exact bars/percentages from the previous successful fetch — loaded
+from `bar-quota-cache.json` on a brand-new process, confirming the disk
+persistence path, not just the in-memory one.

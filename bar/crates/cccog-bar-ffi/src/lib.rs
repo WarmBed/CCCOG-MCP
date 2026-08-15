@@ -165,10 +165,22 @@ impl HttpClient for ReqwestHttpClient {
             .send()
             .map_err(|error| format!("HTTP request failed: {error}"))?;
         let status = response.status().as_u16();
+        // Seconds form only ("Retry-After: 120"); the HTTP-date form parses
+        // to None and the caller's own default backoff applies instead —
+        // never a guess at what a date string means.
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.trim().parse::<u64>().ok());
         let body = response
             .text()
             .map_err(|error| format!("HTTP body failed: {error}"))?;
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            retry_after_seconds,
+        })
     }
 }
 
@@ -254,6 +266,7 @@ fn diagnostic_card(client_id: &str, state: QuotaState, diagnostic: String) -> Qu
         state,
         observed_at: None,
         diagnostic: Some(diagnostic),
+        retry_after_seconds: None,
     }
 }
 
@@ -455,6 +468,7 @@ fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> 
         state: QuotaState::Stale,
         observed_at: card.observed_at,
         diagnostic: Some(diagnostic),
+        retry_after_seconds: None,
     }
 }
 
@@ -488,6 +502,270 @@ pub fn enrich_quota_cards(
             }
         })
         .collect()
+}
+
+// ── HTTP quota resilience: TTL cache, stale-on-failure fallback, 429 backoff ──
+//
+// Two problems observed on the operator's machine, both from claude/grok
+// being polled live over HTTP on every refresh (every ~60s, including
+// repeated app relaunches during testing):
+//
+// 1. A transient failure (HTTP 429) wiped the card down to a bare error —
+//    the five-hour/seven-day bars vanished instead of staying on screen
+//    with a "this might be stale" note. Fixed by caching the last
+//    successful card per provider (`last_success`, persisted to
+//    `%LOCALAPPDATA%\CCCG\bar-quota-cache.json` so even a fresh app launch
+//    right after a 429 still shows real numbers) and rendering it labeled
+//    stale on any non-Fresh result, instead of the bare failure — the bare
+//    failure only ever shows when there has never been a successful fetch.
+// 2. The 429 itself was self-inflicted: TokenBar-Windows (the reference
+//    this shell was derived from) does not hit its quota HTTP endpoints on
+//    every UI tick — `agent_usage.rs`'s `CLAUDE_HEADER_TTL_SECS` caches a
+//    successful Claude fetch for 300 seconds, with the UI's own refresh
+//    tick only re-reading local files in between. This module adopts the
+//    same layering: claude/grok live fetches sit behind a 300s TTL
+//    (`CLAUDE_GROK_TTL_SECS`); the manual Refresh button may bypass the
+//    TTL but is itself rate-limited to once per 60s
+//    (`MANUAL_REFRESH_MIN_INTERVAL_SECS`); an active 429 backoff always
+//    wins over both. Codex is unaffected — it was already a local
+//    file-tail read, not an HTTP call, so it stays on the 60s UI tick.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// TokenBar's `CLAUDE_HEADER_TTL_SECS` (`agent_usage.rs`) — a UI refresh
+/// inside this window serves the cached result, no network.
+pub const CLAUDE_GROK_TTL_SECS: u64 = 300;
+/// The manual Refresh button may bypass the TTL above, but never more than
+/// once per minute.
+pub const MANUAL_REFRESH_MIN_INTERVAL_SECS: u64 = 60;
+/// Default 429 backoff when the response carried no `Retry-After` header.
+pub const DEFAULT_QUOTA_BACKOFF_SECS: u64 = 5 * 60;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedQuotaSuccess {
+    card: QuotaCards,
+    fetched_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QuotaBackoff {
+    until: u64,
+    reason: String,
+}
+
+/// All in-memory except `last_success`, which is also mirrored to disk (see
+/// [`load_persisted_cache`]/[`save_persisted_cache`]) so a card that has
+/// ever succeeded never regresses to a bare error again, even across a
+/// fresh app launch.
+#[derive(Default)]
+pub struct QuotaResilienceCache {
+    last_success: HashMap<String, CachedQuotaSuccess>,
+    backoff: HashMap<String, QuotaBackoff>,
+    /// Last time a REAL network attempt was made for this provider (success
+    /// or failure) — what the TTL/manual-interval gate measures from. Never
+    /// updated by a cache-hit (skipped) round.
+    last_attempt_at: HashMap<String, u64>,
+}
+
+impl QuotaResilienceCache {
+    /// Empty cache — production starts from [`load_persisted_cache`]
+    /// instead; this is the test-fixture entry point (no disk access).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn with_success(mut self, client_id: &str, card: QuotaCards, fetched_at: u64) -> Self {
+        self.last_success
+            .insert(client_id.to_owned(), CachedQuotaSuccess { card, fetched_at });
+        self
+    }
+
+    pub fn with_backoff(mut self, client_id: &str, until: u64, reason: &str) -> Self {
+        self.backoff.insert(
+            client_id.to_owned(),
+            QuotaBackoff {
+                until,
+                reason: reason.to_owned(),
+            },
+        );
+        self
+    }
+
+    pub fn with_last_attempt(mut self, client_id: &str, at: u64) -> Self {
+        self.last_attempt_at.insert(client_id.to_owned(), at);
+        self
+    }
+
+    pub fn is_backed_off(&self, client_id: &str, now: u64) -> bool {
+        self.backoff.get(client_id).is_some_and(|backoff| now < backoff.until)
+    }
+}
+
+fn quota_cache_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|base| base.join("CCCG").join("bar-quota-cache.json"))
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedQuotaCache {
+    #[serde(default)]
+    last_success: HashMap<String, CachedQuotaSuccess>,
+}
+
+fn load_persisted_cache() -> HashMap<String, CachedQuotaSuccess> {
+    let Some(path) = quota_cache_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<PersistedQuotaCache>(&raw)
+        .map(|persisted| persisted.last_success)
+        .unwrap_or_default()
+}
+
+fn save_persisted_cache(last_success: &HashMap<String, CachedQuotaSuccess>) {
+    let Some(path) = quota_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(&PersistedQuotaCache {
+        last_success: last_success.clone(),
+    }) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn quota_resilience_cache() -> &'static Mutex<QuotaResilienceCache> {
+    static CACHE: OnceLock<Mutex<QuotaResilienceCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(QuotaResilienceCache {
+            last_success: load_persisted_cache(),
+            ..QuotaResilienceCache::default()
+        })
+    })
+}
+
+fn is_http_429(card: &QuotaCards) -> bool {
+    card.state != QuotaState::Fresh
+        && card
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("HTTP 429"))
+}
+
+/// Stale-on-failure render: the cached bars/values unchanged, relabeled
+/// stale with the failure reason and the cached fetch's own time — or, when
+/// there has never been a successful fetch for this provider, the bare
+/// failure (nothing to fall back to). Public so tests can exercise both
+/// branches directly.
+pub fn render_with_cache_fallback(
+    client_id: &str,
+    reason: &str,
+    cache: &QuotaResilienceCache,
+    _now: u64,
+) -> QuotaCards {
+    match cache.last_success.get(client_id) {
+        Some(cached) => {
+            let time_text = DateTime::<Utc>::from_timestamp(cached.fetched_at as i64, 0)
+                .map(|value| value.format("%H:%M").to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            QuotaCards {
+                client_id: client_id.to_owned(),
+                windows: cached.card.windows.clone(),
+                state: QuotaState::Stale,
+                observed_at: cached.card.observed_at,
+                diagnostic: Some(format!("stale · {reason} · data from {time_text}")),
+                retry_after_seconds: None,
+            }
+        }
+        None => QuotaCards {
+            client_id: client_id.to_owned(),
+            windows: Vec::new(),
+            state: QuotaState::Unavailable,
+            observed_at: None,
+            diagnostic: Some(reason.to_owned()),
+            retry_after_seconds: None,
+        },
+    }
+}
+
+/// Before attempting a live fetch: `Some(card)` means skip the network this
+/// round and render `card` instead (an active 429 backoff, or a quiet TTL
+/// cache hit reusing the last successful card unchanged); `None` means go
+/// ahead and fetch. Public so tests can exercise the TTL/manual-interval/
+/// backoff gate directly, without a real HTTP client.
+pub fn precheck_http_provider(
+    client_id: &str,
+    manual: bool,
+    cache: &QuotaResilienceCache,
+    now: u64,
+) -> Option<QuotaCards> {
+    if let Some(backoff) = cache.backoff.get(client_id) {
+        if now < backoff.until {
+            return Some(render_with_cache_fallback(client_id, &backoff.reason, cache, now));
+        }
+    }
+    let min_interval = if manual {
+        MANUAL_REFRESH_MIN_INTERVAL_SECS
+    } else {
+        CLAUDE_GROK_TTL_SECS
+    };
+    let within_ttl = cache
+        .last_attempt_at
+        .get(client_id)
+        .is_some_and(|&last| now.saturating_sub(last) < min_interval);
+    if within_ttl {
+        // Quiet cache hit — no attempt was made and nothing failed, so this
+        // is NOT a "stale" render, just TokenBar-style TTL reuse.
+        return cache.last_success.get(client_id).map(|cached| cached.card.clone());
+    }
+    None
+}
+
+/// After a live fetch attempt: update the cache (success clears backoff and
+/// records the new snapshot; an HTTP 429 schedules a backoff, honoring
+/// `Retry-After` when the response carried one) and return the card to
+/// render — the fresh card on success, a stale-on-failure render otherwise.
+/// Public so tests can exercise backoff scheduling directly.
+pub fn postprocess_http_provider(
+    client_id: &str,
+    card: QuotaCards,
+    cache: &mut QuotaResilienceCache,
+    now: u64,
+) -> QuotaCards {
+    cache.last_attempt_at.insert(client_id.to_owned(), now);
+    if card.state == QuotaState::Fresh {
+        cache.last_success.insert(
+            client_id.to_owned(),
+            CachedQuotaSuccess {
+                card: card.clone(),
+                fetched_at: now,
+            },
+        );
+        cache.backoff.remove(client_id);
+        return card;
+    }
+    if is_http_429(&card) {
+        let wait = card
+            .retry_after_seconds
+            .filter(|&seconds| seconds > 0)
+            .unwrap_or(DEFAULT_QUOTA_BACKOFF_SECS);
+        cache.backoff.insert(
+            client_id.to_owned(),
+            QuotaBackoff {
+                until: now + wait,
+                reason: card.diagnostic.clone().unwrap_or_else(|| "HTTP 429".to_owned()),
+            },
+        );
+    }
+    let reason = card.diagnostic.clone().unwrap_or_else(|| "unavailable".to_owned());
+    render_with_cache_fallback(client_id, &reason, cache, now)
 }
 
 /// Background-safe coordinator for the shell.  The minimum is clamped by the
@@ -600,6 +878,11 @@ struct QuotaPollInput {
     /// backward compatible: omitting it just skips both enrichments (same
     /// output as before they existed).
     dispatch_jobs_path: Option<String>,
+    /// True only for the manual Refresh-button click — allowed to bypass
+    /// the 300s TTL, but still rate-limited to once per 60s. Absent/false
+    /// for the automatic timer tick (the common case).
+    #[serde(default)]
+    manual: bool,
     now: Option<u64>,
 }
 
@@ -609,12 +892,42 @@ pub fn poll_remote_quotas_json(input: &str) -> String {
         Err(error) => return error_json(format!("quota input is malformed: {error}")),
     };
     let now = parsed.now.unwrap_or(0);
-    let cards = poll_remote_quotas_with_codex(
+    let claude_path = parsed.claude_credential_path.as_deref().map(Path::new);
+    let grok_path = parsed.grok_auth_path.as_deref().map(Path::new);
+
+    let cache_lock = quota_resilience_cache();
+    let mut cache = cache_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Decide up front whether each HTTP-backed provider even attempts the
+    // network this round (TTL/manual-interval/backoff gate); a decision here
+    // means "skip — render this instead", `None` means "go fetch".
+    let claude_precheck =
+        claude_path.and_then(|_| precheck_http_provider("claude", parsed.manual, &cache, now));
+    let grok_precheck =
+        grok_path.and_then(|_| precheck_http_provider("grok", parsed.manual, &cache, now));
+
+    let raw_cards = poll_remote_quotas_with_codex(
         parsed.codex_sessions_path.as_deref().map(Path::new),
-        parsed.claude_credential_path.as_deref().map(Path::new),
-        parsed.grok_auth_path.as_deref().map(Path::new),
+        if claude_precheck.is_some() { None } else { claude_path },
+        if grok_precheck.is_some() { None } else { grok_path },
         now,
     );
+
+    let mut cards: Vec<QuotaCards> = Vec::with_capacity(raw_cards.len() + 2);
+    for card in raw_cards {
+        if card.client_id == "claude" || card.client_id == "grok" {
+            let client_id = card.client_id.clone();
+            cards.push(postprocess_http_provider(&client_id, card, &mut cache, now));
+        } else {
+            cards.push(card); // codex: file-based, untouched by this resilience layer
+        }
+    }
+    cards.extend(claude_precheck);
+    cards.extend(grok_precheck);
+
+    save_persisted_cache(&cache.last_success);
+    drop(cache);
+
     let cards = enrich_quota_cards(
         cards,
         parsed.dispatch_jobs_path.as_deref().map(Path::new),

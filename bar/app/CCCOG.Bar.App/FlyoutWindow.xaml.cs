@@ -48,7 +48,9 @@ public sealed partial class FlyoutWindow : Window
     {
         InitializeComponent();
 
-        Dashboard.RefreshRequested += RefreshView;
+        // Manual click: allowed to bypass the quota HTTP TTL (still capped
+        // to once per 60s on the Rust side) — see NativeQuotaClient.TryPoll.
+        Dashboard.RefreshRequested += () => RefreshView(manualQuota: true);
 
         var presenter = (OverlappedPresenter)AppWindow.Presenter;
         presenter.SetBorderAndTitleBar(false, false);
@@ -190,7 +192,7 @@ public sealed partial class FlyoutWindow : Window
     /// windowed/aggregated — see NativeControlClient below). Quota is
     /// kicked off separately and arrives async.
     /// </summary>
-    private void RefreshView()
+    private void RefreshView(bool manualQuota = false)
     {
         if (_closing || !_viewReady)
         {
@@ -200,10 +202,17 @@ public sealed partial class FlyoutWindow : Window
         var rows = NativeControlClient.TryFetch(out var visibleJobs);
         Dashboard.RenderFlow(rows, visibleJobs);
         Dashboard.SetRefreshedText($"refreshed {DateTime.Now:HH:mm:ss}");
-        RefreshQuotaCards();
+        RefreshQuotaCards(manualQuota);
     }
 
-    private void RefreshQuotaCards()
+    /// <summary>
+    /// <paramref name="manual"/> distinguishes the Refresh-button click from
+    /// the automatic timer tick / file-watcher debounce: claude/grok's live
+    /// HTTP fetch sits behind a 300s TTL on the Rust side (TokenBar's own
+    /// layering, agent_usage.rs's CLAUDE_HEADER_TTL_SECS) — a manual click
+    /// may bypass that TTL but is itself still capped to once per 60s.
+    /// </summary>
+    private void RefreshQuotaCards(bool manual = false)
     {
         if (_closing || Interlocked.Exchange(ref _quotaPollInFlight, 1) != 0)
         {
@@ -215,7 +224,7 @@ public sealed partial class FlyoutWindow : Window
             IReadOnlyList<QuotaCardViewModel> cards;
             try
             {
-                cards = NativeQuotaClient.TryPoll();
+                cards = NativeQuotaClient.TryPoll(manual);
             }
             catch (Exception exception)
             {
@@ -551,7 +560,7 @@ internal static class NativeQuotaClient
     [DllImport("cccog_bar_ffi", CallingConvention = CallingConvention.Cdecl)]
     private static extern void cccog_bar_free_string(IntPtr value);
 
-    public static IReadOnlyList<QuotaCardViewModel> TryPoll()
+    public static IReadOnlyList<QuotaCardViewModel> TryPoll(bool manual = false)
     {
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var input = JsonSerializer.Serialize(new
@@ -566,6 +575,10 @@ internal static class NativeQuotaClient
             dispatchJobsPath = IOPath.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "CCCG", "dispatch", "jobs"),
+            // True only for the Refresh-button click — see
+            // FlyoutWindow.RefreshQuotaCards and Rust's
+            // precheck_http_provider (the 300s TTL / 60s manual-bypass gate).
+            manual,
             now = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         });
         try
