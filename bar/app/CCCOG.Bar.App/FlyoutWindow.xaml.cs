@@ -3,25 +3,33 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
+using Windows.Graphics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using Windows.Graphics;
 using IOPath = System.IO.Path;
 
 namespace CCCOG.Bar.App;
 
 /// <summary>
-/// The slim CCCOG-Bar companion: a tray-anchored, Mica/Acrylic-backed
-/// flyout with exactly two sections — quota cards and flow rows. No tabs,
-/// charts, settings pages, or history parsing; see
-/// docs/plans/2026-08-16-cccog-bar-v2-slim.md for the performance contract
-/// this exists to keep (window visible &lt;1s cold; quota arrives async).
+/// The slim CCCOG-Bar companion: a tray-anchored flyout with exactly two
+/// sections — quota cards and flow rows. The window chrome (Acrylic
+/// backdrop, borderless/topmost popup style, taskbar-edge positioning,
+/// show/hide slide) is ported from TokenBar-Windows
+/// <c>src/TokenBar.App/FlyoutWindow.xaml.cs</c> — see bar/SYNC.md for the
+/// line-by-line derivation record and the named gaps (resize-drag
+/// persistence, the WH_MOUSE_LL wheel-focus workaround) that were left out
+/// because they depend on TokenBar features (a settings-backed store) this
+/// shell doesn't have. The content refresh/poll logic below the chrome
+/// section is CCCOG's own — see docs/plans/2026-08-16-cccog-bar-v2-slim.md
+/// for the performance contract it exists to keep (window visible &lt;1s
+/// cold; quota arrives async; no history parsing).
 /// </summary>
 public sealed partial class FlyoutWindow : Window
 {
     private const int FlyoutWidth = 500;
     private const int FlyoutHeight = 640;
     private const int Margin = 12;
+    private const int SlideDistance = 24;
 
     private readonly LocalSnapshotReader _reader = new();
     private readonly DispatcherQueueTimer _refreshTimer;
@@ -35,10 +43,13 @@ public sealed partial class FlyoutWindow : Window
     /// of InitializeComponent.</summary>
     private bool _viewReady;
     private bool _everHadQuota;
+    private bool _quotaTimerStarted;
 
     public FlyoutWindow()
     {
         InitializeComponent();
+
+        Dashboard.RefreshRequested += RefreshView;
 
         var presenter = (OverlappedPresenter)AppWindow.Presenter;
         presenter.SetBorderAndTitleBar(false, false);
@@ -46,15 +57,22 @@ public sealed partial class FlyoutWindow : Window
         presenter.IsMaximizable = false;
         presenter.IsMinimizable = false;
         presenter.IsAlwaysOnTop = true;
+
+        ApplyPopupChrome();
+
         AppWindow.IsShownInSwitchers = false;
         AppWindow.Closing += (_, args) =>
         {
             args.Cancel = true;
             HideFlyout();
         };
-        RefreshButton.Click += (_, _) => RefreshView();
 
-        SetupBackdrop();
+        WireResizeGripHover();
+
+        // Transient surface → Acrylic, via the manual controller so the
+        // backdrop stays translucent while unfocused: the flyout is a
+        // glanceable dashboard, not a focused editor.
+        SetupAlwaysOnAcrylic();
 
         _refreshTimer = DispatcherQueue.CreateTimer();
         _refreshTimer.Interval = TimeSpan.FromMilliseconds(250);
@@ -72,13 +90,15 @@ public sealed partial class FlyoutWindow : Window
             _watcher?.Dispose();
             _refreshTimer.Stop();
             _quotaTimer.Stop();
+            _acrylic?.Dispose();
+            _acrylic = null;
         };
 
         // Deliberately do NOT read the dispatch root here: the constructor
         // must return so the caller can call AppWindow.Show() as early as
         // possible (performance contract: window visible < 1s cold). The
-        // file read — milliseconds, per docs/plans/2026-08-16-cccog-bar-v2-slim.md
-        // — happens once ShowFlyout() calls RefreshView() after Show().
+        // file read — milliseconds — happens once ShowFlyout() calls
+        // RefreshView() after Show().
         _viewReady = true;
         StartFileWatcher();
     }
@@ -97,7 +117,9 @@ public sealed partial class FlyoutWindow : Window
         }
     }
 
-    private bool _quotaTimerStarted;
+    private bool _hiding;
+    private long _slideToken;
+    private long _hideGeneration;
 
     public void ShowFlyout()
     {
@@ -105,11 +127,21 @@ public sealed partial class FlyoutWindow : Window
         {
             return;
         }
+
+        _hiding = false;
+        var (resting, start) = PositionNearTray();
+        // Start offset toward the taskbar edge so the WINDOW (backdrop
+        // included) slides in as one surface, TokenBar's entrance motion.
+        AppWindow.Move(start);
         AppWindow.Show();
-        PositionNearTray();
+        // Show can rebuild frame state; re-assert the chrome afterwards.
+        ApplyPopupChrome();
         AppWindow.MoveInZOrderAtTop();
         Activate();
         _ = SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
+        _ = SlideWindowAsync(start, resting, durationMs: 180, decelerate: true);
+        FadeContent(from: 0f, to: 1f, durationMs: 180);
+
         RefreshView();
         if (!_quotaTimerStarted)
         {
@@ -120,11 +152,35 @@ public sealed partial class FlyoutWindow : Window
 
     public void HideFlyout()
     {
-        if (!AppWindow.IsVisible)
+        if (_hiding || !AppWindow.IsVisible)
         {
             return;
         }
+
+        _hiding = true;
+        var generation = ++_hideGeneration;
+        var resting = AppWindow.Position;
+        var sink = Toward(resting, TaskbarEdge(), SlideDistance);
+        FadeContent(from: 1f, to: 0f, durationMs: 120);
+        _ = FinishHideAsync(resting, sink, generation);
+    }
+
+    private async Task FinishHideAsync(PointInt32 from, PointInt32 to, long generation)
+    {
+        await SlideWindowAsync(from, to, durationMs: 120, decelerate: false);
+        if (!_hiding || generation != _hideGeneration)
+        {
+            // Superseded — either a ShowFlyout cleared _hiding, or a newer
+            // hide bumped the generation. Only the current hide's
+            // continuation may finish the job.
+            return;
+        }
+
         AppWindow.Hide();
+        _hiding = false;
+        var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview
+            .GetElementVisual(Content);
+        visual.Opacity = 1f;
     }
 
     /// <summary>
@@ -140,11 +196,8 @@ public sealed partial class FlyoutWindow : Window
         }
 
         var snapshot = _reader.Read(DateTimeOffset.Now);
-        FlowLoadingText.Visibility = Visibility.Collapsed;
-        RowsList.ItemsSource = snapshot.Rows;
-        FlowEmptyText.Visibility = snapshot.Rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        StatusText.Text = $"{snapshot.VisibleJobs} flow row(s) - tokens only";
-        RefreshedText.Text = $"refreshed {DateTime.Now:HH:mm:ss}";
+        Dashboard.RenderFlow(snapshot.Rows, snapshot.VisibleJobs);
+        Dashboard.SetRefreshedText($"refreshed {DateTime.Now:HH:mm:ss}");
         RefreshQuotaCards();
     }
 
@@ -154,6 +207,7 @@ public sealed partial class FlyoutWindow : Window
         {
             return;
         }
+        Dashboard.ShowRefreshing();
         _ = Task.Run(() =>
         {
             IReadOnlyList<QuotaCardViewModel> cards;
@@ -179,16 +233,15 @@ public sealed partial class FlyoutWindow : Window
                 if (cards.Count > 0)
                 {
                     _everHadQuota = true;
-                    QuotaLoadingText.Visibility = Visibility.Collapsed;
-                    QuotaCardsList.ItemsSource = cards;
                 }
-                else if (!_everHadQuota)
+                if (cards.Count > 0 || !_everHadQuota)
                 {
                     // Never hide the section while loading (lessons-learned
-                    // #1) — keep the loading line up instead of showing an
-                    // empty card list.
-                    QuotaLoadingText.Visibility = Visibility.Visible;
+                    // #1) — Dashboard.RenderQuota keeps the loading line up
+                    // instead of showing an empty card list.
+                    Dashboard.RenderQuota(cards, _everHadQuota);
                 }
+                Dashboard.HideRefreshing();
             });
         });
     }
@@ -230,42 +283,44 @@ public sealed partial class FlyoutWindow : Window
         _watcher.Renamed += renamed;
     }
 
-    private DesktopAcrylicController? _acrylic;
-    private SystemBackdropConfiguration? _acrylicConfig;
+    // ── Window chrome: ported from TokenBar-Windows FlyoutWindow.xaml.cs ──
 
-    /// <summary>Mica when the compositor supports it (the TokenBar-style
-    /// glass look); Acrylic is the fallback for older builds. This is a
-    /// tray-resident popover, so the backdrop config stays pinned "active"
-    /// rather than dimming when the window loses focus.</summary>
-    private void SetupBackdrop()
+    private enum Edge
     {
-        if (MicaController.IsSupported())
-        {
-            SystemBackdrop = new MicaBackdrop { Kind = MicaKind.BaseAlt };
-            return;
-        }
-        if (!DesktopAcrylicController.IsSupported())
-        {
-            return;
-        }
-        _acrylicConfig = new SystemBackdropConfiguration { IsInputActive = true, Theme = SystemBackdropTheme.Dark };
-        _acrylic = new DesktopAcrylicController
-        {
-            TintOpacity = 0.35f,
-            LuminosityOpacity = 0.6f,
-            TintColor = Windows.UI.Color.FromArgb(255, 19, 24, 36),
-        };
-        _acrylic.AddSystemBackdropTarget(
-            WinRT.CastExtensions.As<Microsoft.UI.Composition.ICompositionSupportsSystemBackdrop>(this));
-        _acrylic.SetSystemBackdropConfiguration(_acrylicConfig);
-        Closed += (_, _) =>
-        {
-            _acrylic?.Dispose();
-            _acrylic = null;
-        };
+        Left = 0,
+        Top = 1,
+        Right = 2,
+        Bottom = 3,
     }
 
-    private void PositionNearTray()
+    /// <summary>Which screen edge the taskbar sits on (ABM_GETTASKBARPOS);
+    /// bottom when the shell won't say.</summary>
+    private static Edge TaskbarEdge()
+    {
+        var data = new APPBARDATA { cbSize = Marshal.SizeOf<APPBARDATA>() };
+        return SHAppBarMessage(0x0005 /* ABM_GETTASKBARPOS */, ref data) != 0
+            ? (Edge)data.uEdge
+            : Edge.Bottom;
+    }
+
+    /// <summary>Offset a point toward a taskbar edge (the hide direction).</summary>
+    private static PointInt32 Toward(PointInt32 p, Edge edge, int distance) => edge switch
+    {
+        Edge.Left => new PointInt32(p.X - distance, p.Y),
+        Edge.Top => new PointInt32(p.X, p.Y - distance),
+        Edge.Right => new PointInt32(p.X + distance, p.Y),
+        _ => new PointInt32(p.X, p.Y + distance),
+    };
+
+    /// <summary>Anchor against the taskbar corner of the work area, on
+    /// whichever edge the taskbar occupies. Sizes the window and returns the
+    /// resting position plus the slide start (offset toward the taskbar).
+    /// Adapted from TokenBar's PositionNearTray: TokenBar clamps a
+    /// user-dragged height read from AppSettings.Store; CCCOG has no
+    /// persisted-settings store, so this always sizes to the fixed
+    /// FlyoutHeight (still clamped into the work area, same as before this
+    /// port).</summary>
+    private (PointInt32 Resting, PointInt32 Start) PositionNearTray()
     {
         var display = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary);
         var work = display.WorkArea;
@@ -281,22 +336,209 @@ public sealed partial class FlyoutWindow : Window
             scale = 1;
         }
         var width = (int)(FlyoutWidth * scale);
-        var desiredHeight = (int)(FlyoutHeight * scale);
-        var height = Math.Min(desiredHeight, work.Height - (int)(Margin * 2 * scale));
+        var ceiling = work.Height - (int)(24 * scale);
+        var floor = Math.Min((int)(480 * scale), ceiling);
+        var height = (int)Math.Clamp(FlyoutHeight * scale, floor, ceiling);
         AppWindow.Resize(new SizeInt32(width, height));
-        AppWindow.Move(new PointInt32(
-            work.X + work.Width - width - (int)(Margin * scale),
-            work.Y + work.Height - height - (int)(Margin * scale)));
+
+        var edge = TaskbarEdge();
+        var resting = edge switch
+        {
+            // Tray lives at the taskbar's far end: bottom/top → right
+            // corner, left/right → bottom corner.
+            Edge.Left => new PointInt32(work.X + Margin, work.Y + work.Height - height - Margin),
+            Edge.Top => new PointInt32(work.X + work.Width - width - Margin, work.Y + Margin),
+            Edge.Right => new PointInt32(work.X + work.Width - width - Margin, work.Y + work.Height - height - Margin),
+            _ => new PointInt32(work.X + work.Width - width - Margin, work.Y + work.Height - height - Margin),
+        };
+        return (resting, Toward(resting, edge, SlideDistance));
     }
+
+    /// <summary>Move the top-level window each frame; DWM re-blurs the
+    /// acrylic live, so the whole surface travels together.</summary>
+    private async Task SlideWindowAsync(PointInt32 from, PointInt32 to, int durationMs, bool decelerate)
+    {
+        var token = ++_slideToken;
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        while (watch.ElapsedMilliseconds < durationMs)
+        {
+            if (token != _slideToken)
+            {
+                return; // superseded by a newer slide
+            }
+
+            var t = Math.Clamp(watch.ElapsedMilliseconds / (double)durationMs, 0, 1);
+            var eased = decelerate ? 1 - Math.Pow(1 - t, 3) : Math.Pow(t, 2);
+            AppWindow.Move(new PointInt32(
+                (int)Math.Round(from.X + (to.X - from.X) * eased),
+                (int)Math.Round(from.Y + (to.Y - from.Y) * eased)));
+            await Task.Delay(8); // ~120Hz pacing; DWM coalesces to refresh rate
+        }
+
+        if (token == _slideToken)
+        {
+            AppWindow.Move(to);
+        }
+    }
+
+    private void FadeContent(float from, float to, int durationMs)
+    {
+        var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview
+            .GetElementVisual(Content);
+        var compositor = visual.Compositor;
+        visual.Opacity = from;
+        var fade = compositor.CreateScalarKeyFrameAnimation();
+        fade.InsertKeyFrame(1f, to);
+        fade.Duration = TimeSpan.FromMilliseconds(durationMs);
+        visual.StartAnimation("Opacity", fade);
+    }
+
+    /// <summary>Popup chrome: strip every residual frame style down to
+    /// WS_POPUP (the presenter's borderless mode leaves WS_DLGFRAME behind,
+    /// which draws a 1px outline DWMWA_BORDER_COLOR cannot remove), then
+    /// round the corners and erase the DWM border color.</summary>
+    private void ApplyPopupChrome()
+    {
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+
+        const int GWL_STYLE = -16;
+        const long WS_POPUP = 0x80000000L;
+        const long WS_VISIBLE = 0x10000000L;
+        const long WS_CLIPCHILDREN = 0x02000000L;
+        var oldStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        var newStyle = (nint)(WS_POPUP | WS_CLIPCHILDREN | ((long)oldStyle & WS_VISIBLE));
+        _ = SetWindowLongPtrW(hwnd, GWL_STYLE, newStyle);
+
+        var corner = 2; // DWMWCP_ROUND
+        _ = DwmSetWindowAttribute(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, ref corner, sizeof(int));
+        var borderColor = unchecked((int)0xFFFFFFFE); // DWMWA_COLOR_NONE
+        _ = DwmSetWindowAttribute(hwnd, 34 /* DWMWA_BORDER_COLOR */, ref borderColor, sizeof(int));
+
+        // HWND_TOPMOST directly: the presenter's IsAlwaysOnTop doesn't
+        // survive the WS_POPUP style stomp, so the flyout sank under normal
+        // windows whenever anything else was open. Re-assert through the
+        // presenter as well (toggle forces a reapply of the z-band).
+        const uint SWP_FRAMECHANGED = 0x0020;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOACTIVATE = 0x0010;
+        var HWND_TOPMOST = new nint(-1);
+        _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+        if (AppWindow.Presenter is OverlappedPresenter p)
+        {
+            p.IsAlwaysOnTop = false;
+            p.IsAlwaysOnTop = true;
+        }
+    }
+
+    /// <summary>Hover-only: brightens the resize-grip hint on pointer
+    /// enter/exit. TokenBar also wires PointerPressed/Moved/Released to drag
+    /// the top edge and persists the result via AppSettings.Store — CCCOG
+    /// has no settings store, so that drag behavior was not ported (named
+    /// gap; see bar/SYNC.md). The window keeps its fixed FlyoutHeight.</summary>
+    private void WireResizeGripHover()
+    {
+        ResizeGrip.PointerEntered += (_, _) => ResizeGripHint.Opacity = 1;
+        ResizeGrip.PointerExited += (_, _) => ResizeGripHint.Opacity = 0;
+    }
+
+    private DesktopAcrylicController? _acrylic;
+    private SystemBackdropConfiguration? _acrylicConfig;
+
+    /// <summary>Acrylic that never falls back to the opaque inactive color:
+    /// IsInputActive is pinned true for the window's lifetime. This
+    /// replaces the previous CCCOG shell's Mica-first / dark-tint fallback
+    /// entirely — TokenBar never uses Mica for this popover, and this is
+    /// its exact tint/opacity pair (not a CCCOG reinterpretation).</summary>
+    private void SetupAlwaysOnAcrylic()
+    {
+        if (!DesktopAcrylicController.IsSupported())
+        {
+            SystemBackdrop = new DesktopAcrylicBackdrop();
+            return;
+        }
+
+        _acrylicConfig = new SystemBackdropConfiguration
+        {
+            IsInputActive = true,
+        };
+        _acrylic = new DesktopAcrylicController
+        {
+            // Default acrylic reads nearly opaque; thin it out so the
+            // desktop shows through.
+            TintOpacity = 0.25f,
+            LuminosityOpacity = 0.55f,
+        };
+        ApplyAcrylicTheme();
+        Dashboard.ActualThemeChanged += (_, _) => ApplyAcrylicTheme();
+        _acrylic.AddSystemBackdropTarget(
+            WinRT.CastExtensions.As<Microsoft.UI.Composition.ICompositionSupportsSystemBackdrop>(this));
+        _acrylic.SetSystemBackdropConfiguration(_acrylicConfig);
+    }
+
+    private void ApplyAcrylicTheme()
+    {
+        if (_acrylic is null || _acrylicConfig is null)
+        {
+            return;
+        }
+
+        var dark = Dashboard.ActualTheme == ElementTheme.Dark;
+        _acrylicConfig.Theme = dark
+            ? SystemBackdropTheme.Dark
+            : SystemBackdropTheme.Light;
+        _acrylic.TintColor = dark
+            ? Windows.UI.Color.FromArgb(255, 28, 28, 34)
+            : Windows.UI.Color.FromArgb(255, 243, 243, 243);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct APPBARDATA
+    {
+        public int cbSize;
+        public nint hWnd;
+        public uint uCallbackMessage;
+        public uint uEdge;
+        public RECT rc;
+        public nint lParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("shell32.dll")]
+    private static extern nuint SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(
+        nint hwnd, int attribute, ref int value, int size);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern nint GetWindowLongPtrW(nint hwnd, int index);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern nint SetWindowLongPtrW(nint hwnd, int index, nint value);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(
+        nint hwnd, nint hwndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(nint hwnd);
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(nint hwnd);
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForSystem();
-
-    [DllImport("user32.dll")]
-    private static extern bool SetForegroundWindow(nint hwnd);
 }
 
 internal static class NativeQuotaClient
@@ -385,10 +627,12 @@ internal static class NativeQuotaClient
                     {
                         ProviderId = providerId,
                         Label = providerId,
+                        WindowLabel = providerId,
                         UsedPercent = 0,
                         ResetText = "Reset time unavailable",
                         StateText = diagnostic ?? $"{state.ToLowerInvariant()}",
                         IsFailure = true,
+                        IsWholeProviderFailure = true,
                     });
                     continue;
                 }
@@ -407,6 +651,7 @@ internal static class NativeQuotaClient
                     {
                         ProviderId = providerId,
                         Label = $"{providerId} - {label}",
+                        WindowLabel = label,
                         UsedPercent = Math.Clamp(used, 0, 100),
                         ResetText = FormatReset(reset),
                         StateText = state.Equals("fresh", StringComparison.OrdinalIgnoreCase)

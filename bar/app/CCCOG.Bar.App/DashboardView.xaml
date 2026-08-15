@@ -1,0 +1,81 @@
+<UserControl
+    x:Class="CCCOG.Bar.App.DashboardView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- Ported from TokenBar-Windows src/TokenBar.App/DashboardView.xaml
+         (namespace only): same Grid Padding/RowSpacing, same header Grid
+         shape (title left, refresh button+spinner right in a 26x26 overlay
+         Grid), same ScrollViewer/ContentPresenter section pattern, same
+         footer row. See bar/SYNC.md for what was dropped and why (year
+         filter, client tabs, today/total/rate stat row, 3D graph host,
+         gear/Quit buttons — none of those exist in CCCOG's two-section
+         shell) and Ui.cs for the ported card/row primitives this view's
+         code-behind builds with. -->
+    <Grid Padding="16,14,16,10" RowSpacing="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <StackPanel Grid.Row="0" Spacing="6">
+            <Grid>
+                <TextBlock
+                    FontSize="15"
+                    FontWeight="SemiBold"
+                    VerticalAlignment="Center"
+                    Text="CCCOG" />
+                <Grid VerticalAlignment="Center" HorizontalAlignment="Right" Width="26" Height="26">
+                    <Button
+                        x:Name="RefreshButton"
+                        Padding="0"
+                        Width="26"
+                        Height="26"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        ToolTipService.ToolTip="Refresh">
+                        <FontIcon Glyph="&#xE72C;" FontSize="11" Opacity="0.75" />
+                    </Button>
+                    <ProgressRing
+                        x:Name="RefreshSpinner"
+                        Width="15"
+                        Height="15"
+                        IsActive="False"
+                        Visibility="Collapsed" />
+                </Grid>
+            </Grid>
+            <TextBlock x:Name="RefreshedText" Opacity="0.65" FontSize="11" Text="refreshing…" />
+        </StackPanel>
+
+        <!-- Section content: TokenBar's ScrollViewer + ContentPresenter
+             pattern, reused twice for CCCOG's two always-present sections
+             (Quota, Flow) instead of TokenBar's single lens-swapped
+             ContentHost. Each host's content is a TokenBar Ui.Card() border,
+             rebuilt independently on its own refresh cadence (Flow is
+             synchronous/file-only; Quota arrives async). -->
+        <ScrollViewer
+            Grid.Row="1"
+            VerticalScrollBarVisibility="Auto"
+            VerticalScrollMode="Enabled"
+            IsVerticalScrollChainingEnabled="False">
+            <StackPanel Spacing="10">
+                <ContentPresenter x:Name="QuotaHost" />
+                <ContentPresenter x:Name="FlowHost" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Footer: TokenBar's footer pattern (status text, left-aligned,
+             opacity 0.5, FontSize 10). No gear/Quit buttons — CCCOG has no
+             settings window or in-flyout quit action. -->
+        <Grid Grid.Row="2">
+            <TextBlock
+                x:Name="FooterText"
+                VerticalAlignment="Center"
+                Opacity="0.5"
+                FontSize="10"
+                Text="" />
+        </Grid>
+    </Grid>
+</UserControl>
