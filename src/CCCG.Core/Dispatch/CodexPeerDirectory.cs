@@ -80,6 +80,11 @@ public sealed class CodexPeerDirectory
         {
             foreach (var file in Directory.EnumerateFiles(sessionsRoot, "rollout-*.jsonl", SearchOption.AllDirectories))
             {
+                if (IsArchivePath(file))
+                {
+                    continue;
+                }
+
                 var parsed = ReadRolloutMeta(file);
                 if (parsed is null || string.IsNullOrWhiteSpace(parsed.SessionId))
                 {
@@ -273,6 +278,10 @@ public sealed class CodexPeerDirectory
 
     private string LockPath(string sessionId) =>
         Path.Combine(codexHome, "thread-writer-locks", sessionId + ".lock");
+
+    private static bool IsArchivePath(string path) =>
+        path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(part => string.Equals(part, "cccg-archive", StringComparison.OrdinalIgnoreCase));
 
     private static bool LockIsHeld(string lockPath)
     {

@@ -183,6 +183,7 @@ var tests = new (string Name, Action Run)[]
     ("archive is manually restorable from manifest", ArchiveIsManuallyRestorableFromManifest),
     ("archive refuses live or CCCG owned peer", ArchiveRefusesLiveOrCccgOwnedPeer),
     ("archive collision or manifest failure leaves source intact", ArchiveCollisionOrManifestFailureLeavesSourceIntact),
+    ("archive visibility excludes archived peers from list watch search and read", ArchiveVisibilityExcludesArchivedPeers),
     ("Host registers all CCD parity tools", HostRegistersAllCcdParityTools),
     ("Host tool descriptions warn transcript is untrusted", HostToolDescriptionsWarnUntrustedContent),
     ("Worker dispatches read search title archive operations", WorkerDispatchesReadSearchTitleArchiveOperations),
@@ -3520,6 +3521,90 @@ static void ArchiveCollisionOrManifestFailureLeavesSourceIntact()
     finally
     {
         TryDelete(root);
+    }
+}
+
+static void ArchiveVisibilityExcludesArchivedPeers()
+{
+    var grok = new GrokHomeFixture();
+    var codex = new CodexHomeFixture();
+    var claude = new ClaudeHomeFixture();
+    var watchRoot = Path.Combine(Path.GetTempPath(), $"cccg-archive-watch-{Guid.NewGuid():N}");
+    try
+    {
+        const string cwd = "D:\\code\\app";
+        const string needle = "ARCHIVE-UNSEEN";
+        var grokId = "archive-grok";
+        var codexId = "84999999-9999-4999-8999-999999999999";
+        var claudeId = "85999999-9999-4999-8999-999999999999";
+
+        grok.WriteSummary(cwd, grokId, "Archived Grok", needle,
+            DateTimeOffset.Parse("2026-08-15T04:00:00Z"));
+        var grokGroup = Path.Combine(grok.Root, "sessions", Uri.EscapeDataString(cwd), grokId);
+        File.WriteAllText(Path.Combine(grokGroup, "chat_history.jsonl"),
+            "{\"type\":\"user\",\"content\":\"" + needle + "\"}\n");
+
+        WriteCodexTranscript(codex.Root, codexId, "Archived Codex", needle);
+
+        var claudeProject = Path.Combine(claude.Root, "projects", "D--code-app");
+        Directory.CreateDirectory(claudeProject);
+        File.WriteAllText(Path.Combine(claudeProject, claudeId + ".jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"" + claudeId +
+            "\",\"cwd\":\"D:\\\\code\\\\app\",\"message\":{\"role\":\"user\",\"content\":\"" +
+            needle + "\"}}\n");
+
+        var grokLock = Path.Combine(grokGroup + ".cccg-archive.lock");
+        var codexLock = Path.Combine(codex.Root, "sessions", codexId + ".cccg-archive.lock");
+        var claudeTranscript = Path.Combine(claudeProject, claudeId + ".jsonl");
+        var claudeLock = claudeTranscript + ".cccg-archive.lock";
+
+        Equal("archived", new PeerArchiveService(grokHome: grok.Root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("grok", grokId).Status);
+        Equal("archived", new PeerArchiveService(codexHome: codex.Root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("codex", codexId).Status);
+        Equal("archived", new PeerArchiveService(claudeHome: claude.Root,
+            liveProbe: (_, _) => false, ownerProbe: (_, _) => false).Archive("claude", claudeId).Status);
+
+        True(!File.Exists(grokLock));
+        True(!File.Exists(codexLock));
+        True(!File.Exists(claudeLock));
+
+        var grokDirectory = grok.Open(_ => false, DateTimeOffset.UtcNow);
+        var codexDirectory = codex.Open(_ => false, DateTimeOffset.UtcNow);
+        var claudeDirectory = new ClaudePeerDirectory(claude.Root, _ => false);
+        True(grokDirectory.List().Peers.All(peer => peer.SessionId != grokId));
+        True(codexDirectory.List().Peers.All(peer => peer.SessionId != codexId));
+        True(claudeDirectory.List().Peers.All(peer => peer.SessionId != claudeId));
+
+        var watcher = new PeerWatcher((provider, sessionId) => provider switch
+        {
+            "grok" => grokDirectory.Inspect(sessionId),
+            "codex" => codexDirectory.Inspect(sessionId),
+            "claude" => claudeDirectory.Inspect(sessionId),
+            _ => null
+        }, watchRoot);
+        var watched = watcher.Watch($"{grokId},{codexId},{claudeId}", "all");
+        True(watched.Peers.All(peer => !peer.Found));
+
+        var transcripts = new TranscriptService(
+            codexHome: codex.Root,
+            grokHome: grok.Root,
+            claudeHome: claude.Root);
+        var search = transcripts.Search(new TranscriptSearchRequest(needle, "all", 10));
+        Equal(0, search.Hits.Count);
+        Throws<InvalidOperationException>(() => transcripts.Read(
+            new TranscriptReadRequest("grok", grokId)));
+        Throws<InvalidOperationException>(() => transcripts.Read(
+            new TranscriptReadRequest("codex", codexId)));
+        Throws<InvalidOperationException>(() => transcripts.Read(
+            new TranscriptReadRequest("claude", claudeId)));
+    }
+    finally
+    {
+        grok.Dispose();
+        codex.Dispose();
+        claude.Dispose();
+        TryDelete(watchRoot);
     }
 }
 

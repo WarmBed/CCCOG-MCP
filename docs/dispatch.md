@@ -74,6 +74,19 @@ passed through without aliases or an allow-list.
 - A failed provider call is recorded but never promoted to a successful
   binding.
 
+## Archived sessions
+
+`cccg_archive_peer` moves provider files below a provider-owned
+`cccg-archive\` directory and writes a manifest for manual restoration.
+Normal peer listing, watching, transcript reads, and transcript searches
+exclude every path below that directory, so an archived session is invisible
+until an operator restores its manifest entries.
+
+The adjacent `.cccg-archive.lock` file is a transient cross-process gate, not
+a tombstone or session marker. The archive operation releases the gate and
+removes the file on every completed outcome; a leftover after a crashed
+process is inert and may be deleted once no archive operation is running.
+
 ## Multi-Claude concurrency
 
 Bindings, job status, and inbox files use OS-visible file locks and atomic

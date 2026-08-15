@@ -90,6 +90,11 @@ public sealed class ClaudePeerDirectory
 
         foreach (var projectDirectory in projectDirectories)
         {
+            if (IsArchivePath(projectDirectory))
+            {
+                continue;
+            }
+
             IEnumerable<string> transcripts;
             try
             {
@@ -105,6 +110,11 @@ public sealed class ClaudePeerDirectory
 
             foreach (var transcript in transcripts)
             {
+                if (IsArchivePath(transcript))
+                {
+                    continue;
+                }
+
                 var peer = ReadTranscript(transcript);
                 if (peer is null
                     || (!string.IsNullOrWhiteSpace(cwd)
@@ -277,6 +287,10 @@ public sealed class ClaudePeerDirectory
             .Replace(':', '-')
             .Replace('\\', '-')
             .Replace('/', '-');
+
+    private static bool IsArchivePath(string path) =>
+        path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(part => string.Equals(part, "cccg-archive", StringComparison.OrdinalIgnoreCase));
 
     private static string? String(JsonElement element, string property) =>
         element.ValueKind == JsonValueKind.Object

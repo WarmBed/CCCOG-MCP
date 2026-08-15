@@ -162,9 +162,19 @@ public sealed class GrokPeerDirectory
 
         foreach (var group in Directory.EnumerateDirectories(root))
         {
+            if (IsArchivePath(group))
+            {
+                continue;
+            }
+
             var groupCwd = ReadGroupCwd(group);
             foreach (var sessionDir in Directory.EnumerateDirectories(group))
             {
+                if (IsArchivePath(sessionDir))
+                {
+                    continue;
+                }
+
                 var summaryPath = Path.Combine(sessionDir, "summary.json");
                 if (!File.Exists(summaryPath))
                 {
@@ -269,6 +279,10 @@ public sealed class GrokPeerDirectory
         PeerStatus.Resumable => 2,
         _ => 3
     };
+
+    private static bool IsArchivePath(string path) =>
+        path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(part => string.Equals(part, "cccg-archive", StringComparison.OrdinalIgnoreCase));
 
     private static string? FirstNonEmpty(params string?[] values)
     {

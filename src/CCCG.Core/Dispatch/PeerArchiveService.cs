@@ -117,107 +117,115 @@ public sealed class PeerArchiveService
         }
 
         var lockPath = plan.LockPath;
-        using var gate = CrossProcessFileGate.Acquire(lockPath, TimeSpan.FromSeconds(30));
-        if (IsLive(provider, sessionId))
-        {
-            return Result("live_refused", provider, sessionId,
-                "Session became live before archive; no files were moved.");
-        }
-
-        if (IsOwned(provider, sessionId))
-        {
-            return Result("owner_refused", provider, sessionId,
-                "A CCCG owner claimed the session before archive; no files were moved.");
-        }
-
-        if (Directory.Exists(plan.ArchivePath))
-        {
-            return Result("conflict", provider, sessionId,
-                "Archive destination already exists; source was left intact.",
-                plan.ArchivePath);
-        }
-
-        var manifest = new ArchiveManifest
-        {
-            Provider = provider,
-            SessionId = sessionId,
-            ArchivedAtUtc = plan.ArchivedAtUtc,
-            Files = plan.Files.Select(file => new ArchiveFileEntry(
-                file.SourcePath,
-                file.DestinationPath,
-                file.Length,
-                file.Sha256)).ToList(),
-            IndexEntries = plan.IndexEntries
-        };
-        var manifestText = JsonSerializer.Serialize(manifest, JsonOptions);
-        var manifestPath = Path.Combine(plan.ArchivePath, "manifest.json");
-        if (manifestCanWrite is not null && !manifestCanWrite(manifestPath))
-        {
-            return Result("failed", provider, sessionId,
-                "Archive manifest preflight failed; source was left intact.",
-                plan.ArchivePath, manifestPath);
-        }
-
-        var moved = new List<ArchivePlanFile>();
-        var indexChanged = false;
+        var gate = CrossProcessFileGate.Acquire(lockPath, TimeSpan.FromSeconds(30));
         try
         {
-            Directory.CreateDirectory(plan.ArchivePath);
-            foreach (var file in plan.Files)
+            if (IsLive(provider, sessionId))
             {
-                EnsureUnder(plan.ArchivePath, file.DestinationPath);
-                EnsureUnder(plan.StorageRoot, file.SourcePath);
-                Directory.CreateDirectory(Path.GetDirectoryName(file.DestinationPath)!);
-                File.Move(file.SourcePath, file.DestinationPath);
-                moved.Add(file);
+                return Result("live_refused", provider, sessionId,
+                    "Session became live before archive; no files were moved.");
             }
 
-            foreach (var file in moved)
+            if (IsOwned(provider, sessionId))
             {
-                DeleteEmptyParents(file.SourcePath, plan.StorageRoot);
+                return Result("owner_refused", provider, sessionId,
+                    "A CCCG owner claimed the session before archive; no files were moved.");
             }
 
-            if (plan.IndexPath is not null && plan.FilteredIndexText is not null)
+            if (Directory.Exists(plan.ArchivePath))
             {
-                CrossProcessFileGate.AtomicWriteAllText(plan.IndexPath, plan.FilteredIndexText);
-                indexChanged = true;
+                return Result("conflict", provider, sessionId,
+                    "Archive destination already exists; source was left intact.",
+                    plan.ArchivePath);
             }
 
-            CrossProcessFileGate.AtomicWriteAllText(manifestPath, manifestText);
-            return new PeerArchiveResult(
-                "archived",
-                provider,
-                sessionId,
-                plan.ArchivePath,
-                manifestPath,
-                "Session files moved to cccg-archive; manifest records manual restore paths.");
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
-        {
-            if (indexChanged && plan.IndexPath is not null && plan.OriginalIndexText is not null)
+            var manifest = new ArchiveManifest
             {
-                TryAtomicRestore(plan.IndexPath, plan.OriginalIndexText);
+                Provider = provider,
+                SessionId = sessionId,
+                ArchivedAtUtc = plan.ArchivedAtUtc,
+                Files = plan.Files.Select(file => new ArchiveFileEntry(
+                    file.SourcePath,
+                    file.DestinationPath,
+                    file.Length,
+                    file.Sha256)).ToList(),
+                IndexEntries = plan.IndexEntries
+            };
+            var manifestText = JsonSerializer.Serialize(manifest, JsonOptions);
+            var manifestPath = Path.Combine(plan.ArchivePath, "manifest.json");
+            if (manifestCanWrite is not null && !manifestCanWrite(manifestPath))
+            {
+                return Result("failed", provider, sessionId,
+                    "Archive manifest preflight failed; source was left intact.",
+                    plan.ArchivePath, manifestPath);
             }
 
-            foreach (var file in moved.AsEnumerable().Reverse())
+            var moved = new List<ArchivePlanFile>();
+            var indexChanged = false;
+            try
             {
-                try
+                Directory.CreateDirectory(plan.ArchivePath);
+                foreach (var file in plan.Files)
                 {
-                    if (File.Exists(file.DestinationPath))
+                    EnsureUnder(plan.ArchivePath, file.DestinationPath);
+                    EnsureUnder(plan.StorageRoot, file.SourcePath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(file.DestinationPath)!);
+                    File.Move(file.SourcePath, file.DestinationPath);
+                    moved.Add(file);
+                }
+
+                foreach (var file in moved)
+                {
+                    DeleteEmptyParents(file.SourcePath, plan.StorageRoot);
+                }
+
+                if (plan.IndexPath is not null && plan.FilteredIndexText is not null)
+                {
+                    CrossProcessFileGate.AtomicWriteAllText(plan.IndexPath, plan.FilteredIndexText);
+                    indexChanged = true;
+                }
+
+                CrossProcessFileGate.AtomicWriteAllText(manifestPath, manifestText);
+                return new PeerArchiveResult(
+                    "archived",
+                    provider,
+                    sessionId,
+                    plan.ArchivePath,
+                    manifestPath,
+                    "Session files moved to cccg-archive; manifest records manual restore paths.");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                if (indexChanged && plan.IndexPath is not null && plan.OriginalIndexText is not null)
+                {
+                    TryAtomicRestore(plan.IndexPath, plan.OriginalIndexText);
+                }
+
+                foreach (var file in moved.AsEnumerable().Reverse())
+                {
+                    try
                     {
-                        Directory.CreateDirectory(Path.GetDirectoryName(file.SourcePath)!);
-                        File.Move(file.DestinationPath, file.SourcePath);
+                        if (File.Exists(file.DestinationPath))
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(file.SourcePath)!);
+                            File.Move(file.DestinationPath, file.SourcePath);
+                        }
+                    }
+                    catch (IOException)
+                    {
                     }
                 }
-                catch (IOException)
-                {
-                }
-            }
 
-            TryDeleteEmpty(plan.ArchivePath);
-            return Result("failed", provider, sessionId,
-                "Archive failed and moved files were rolled back: " + exception.Message,
-                plan.ArchivePath, manifestPath);
+                TryDeleteEmpty(plan.ArchivePath);
+                return Result("failed", provider, sessionId,
+                    "Archive failed and moved files were rolled back: " + exception.Message,
+                    plan.ArchivePath, manifestPath);
+            }
+        }
+        finally
+        {
+            gate.Dispose();
+            TryDeleteArchiveLock(lockPath);
         }
     }
 
@@ -587,6 +595,17 @@ public sealed class PeerArchiveService
             }
         }
         catch (IOException)
+        {
+        }
+    }
+
+    private static void TryDeleteArchiveLock(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
         }
     }
