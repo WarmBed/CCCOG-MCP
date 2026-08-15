@@ -168,6 +168,7 @@ var tests = new (string Name, Action Run)[]
     ("search is case insensitive substring and one hit per session", SearchIsCaseInsensitiveSubstringAndOneHitPerSession),
     ("search provider filter limits sources", SearchProviderFilterLimitsSources),
     ("search tail first and honest file byte cap", SearchTailFirstAndHonestFileByteCap),
+    ("search counts tail bytes and scans newest first", SearchCountsTailBytesAndScansNewestFirst),
     ("search stops at total session and output caps", SearchStopsAtTotalSessionAndOutputCaps),
     ("search warning treats transcript as data", SearchWarningTreatsTranscriptAsData),
     ("set title Claude closed appends native custom title", SetTitleClaudeClosedAppendsNativeCustomTitle),
@@ -3137,6 +3138,46 @@ static void SearchTailFirstAndHonestFileByteCap()
         True(result.Hits[0].Excerpt.Contains("UniqueNeedle", StringComparison.Ordinal));
         True(result.Truncated);
         True(result.TruncationReason?.Contains("file", StringComparison.OrdinalIgnoreCase) == true);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void SearchCountsTailBytesAndScansNewestFirst()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-search-tail-budget-{Guid.NewGuid():N}");
+    try
+    {
+        var ids = new[]
+        {
+            "7f666666-6666-4666-8666-666666666661",
+            "7f666666-6666-4666-8666-666666666662",
+            "7f666666-6666-4666-8666-666666666663"
+        };
+        var day = Path.Combine(root, "sessions", "2026", "08", "15");
+        Directory.CreateDirectory(day);
+        var filler = new string('x', 2_100_000);
+        for (var index = 0; index < ids.Length; index++)
+        {
+            var path = Path.Combine(day,
+                $"rollout-2026-08-15T00-00-0{index}-{ids[index]}.jsonl");
+            File.WriteAllText(path,
+                "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"" + ids[index] + "\"}}\n" +
+                "{\"type\":\"message\",\"payload\":{\"role\":\"user\",\"content\":" +
+                System.Text.Json.JsonSerializer.Serialize(filler) + "}}\n" +
+                "{\"type\":\"message\",\"payload\":{\"role\":\"assistant\",\"content\":\"PARITY GREEN " + index + "\"}}\n");
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(-index));
+        }
+
+        var result = new TranscriptService(codexHome: root)
+            .Search(new TranscriptSearchRequest("PARITY GREEN", "codex", 3));
+
+        True(result.ScannedSessions > 0);
+        True(result.Hits.Count > 0);
+        Equal(ids[0], result.Hits[0].SessionId);
+        True(result.TruncationReason != "total-byte-cap");
     }
     finally
     {

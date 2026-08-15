@@ -127,18 +127,28 @@ public sealed class TranscriptService
                 break;
             }
 
-            var fileLength = File.Exists(source.Path) ? new FileInfo(source.Path).Length : 0;
-            var estimatedBytes = Math.Min(fileLength, options.MaxFileBytes);
-            if (scannedBytes + estimatedBytes > options.MaxTotalBytes)
+            // Use the file length only to determine whether the reader will
+            // open the whole file or a bounded tail window.  The total budget
+            // is charged from LoadedRecords.BytesRead below, never from the
+            // nominal candidate file size.
+            var readWindowBytes = ReadWindowBytes(source.Path);
+            if (scannedBytes + readWindowBytes > options.MaxTotalBytes)
             {
                 truncated = true;
                 truncationReason = "total-byte-cap";
                 break;
             }
 
-            scannedBytes += estimatedBytes;
-            scannedSessions++;
             var loaded = LoadRecords(source);
+            if (scannedBytes + loaded.BytesRead > options.MaxTotalBytes)
+            {
+                truncated = true;
+                truncationReason = "total-byte-cap";
+                break;
+            }
+
+            scannedBytes += loaded.BytesRead;
+            scannedSessions++;
             if (loaded.Truncated)
             {
                 truncated = true;
@@ -288,12 +298,11 @@ public sealed class TranscriptService
         if (provider is null or "codex")
         {
             var root = Path.Combine(codexHome, "sessions");
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var candidates = new Dictionary<string, TranscriptSource>(StringComparer.OrdinalIgnoreCase);
             if (Directory.Exists(root))
             {
                 foreach (var path in EnumerateFilesSafe(root, "rollout-*.jsonl"))
                 {
-                    TranscriptSource? candidate = null;
                     try
                     {
                         using var document = JsonDocument.Parse(ReadFirstLine(path));
@@ -303,23 +312,29 @@ public sealed class TranscriptService
                         }
 
                         var sessionId = String(payload, "session_id");
-                        if (string.IsNullOrWhiteSpace(sessionId) || !seen.Add(sessionId))
+                        if (string.IsNullOrWhiteSpace(sessionId))
                         {
                             continue;
                         }
 
-                        candidate = new TranscriptSource(
+                        var candidate = new TranscriptSource(
                             "codex", sessionId, path, ReadCodexTitle(sessionId),
                             File.GetLastWriteTimeUtc(path));
+                        if (!candidates.TryGetValue(sessionId, out var existing)
+                            || candidate.UpdatedAt > existing.UpdatedAt)
+                        {
+                            candidates[sessionId] = candidate;
+                        }
                     }
                     catch (Exception exception) when (exception is IOException or JsonException)
                     {
                     }
+                }
 
-                    if (candidate is not null)
-                    {
-                        yield return candidate;
-                    }
+                foreach (var candidate in candidates.Values
+                             .OrderByDescending(source => source.UpdatedAt ?? DateTimeOffset.MinValue))
+                {
+                    yield return candidate;
                 }
             }
         }
@@ -327,7 +342,6 @@ public sealed class TranscriptService
         if (provider is null or "grok")
         {
             var root = Path.Combine(grokHome, "sessions");
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (Directory.Exists(root))
             {
                 foreach (var summaryPath in EnumerateFilesSafe(root, "summary.json"))
@@ -341,7 +355,7 @@ public sealed class TranscriptService
                             : default;
                         var sessionId = String(info, "id")
                             ?? Path.GetFileName(Path.GetDirectoryName(summaryPath) ?? "");
-                        if (string.IsNullOrWhiteSpace(sessionId) || !seen.Add(sessionId))
+                        if (string.IsNullOrWhiteSpace(sessionId))
                         {
                             continue;
                         }
@@ -358,7 +372,8 @@ public sealed class TranscriptService
                             String(document.RootElement, "generated_title")
                                 ?? String(document.RootElement, "session_summary"),
                             Timestamp(document.RootElement, "last_active_at")
-                                ?? Timestamp(document.RootElement, "updated_at"));
+                                ?? Timestamp(document.RootElement, "updated_at")
+                                ?? File.GetLastWriteTimeUtc(summaryPath));
                     }
                     catch (Exception exception) when (exception is IOException or JsonException)
                     {
@@ -375,25 +390,21 @@ public sealed class TranscriptService
         if (provider is null or "claude")
         {
             var root = Path.Combine(claudeHome, "projects");
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (Directory.Exists(root))
             {
                 foreach (var path in EnumerateFilesSafe(root, "*.jsonl"))
                 {
                     var sessionId = Path.GetFileNameWithoutExtension(path);
-                    if (!Guid.TryParse(sessionId, out _) || !seen.Add(sessionId))
+                    if (!Guid.TryParse(sessionId, out _))
                     {
                         continue;
                     }
 
-                    var source = new TranscriptSource("claude", sessionId, path, null,
+                    // Title extraction happens with the bounded search read;
+                    // do not load every Claude transcript while enumerating
+                    // candidates, otherwise those bytes bypass the budget.
+                    yield return new TranscriptSource("claude", sessionId, path, null,
                         File.GetLastWriteTimeUtc(path));
-                    var loaded = LoadRecords(source);
-                    yield return source with
-                    {
-                        Title = loaded.Title,
-                        UpdatedAt = loaded.UpdatedAt ?? source.UpdatedAt
-                    };
                 }
             }
         }
@@ -538,29 +549,33 @@ public sealed class TranscriptService
         if (!File.Exists(source.Path))
         {
             return new LoadedRecords(Array.Empty<TranscriptRecord>(), source.Title,
-                source.UpdatedAt, 0, false);
+                source.UpdatedAt, 0, false, 0);
         }
 
         string text;
         var skipped = 0;
         var truncated = false;
+        long bytesRead;
         try
         {
             var length = new FileInfo(source.Path).Length;
             if (length <= options.MaxFileBytes)
             {
                 text = ReadAllTextShared(source.Path);
+                bytesRead = length;
             }
             else
             {
                 truncated = true;
-                text = ReadTailTextShared(source.Path, Math.Min(options.TailBytes, options.MaxFileBytes));
+                var tailBytes = Math.Min(options.TailBytes, options.MaxFileBytes);
+                text = ReadTailTextShared(source.Path, tailBytes);
+                bytesRead = tailBytes;
             }
         }
         catch (IOException)
         {
             return new LoadedRecords(Array.Empty<TranscriptRecord>(), source.Title,
-                source.UpdatedAt, 1, true);
+                source.UpdatedAt, 1, true, 0);
         }
 
         var records = new List<TranscriptRecord>();
@@ -598,7 +613,24 @@ public sealed class TranscriptService
             }
         }
 
-        return new LoadedRecords(records, title, updatedAt ?? File.GetLastWriteTimeUtc(source.Path), skipped, truncated);
+        return new LoadedRecords(records, title, updatedAt ?? File.GetLastWriteTimeUtc(source.Path), skipped, truncated,
+            bytesRead);
+    }
+
+    private long ReadWindowBytes(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            return stream.Length <= options.MaxFileBytes
+                ? stream.Length
+                : Math.Min((long)options.TailBytes, options.MaxFileBytes);
+        }
+        catch (IOException)
+        {
+            return 0;
+        }
     }
 
     private static bool TryExtract(
@@ -870,5 +902,6 @@ public sealed class TranscriptService
         string? Title,
         DateTimeOffset? UpdatedAt,
         int SkippedRecords,
-        bool Truncated);
+        bool Truncated,
+        long BytesRead);
 }
