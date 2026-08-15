@@ -12,7 +12,7 @@ namespace CCCOG.Bar.App;
 public sealed partial class FlyoutWindow : Window
 {
     private const int FlyoutWidth = 400;
-    private const int FlyoutHeight = 780;
+    private const int FlyoutHeight = 900;
     private const int Margin = 12;
 
     private readonly LocalSnapshotReader _reader = new();

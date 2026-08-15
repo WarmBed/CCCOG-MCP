@@ -10,8 +10,7 @@
         </Grid.Resources>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="280" />
+            <RowDefinition Height="550" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
@@ -27,64 +26,70 @@
             </Button>
         </StackPanel>
 
-        <ItemsControl x:Name="QuotaCardsList" Grid.Row="1" Margin="0,0,0,10">
-            <ItemsControl.ItemTemplate>
-                <DataTemplate>
-                    <Border Background="#1AFFFFFF" BorderBrush="#334A5568" BorderThickness="1"
-                            CornerRadius="6" Padding="8,6" Margin="0,0,0,5">
-                        <StackPanel Spacing="4">
-                            <Grid ColumnDefinitions="*,Auto">
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBlock Text="{Binding Label}" FontSize="12" FontWeight="SemiBold"
-                                               Foreground="#F8FAFC" />
-                                    <TextBlock Text="{Binding UsedText}" FontSize="11" Foreground="#F8FAFC" />
-                                </StackPanel>
-                            </Grid>
-                            <ProgressBar Maximum="100" Value="{Binding UsedPercent}" Height="6" />
-                            <StackPanel Spacing="2">
-                                <TextBlock Text="{Binding ResetText}" FontSize="10" Opacity="0.65"
-                                           Foreground="#F8FAFC" />
-                                <TextBlock Text="{Binding StateText}" FontSize="10" Opacity="0.65"
-                                           Foreground="#F8FAFC"
-                                           TextTrimming="CharacterEllipsis" />
-                            </StackPanel>
-                        </StackPanel>
-                    </Border>
-                </DataTemplate>
-            </ItemsControl.ItemTemplate>
-        </ItemsControl>
-
-        <Border Grid.Row="2" Background="#12000000" BorderBrush="#334A5568" BorderThickness="1"
-                CornerRadius="6" Padding="8,7" Margin="0,0,0,8">
-            <Grid RowDefinitions="Auto,*">
-                <TextBlock Text="Control relations" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,5" />
-                <ScrollViewer Grid.Row="1" MaxHeight="270" VerticalScrollBarVisibility="Auto">
-                    <ItemsControl x:Name="RelationList">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Border Background="#12FFFFFF" CornerRadius="4" Padding="6,5" Margin="0,0,0,4"
-                                        ToolTipService.ToolTip="{Binding TaskSummary}">
-                                    <Grid ColumnDefinitions="Auto,*,Auto">
-                                        <Ellipse Width="7" Height="7" VerticalAlignment="Center"
-                                                 Fill="{Binding StatusBrush}" />
-                                        <StackPanel Grid.Column="1" Margin="6,0,4,0" Spacing="1">
-                                            <TextBlock Text="{Binding Label}" FontSize="11"
-                                                       Foreground="#F8FAFC" TextTrimming="CharacterEllipsis" />
-                                            <TextBlock Text="{Binding AgeText}" FontSize="10" Opacity="0.62"
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <ItemsControl x:Name="QuotaCardsList" Margin="0,0,0,10">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="#1AFFFFFF" BorderBrush="#334A5568" BorderThickness="1"
+                                    CornerRadius="6" Padding="8,6" Margin="0,0,0,5">
+                                <StackPanel Spacing="4">
+                                    <Grid ColumnDefinitions="*,Auto">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <TextBlock Text="{Binding Label}" FontSize="12" FontWeight="SemiBold"
                                                        Foreground="#F8FAFC" />
+                                            <TextBlock Text="{Binding UsedText}" FontSize="11" Foreground="#F8FAFC" />
                                         </StackPanel>
-                                        <TextBlock Grid.Column="2" Text="{Binding CountText}" FontSize="11"
-                                                   Foreground="#F8FAFC" FontWeight="SemiBold" VerticalAlignment="Center" />
                                     </Grid>
-                                </Border>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                </ScrollViewer>
-            </Grid>
-        </Border>
+                                    <ProgressBar Maximum="100" Value="{Binding UsedPercent}" Height="6" />
+                                    <StackPanel Spacing="2">
+                                        <TextBlock Text="{Binding ResetText}" FontSize="10" Opacity="0.65"
+                                                   Foreground="#F8FAFC" />
+                                        <TextBlock Text="{Binding StateText}" FontSize="10" Opacity="0.65"
+                                                   Foreground="#F8FAFC"
+                                                   TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
 
-        <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="8">
+                <Border Background="#12000000" BorderBrush="#334A5568" BorderThickness="1"
+                        CornerRadius="6" Padding="8,7" Margin="0,0,0,8">
+                    <Grid RowDefinitions="Auto,*">
+                        <TextBlock Text="Control relations" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,5" />
+                        <ScrollViewer Grid.Row="1" Height="170" VerticalScrollBarVisibility="Auto">
+                            <ItemsControl x:Name="RelationList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Background="#12FFFFFF" CornerRadius="4" Padding="6,5" Margin="0,0,0,4"
+                                                ToolTipService.ToolTip="{Binding TaskSummary}">
+                                            <Grid ColumnDefinitions="Auto,*,Auto">
+                                                <Ellipse Width="7" Height="7" VerticalAlignment="Center"
+                                                         Fill="{Binding StatusBrush}" />
+                                                <StackPanel Grid.Column="1" Margin="6,0,4,0" Spacing="1">
+                                                    <TextBlock Text="{Binding Label}" FontSize="11"
+                                                               Foreground="#F8FAFC" TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Text="{Binding AgeText}" FontSize="10" Opacity="0.62"
+                                                               Foreground="#F8FAFC" />
+                                                </StackPanel>
+                                                <TextBlock Grid.Column="2" Text="{Binding CountText}" FontSize="11"
+                                                           Foreground="#F8FAFC" FontWeight="SemiBold" VerticalAlignment="Center" />
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Grid>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+
+        <StackPanel Grid.Row="0" Grid.RowSpan="3" Orientation="Horizontal" Spacing="8"
+                    VerticalAlignment="Bottom" Background="#F9131824" Padding="0,6,0,0"
+                    Canvas.ZIndex="2">
             <TextBlock x:Name="StatusText" Text="0 edges - tokens only" FontSize="10" Opacity="0.6"
                        VerticalAlignment="Center" />
             <Button x:Name="ExpandButton" Content="Expand full graph" FontSize="11"

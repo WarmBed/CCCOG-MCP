@@ -12,14 +12,14 @@
 - [x] Screenshot self-check at 21:38 on 2026-08-15 showed Codex
   `37% used` with a concrete reset time; Claude reported `stale: OAuth refresh
   rejected` and Grok reported `stale: quota HTTP 401`.
-- [x] TokenBar-style flyout self-check at 22:13 on 2026-08-15 showed a
-  400px-wide bottom-right flyout with compact quota cards, a refresh button,
+- [x] TokenBar-style flyout self-check at 22:30 on 2026-08-15 showed a
+  400px-wide, 900px-tall bottom-right flyout with compact quota cards, a refresh button,
   and compact control-relation rows. The live Codex card read `38% used`
   (the value had moved from 37% during the run) with reset `2026-08-20
   11:50`; Claude/Grok retained their explicit stale reasons.
-- [x] The default flyout snapshot showed 8 bounded relation rows (Active + 2h,
+- [x] The default flyout snapshot showed 7 bounded relation rows (Active + 2h,
   with completed rows aggregated as `×N`), row tooltips carried the task
-  summary, and the footer reported `8 edges - tokens only`.
+  summary, and the footer reported `7 edges - tokens only`.
 - [x] UI Automation invoked `Expand full graph`; the legacy graph opened as a
   centered, visible `1100x760` `CCCOG-Bar` window (not an off-screen window).
 - [x] Local scanner excludes paths below `cccg-archive` and skips torn JSON.
@@ -37,6 +37,9 @@
 - [x] Final-binary verification: PID 8232 remained responsive for 136 seconds
   (22:16:18–22:18:35), and the post-tick screenshot still showed the Codex
   `38% used` card; `bar-crash.log` was absent.
+- [x] Final flyout layout/soak: PID 22208 remained responsive for 95 seconds
+  (22:30:18–22:31:53), with the footer visible below the relation list and the
+  post-tick screenshot showing Codex `38% used`; `bar-crash.log` was absent.
 - [x] The environment's native `computer-use` window pipe was unavailable, so
   the screenshot check used Win32 `PrintWindow` against the real executable.
 - [ ] Final visual spacing, keyboard narration, contrast, DPI scaling, and
