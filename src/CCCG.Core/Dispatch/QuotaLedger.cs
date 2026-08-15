@@ -48,11 +48,16 @@ public sealed class QuotaReservation
 }
 
 /// <summary>
-/// Cross-process local daily dispatch quota.  Each source/provider/date has
+/// Cross-process local daily dispatch counter. Each source/provider/date has
 /// one locked JSON counter file; no prompt or secret is written to its name.
+/// Enforcement is opt-in through a positive quota environment variable; the
+/// ledger keeps counting when neither variable is set.
 /// </summary>
 public sealed class QuotaLedger
 {
+    private const int RecordedClaudeLimit = 50;
+    private const int RecordedDefaultLimit = 200;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = false,
@@ -61,8 +66,8 @@ public sealed class QuotaLedger
 
     private readonly string root;
     private readonly Func<DateTimeOffset> now;
-    private readonly int claudeLimit;
-    private readonly int defaultLimit;
+    private readonly int? claudeLimit;
+    private readonly int? defaultLimit;
 
     public QuotaLedger(
         string? root = null,
@@ -76,9 +81,9 @@ public sealed class QuotaLedger
             "dispatch",
             "quotas");
         this.now = now ?? (() => DateTimeOffset.Now);
-        this.claudeLimit = claudeLimit ?? ParseLimit("CCCG_QUOTA_CLAUDE", 50);
-        this.defaultLimit = defaultLimit ?? ParseLimit("CCCG_QUOTA_DEFAULT", 200);
-        if (this.claudeLimit <= 0 || this.defaultLimit <= 0)
+        this.claudeLimit = claudeLimit ?? ParseLimit("CCCG_QUOTA_CLAUDE");
+        this.defaultLimit = defaultLimit ?? ParseLimit("CCCG_QUOTA_DEFAULT");
+        if (claudeLimit is <= 0 || defaultLimit is <= 0)
         {
             throw new InvalidOperationException("Quota limits must be positive.");
         }
@@ -98,13 +103,15 @@ public sealed class QuotaLedger
         var fileName = HashKey(source, provider, date) + ".json";
         var directory = Path.Combine(root, date);
         var path = Path.Combine(directory, fileName);
-        var limit = provider == "claude" ? claudeLimit : defaultLimit;
+        var enforcementLimit = provider == "claude" ? claudeLimit : defaultLimit;
+        var recordedLimit = enforcementLimit
+            ?? (provider == "claude" ? RecordedClaudeLimit : RecordedDefaultLimit);
         Directory.CreateDirectory(directory);
 
         using (CrossProcessFileGate.Acquire(path + ".lock", TimeSpan.FromSeconds(30)))
         {
-            var counter = Read(path, source, provider, date, limit);
-            if (counter.Count >= limit)
+            var counter = Read(path, source, provider, date, recordedLimit);
+            if (enforcementLimit is int limit && counter.Count >= limit)
             {
                 return new QuotaReservation(
                     path,
@@ -134,7 +141,7 @@ public sealed class QuotaLedger
                 fileName,
                 allowed: true,
                 counter.Count,
-                limit,
+                recordedLimit,
                 "allowed");
         }
     }
@@ -209,12 +216,12 @@ public sealed class QuotaLedger
         };
     }
 
-    private static int ParseLimit(string variable, int fallback)
+    private static int? ParseLimit(string variable)
     {
         var value = Environment.GetEnvironmentVariable(variable);
         if (string.IsNullOrWhiteSpace(value))
         {
-            return fallback;
+            return null;
         }
 
         if (!int.TryParse(value.Trim(), out var parsed) || parsed <= 0)

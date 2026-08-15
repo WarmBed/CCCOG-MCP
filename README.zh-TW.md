@@ -93,9 +93,10 @@ CCCG 的定位是受控測試,不是隱藏「到底是誰回答的」。每個�
 
 CCCG 生的任何 provider 子行程都帶著 `CCCG_HOP`;新派工計算
 `jobHop = processHop + 1`,超過 `CCCG_MAX_HOP`(預設 2)直接 fail-closed——
-A 叫 B、B 又叫 A 的循環在任何 provider 啟動前就被確定性擋下。每呼叫者每日
-額度(`claude` 50/日、其他 200/日;`CCCG_QUOTA_CLAUDE` /
-`CCCG_QUOTA_DEFAULT` 可覆寫)原子化計數、本地午夜重置。每個遞迴
+A 叫 B、B 又叫 A 的循環在任何 provider 啟動前就被確定性擋下。每個呼叫者的
+每日使用量一律在本地 ledger 原子化計數，並於本地午夜重置。每日額度拒絕是
+選配：只有把 `CCCG_QUOTA_CLAUDE` 或 `CCCG_QUOTA_DEFAULT` 設為正整數才啟用
+對應 provider 限額；兩者都未設定時，派工不受次數限制。每個遞迴
 (`hop >= 1`)派工都會往信箱寫一條 `fromRole=system` 稽核訊息——誰在哪個
 cwd 用什麼模型叫了誰——絕不含 prompt 內容。Claude 子 session 預設純文字;
 `CCCG_CLAUDE_CHILD_MODE=tools` 精準放行 `--allowed-tools WebSearch,WebFetch`

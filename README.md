@@ -97,9 +97,11 @@ third-party model is an Anthropic model.
 Any provider child spawned by CCCG carries `CCCG_HOP`; a new dispatch computes
 `jobHop = processHop + 1` and fails closed above `CCCG_MAX_HOP` (default 2), so
 A-calls-B-calls-A loops die deterministically before any provider starts.
-Per-caller daily quotas (`claude` 50/day, others 200/day;
-`CCCG_QUOTA_CLAUDE` / `CCCG_QUOTA_DEFAULT` override) are enforced atomically
-and reset at local midnight. Every recursive (`hop >= 1`) dispatch posts a
+Per-caller daily usage is always counted atomically in the local ledger and
+resets at local midnight. Daily quota rejection is opt-in: setting
+`CCCG_QUOTA_CLAUDE` or `CCCG_QUOTA_DEFAULT` to a positive integer enables that
+provider limit; with neither variable set, dispatches are unlimited by count.
+Every recursive (`hop >= 1`) dispatch posts a
 `fromRole=system` audit line to the inbox — who called whom, from which cwd,
 with which model — never the prompt text. Claude child sessions default to
 text-only; `CCCG_CLAUDE_CHILD_MODE=tools` grants exactly

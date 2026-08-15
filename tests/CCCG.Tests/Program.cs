@@ -45,12 +45,6 @@ foreach (var variable in new[]
     Environment.SetEnvironmentVariable(variable, null);
 }
 
-// Keep integration fixtures repeatable when the same developer machine has
-// already accumulated real dispatch quota counters.  QuotaLedger unit tests
-// inject their own roots and limits, so this does not weaken those assertions.
-Environment.SetEnvironmentVariable("CCCG_QUOTA_CLAUDE", "1000000");
-Environment.SetEnvironmentVariable("CCCG_QUOTA_DEFAULT", "1000000");
-
 var tests = new (string Name, Action Run)[]
 {
     ("arguments parse split and inline values", ArgumentsParse),
@@ -147,6 +141,7 @@ var tests = new (string Name, Action Run)[]
     ("owner provider child receives hop environment", OwnerProviderChildReceivesHopEnvironment),
     ("host worker preserves inherited hop environment", HostWorkerPreservesInheritedHopEnvironment),
     ("quota counts by source provider and date", QuotaCountsBySourceProviderAndDate),
+    ("quota without env counts but never rejects", QuotaWithoutEnvironmentCountsButNeverRejects),
     ("quota uses Claude and default overrides", QuotaUsesClaudeAndDefaultOverrides),
     ("quota rejects at limit with tomorrow reset", QuotaRejectsAtLimitWithTomorrowReset),
     ("quota resets across local date", QuotaResetsAcrossLocalDate),
@@ -2532,18 +2527,53 @@ static void QuotaCountsBySourceProviderAndDate()
     var now = new DateTimeOffset(2026, 8, 15, 9, 0, 0, TimeSpan.FromHours(8));
     try
     {
-        var ledger = new QuotaLedger(root, () => now, claudeLimit: 2, defaultLimit: 3);
-        var first = ledger.TryConsume("user:a@pc", "claude");
-        var second = ledger.TryConsume("user:a@pc", "claude");
-        var otherProvider = ledger.TryConsume("user:a@pc", "codex");
-        var otherSource = ledger.TryConsume("user:b@pc", "claude");
-        True(first.Allowed);
-        Equal(1, first.Count);
-        True(second.Allowed);
-        Equal(2, second.Count);
-        True(otherProvider.Allowed);
-        True(otherSource.Allowed);
-        Equal(3, Directory.EnumerateFiles(Path.Combine(root, "2026-08-15"), "*.json").Count());
+        WithQuotaEnvironment("2", "3", () =>
+        {
+            var ledger = new QuotaLedger(root, () => now);
+            var first = ledger.TryConsume("user:a@pc", "claude");
+            var second = ledger.TryConsume("user:a@pc", "claude");
+            var otherProvider = ledger.TryConsume("user:a@pc", "codex");
+            var otherSource = ledger.TryConsume("user:b@pc", "claude");
+            True(first.Allowed);
+            Equal(1, first.Count);
+            True(second.Allowed);
+            Equal(2, second.Count);
+            True(otherProvider.Allowed);
+            True(otherSource.Allowed);
+            Equal(3, Directory.EnumerateFiles(Path.Combine(root, "2026-08-15"), "*.json").Count());
+        });
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void QuotaWithoutEnvironmentCountsButNeverRejects()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-quota-unlimited-{Guid.NewGuid():N}");
+    try
+    {
+        WithQuotaEnvironment(null, null, () =>
+        {
+            var now = new DateTimeOffset(2026, 8, 15, 9, 0, 0, TimeSpan.FromHours(8));
+            var ledger = new QuotaLedger(root, () => now);
+            QuotaReservation? last = null;
+            for (var index = 0; index < 205; index++)
+            {
+                last = ledger.TryConsume("user:a@pc", "grok");
+                True(last.Allowed);
+            }
+
+            Equal(205, last!.Count);
+            var counterPath = Directory.EnumerateFiles(
+                Path.Combine(root, "2026-08-15"), "*.json")
+                .Single();
+            True(File.ReadAllText(counterPath).Contains("\"count\":205", StringComparison.Ordinal));
+        });
     }
     finally
     {
@@ -2559,16 +2589,15 @@ static void QuotaUsesClaudeAndDefaultOverrides()
     var root = Path.Combine(Path.GetTempPath(), $"cccg-quota-override-{Guid.NewGuid():N}");
     try
     {
-        var ledger = new QuotaLedger(
-            root,
-            () => DateTimeOffset.UtcNow,
-            claudeLimit: 1,
-            defaultLimit: 2);
-        True(ledger.TryConsume("user:a@pc", "claude").Allowed);
-        True(!ledger.TryConsume("user:a@pc", "claude").Allowed);
-        True(ledger.TryConsume("user:a@pc", "grok").Allowed);
-        True(ledger.TryConsume("user:a@pc", "grok").Allowed);
-        True(!ledger.TryConsume("user:a@pc", "grok").Allowed);
+        WithQuotaEnvironment("1", "2", () =>
+        {
+            var ledger = new QuotaLedger(root, () => DateTimeOffset.UtcNow);
+            True(ledger.TryConsume("user:a@pc", "claude").Allowed);
+            True(!ledger.TryConsume("user:a@pc", "claude").Allowed);
+            True(ledger.TryConsume("user:a@pc", "grok").Allowed);
+            True(ledger.TryConsume("user:a@pc", "grok").Allowed);
+            True(!ledger.TryConsume("user:a@pc", "grok").Allowed);
+        });
     }
     finally
     {
@@ -2584,14 +2613,17 @@ static void QuotaRejectsAtLimitWithTomorrowReset()
     var root = Path.Combine(Path.GetTempPath(), $"cccg-quota-limit-{Guid.NewGuid():N}");
     try
     {
-        var ledger = new QuotaLedger(root, () => DateTimeOffset.UtcNow, claudeLimit: 1, defaultLimit: 1);
-        True(ledger.TryConsume("user:a@pc", "claude").Allowed);
-        var rejected = ledger.TryConsume("user:a@pc", "claude");
-        True(!rejected.Allowed);
-        Equal(1, rejected.Count);
-        Equal(1, rejected.Limit);
-        True(rejected.Message.Contains("resets tomorrow", StringComparison.Ordinal));
-        True(rejected.Message.Contains("claude", StringComparison.Ordinal));
+        WithQuotaEnvironment("1", "1", () =>
+        {
+            var ledger = new QuotaLedger(root, () => DateTimeOffset.UtcNow);
+            True(ledger.TryConsume("user:a@pc", "claude").Allowed);
+            var rejected = ledger.TryConsume("user:a@pc", "claude");
+            True(!rejected.Allowed);
+            Equal(1, rejected.Count);
+            Equal(1, rejected.Limit);
+            True(rejected.Message.Contains("resets tomorrow", StringComparison.Ordinal));
+            True(rejected.Message.Contains("claude", StringComparison.Ordinal));
+        });
     }
     finally
     {
@@ -2608,14 +2640,17 @@ static void QuotaResetsAcrossLocalDate()
     var now = new DateTimeOffset(2026, 8, 15, 23, 59, 0, TimeSpan.FromHours(8));
     try
     {
-        var ledger = new QuotaLedger(root, () => now, claudeLimit: 1, defaultLimit: 1);
-        True(ledger.TryConsume("user:a@pc", "claude").Allowed);
-        True(!ledger.TryConsume("user:a@pc", "claude").Allowed);
-        now = now.AddMinutes(2);
-        var nextDay = ledger.TryConsume("user:a@pc", "claude");
-        True(nextDay.Allowed);
-        Equal(1, nextDay.Count);
-        True(File.Exists(Path.Combine(root, "2026-08-16", nextDay.FileName)));
+        WithQuotaEnvironment("1", "1", () =>
+        {
+            var ledger = new QuotaLedger(root, () => now);
+            True(ledger.TryConsume("user:a@pc", "claude").Allowed);
+            True(!ledger.TryConsume("user:a@pc", "claude").Allowed);
+            now = now.AddMinutes(2);
+            var nextDay = ledger.TryConsume("user:a@pc", "claude");
+            True(nextDay.Allowed);
+            Equal(1, nextDay.Count);
+            True(File.Exists(Path.Combine(root, "2026-08-16", nextDay.FileName)));
+        });
     }
     finally
     {
@@ -2631,13 +2666,16 @@ static void QuotaReservationRollsBack()
     var root = Path.Combine(Path.GetTempPath(), $"cccg-quota-release-{Guid.NewGuid():N}");
     try
     {
-        var ledger = new QuotaLedger(root, () => DateTimeOffset.UtcNow, claudeLimit: 1, defaultLimit: 1);
-        var reservation = ledger.TryConsume("user:a@pc", "claude");
-        True(reservation.Allowed);
-        ledger.Release(reservation);
-        var retry = ledger.TryConsume("user:a@pc", "claude");
-        True(retry.Allowed);
-        Equal(1, retry.Count);
+        WithQuotaEnvironment("1", "1", () =>
+        {
+            var ledger = new QuotaLedger(root, () => DateTimeOffset.UtcNow);
+            var reservation = ledger.TryConsume("user:a@pc", "claude");
+            True(reservation.Allowed);
+            ledger.Release(reservation);
+            var retry = ledger.TryConsume("user:a@pc", "claude");
+            True(retry.Allowed);
+            Equal(1, retry.Count);
+        });
     }
     finally
     {
@@ -3846,6 +3884,23 @@ static void TryDelete(string path)
     }
     catch (IOException)
     {
+    }
+}
+
+static void WithQuotaEnvironment(string? claude, string? @default, Action action)
+{
+    var previousClaude = Environment.GetEnvironmentVariable("CCCG_QUOTA_CLAUDE");
+    var previousDefault = Environment.GetEnvironmentVariable("CCCG_QUOTA_DEFAULT");
+    try
+    {
+        Environment.SetEnvironmentVariable("CCCG_QUOTA_CLAUDE", claude);
+        Environment.SetEnvironmentVariable("CCCG_QUOTA_DEFAULT", @default);
+        action();
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("CCCG_QUOTA_CLAUDE", previousClaude);
+        Environment.SetEnvironmentVariable("CCCG_QUOTA_DEFAULT", previousDefault);
     }
 }
 
