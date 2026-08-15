@@ -17,7 +17,11 @@ public sealed partial class MainWindow : Window
     private readonly LocalSnapshotReader _reader = new();
     private readonly DispatcherQueueTimer _refreshTimer;
     private readonly DispatcherQueueTimer _quotaTimer;
+    private readonly List<Storyboard> _runningAnimations = [];
     private FileSystemWatcher? _watcher;
+    private int _quotaPollInFlight;
+    private bool _closing;
+    private bool _viewReady;
     private string _provider = "all";
 
     public MainWindow()
@@ -42,11 +46,14 @@ public sealed partial class MainWindow : Window
         _quotaTimer.Tick += (_, _) => RefreshQuotaCards();
         Closed += (_, _) =>
         {
+            _closing = true;
             _watcher?.Dispose();
             _refreshTimer.Stop();
             _quotaTimer.Stop();
+            StopAnimations();
             AppWindow.Hide();
         };
+        _viewReady = true;
         StartFileWatcher();
         RefreshView();
         _quotaTimer.Start();
@@ -72,7 +79,12 @@ public sealed partial class MainWindow : Window
 
     private void RefreshView()
     {
+        if (_closing || !_viewReady)
+        {
+            return;
+        }
         var snapshot = _reader.Read(_provider);
+        StopAnimations();
         GraphCanvas.Children.Clear();
         var positions = new Dictionary<string, (double X, double Y)>(StringComparer.Ordinal);
         var index = 0;
@@ -146,11 +158,21 @@ public sealed partial class MainWindow : Window
                 Storyboard.SetTarget(animation, card);
                 Storyboard.SetTargetProperty(animation, "Opacity");
                 storyboard.Begin();
+                _runningAnimations.Add(storyboard);
             }
         }
 
         RefreshQuotaCards();
         StatusText.Text = $"{snapshot.Jobs} dispatch records · refreshed {DateTime.Now:HH:mm:ss}";
+    }
+
+    private void StopAnimations()
+    {
+        foreach (var storyboard in _runningAnimations)
+        {
+            storyboard.Stop();
+        }
+        _runningAnimations.Clear();
     }
 
     private void StartFileWatcher()
@@ -168,11 +190,19 @@ public sealed partial class MainWindow : Window
         };
         FileSystemEventHandler changed = (_, _) => DispatcherQueue.TryEnqueue(() =>
         {
+            if (_closing)
+            {
+                return;
+            }
             _refreshTimer.Stop();
             _refreshTimer.Start();
         });
         RenamedEventHandler renamed = (_, _) => DispatcherQueue.TryEnqueue(() =>
         {
+            if (_closing)
+            {
+                return;
+            }
             _refreshTimer.Stop();
             _refreshTimer.Start();
         });
@@ -184,17 +214,44 @@ public sealed partial class MainWindow : Window
 
     private void RefreshQuotaCards()
     {
-        var cards = NativeQuotaClient.TryPoll();
-        QuotaCardsList.ItemsSource = cards.Count == 0
-            ? new[]
+        if (_closing || Interlocked.Exchange(ref _quotaPollInFlight, 1) != 0)
+        {
+            return;
+        }
+        _ = Task.Run(() =>
+        {
+            IReadOnlyList<QuotaCardViewModel> cards;
+            try
             {
-                new QuotaCardViewModel
-                {
-                    Label = "Provider quota", UsedPercent = 0,
-                    ResetText = "Refresh unavailable", StateText = "stale / unavailable",
-                },
+                cards = NativeQuotaClient.TryPoll();
             }
-            : cards;
+            catch (Exception exception)
+            {
+                CrashLog.Append(exception);
+                cards = [];
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _quotaPollInFlight, 0);
+            }
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (_closing)
+                {
+                    return;
+                }
+                QuotaCardsList.ItemsSource = cards.Count == 0
+                    ? new[]
+                    {
+                        new QuotaCardViewModel
+                        {
+                            Label = "Provider quota", UsedPercent = 0,
+                            ResetText = "Refresh unavailable", StateText = "stale / unavailable",
+                        },
+                    }
+                    : cards;
+            });
+        });
     }
 }
 
@@ -237,6 +294,14 @@ internal static class NativeQuotaClient
             return [];
         }
         catch (EntryPointNotFoundException)
+        {
+            return [];
+        }
+        catch (BadImageFormatException)
+        {
+            return [];
+        }
+        catch (ExternalException)
         {
             return [];
         }
