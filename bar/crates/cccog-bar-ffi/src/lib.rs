@@ -9,9 +9,10 @@ use cccog_bar_core::dispatch::parse_status;
 use cccog_bar_core::graph::GraphSnapshot;
 use cccog_bar_core::owners::is_archived_path;
 use cccog_bar_quota::{
-    extract_reset_date, fetch_claude_quota, fetch_grok_quota, load_claude_credential,
-    load_codex_quota_from_sessions, load_grok_token, looks_like_quota_limit_error, HttpClient,
-    HttpRequest, HttpResponse, PollGate, QuotaCards, QuotaState, QuotaWindow,
+    extract_human_reset_date, extract_reset_date, fetch_claude_quota, fetch_grok_quota,
+    load_claude_credential, load_codex_quota_from_sessions, load_grok_token,
+    looks_like_quota_limit_error, looks_like_quota_limit_output, HttpClient, HttpRequest,
+    HttpResponse, PollGate, QuotaCards, QuotaState, QuotaWindow,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -325,6 +326,47 @@ fn find_quota_limit_failure(
     found
 }
 
+/// Bounded tail read (last [`LOG_TAIL_MAX_BYTES`]) — the provider CLI's own
+/// error message is emitted near the end of the log, so there's no need to
+/// read the whole file (same convention `cccog-bar-quota`'s codex rollout
+/// reader uses).
+const LOG_TAIL_MAX_BYTES: u64 = 4 * 1024;
+
+fn read_log_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(LOG_TAIL_MAX_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The first quota-limit signal text for a failed job: its own `error`
+/// field (generic marker check) first, then bounded tails of
+/// `stdout.log`/`stderr.log` (provider-specific marker check). Needed
+/// because the wrapper's `status.json` can record a generic "Provider
+/// exited with code 1." while the provider CLI's real rejection message
+/// only reached stdout — verified real case: job
+/// `20260815T141347Z_ce298f32` (codex). See `bar/SYNC.md`.
+fn quota_limit_signal_text(provider: &str, status_error: Option<&str>, job_dir: &Path) -> Option<String> {
+    if let Some(error) = status_error {
+        if looks_like_quota_limit_error(error) {
+            return Some(error.to_owned());
+        }
+    }
+    for filename in ["stdout.log", "stderr.log"] {
+        let Some(tail) = read_log_tail(&job_dir.join(filename)) else {
+            continue;
+        };
+        if looks_like_quota_limit_output(provider, &tail) {
+            return Some(tail);
+        }
+    }
+    None
+}
+
 fn walk_jobs_for_quota_failure(
     dir: &Path,
     provider: &str,
@@ -358,12 +400,6 @@ fn walk_jobs_for_quota_failure(
         if !status.provider.eq_ignore_ascii_case(provider) {
             continue;
         }
-        let Some(error) = status.error.as_deref() else {
-            continue;
-        };
-        if !looks_like_quota_limit_error(error) {
-            continue;
-        }
         let Some(at) = status
             .finished_at
             .as_deref()
@@ -378,9 +414,18 @@ fn walk_jobs_for_quota_failure(
         if !(0..=JOB_FAILURE_LOOKBACK_SECS).contains(&age) {
             continue;
         }
+        let Some(job_dir) = path.parent() else {
+            continue;
+        };
+        let Some(signal_text) =
+            quota_limit_signal_text(provider, status.error.as_deref(), job_dir)
+        else {
+            continue;
+        };
         let candidate = QuotaLimitFailure {
             at,
-            reset_hint: extract_reset_date(error),
+            reset_hint: extract_human_reset_date(&signal_text)
+                .or_else(|| extract_reset_date(&signal_text)),
         };
         let is_newer = found.as_ref().is_none_or(|existing| candidate.at > existing.at);
         if is_newer {
@@ -390,15 +435,14 @@ fn walk_jobs_for_quota_failure(
 }
 
 /// Overrides a card to an honest "we saw this happen" state: a single 100%
-/// window (so the shell paints the red 100% bar the operator asked for) and
-/// a diagnostic naming the dispatch failure's own timestamp — never a
-/// synthesized percentage or an invented reset date.
+/// window — the red-bar color communicates blocked-ness as a status color,
+/// never a synthesized percentage — and a diagnostic naming the dispatch
+/// failure's own timestamp plus the reset date literally found in its
+/// message, or the word "unknown" when none was found (never invented).
 fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> QuotaCards {
     let time_text = failure.at.format("%H:%M").to_string();
-    let diagnostic = match &failure.reset_hint {
-        Some(reset) => format!("limit reached (per dispatch failure at {time_text}) · resets {reset}"),
-        None => format!("limit reached (per dispatch failure at {time_text})"),
-    };
+    let reset_text = failure.reset_hint.as_deref().unwrap_or("unknown");
+    let diagnostic = format!("limit reached (dispatch failure {time_text}) · resets {reset_text}");
     QuotaCards {
         client_id: card.client_id,
         windows: vec![QuotaWindow {

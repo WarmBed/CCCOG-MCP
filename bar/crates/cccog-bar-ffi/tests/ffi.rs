@@ -178,6 +178,28 @@ fn write_failed_job(root: &std::path::Path, id: &str, provider: &str, finished_a
     .unwrap();
 }
 
+/// Same as `write_failed_job`, plus a `stdout.log` — for the case where
+/// `status.json`'s own `error` is a generic wrapper message and the real
+/// quota rejection only reached the provider CLI's process output.
+fn write_failed_job_with_stdout(
+    root: &std::path::Path,
+    id: &str,
+    provider: &str,
+    finished_at: &str,
+    status_error: &str,
+    stdout: &str,
+) {
+    write_failed_job(root, id, provider, finished_at, status_error);
+    std::fs::write(root.join(id).join("stdout.log"), stdout).unwrap();
+}
+
+/// Real message, byte-for-byte from job 20260815T141347Z_ce298f32's
+/// stdout.log tail (verified on the operator's machine) — see bar/SYNC.md.
+const REAL_CODEX_STDOUT_USAGE_LIMIT: &str = "{\"type\":\"thread.started\",\"thread_id\":\"019fe5e1-ce57-7b83-9235-6ace526d929d\"}\n\
+{\"type\":\"turn.started\"}\n\
+{\"type\":\"error\",\"message\":\"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 20th, 2026 11:50 AM.\"}\n\
+{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 20th, 2026 11:50 AM.\"}}\n";
+
 #[test]
 fn stale_snapshot_past_one_hour_is_flagged_and_annotated_with_its_age() {
     let fresh_at = (NOW_SECONDS - 20 * 60) * 1_000; // 20 minutes old
@@ -216,7 +238,35 @@ fn job_failure_override_beats_the_stale_annotation_and_carries_the_failure_time(
     assert_eq!(card.windows[0].remaining_percent, 0.0);
     assert_eq!(
         card.diagnostic.as_deref(),
-        Some("limit reached (per dispatch failure at 09:30) · resets 2026-08-20T00:00:00Z")
+        Some("limit reached (dispatch failure 09:30) · resets 2026-08-20T00:00:00Z")
+    );
+}
+
+#[test]
+fn job_failure_override_scans_stdout_tail_when_status_error_is_generic() {
+    // The real-world case: status.json's own error is the wrapper's
+    // generic "exited with code 1", not the provider's actual message —
+    // the override must still fire from the stdout.log tail.
+    let root = tempfile::tempdir().unwrap();
+    // Same job id/content as the real fixture; the timestamp is shifted
+    // earlier (still within the 24h lookback) so it precedes this test's
+    // fixed NOW_SECONDS (2026-08-15T12:00:00Z) — the operator's own machine
+    // observed the real finishedAt (14:13:56Z) after that instant, which a
+    // fixed "now" in a test can't be.
+    write_failed_job_with_stdout(
+        root.path(),
+        "20260815T141347Z_ce298f32",
+        "codex",
+        "2026-08-15T09:13:56Z",
+        "Provider exited with code 1.",
+        REAL_CODEX_STDOUT_USAGE_LIMIT,
+    );
+    let cards = enrich_quota_cards(vec![codex_card(None)], Some(root.path()), NOW_SECONDS);
+    let card = &cards[0];
+    assert_eq!(card.windows[0].used_percent, 100.0, "red 100% bar");
+    assert_eq!(
+        card.diagnostic.as_deref(),
+        Some("limit reached (dispatch failure 09:13) · resets Aug 20th, 2026 11:50 AM")
     );
 }
 

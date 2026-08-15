@@ -600,6 +600,32 @@ fn time_suffix_len(rest: &str) -> Option<usize> {
     Some(end)
 }
 
+/// Provider-specific markers checked against a failed job's stdout/stderr
+/// tail — used when the wrapper's `status.json` `error` field is a generic
+/// "exited with code 1" but the provider CLI's own message (its real quota
+/// rejection) landed in the process output instead. Real case: job
+/// `20260815T141347Z_ce298f32` (codex) had `error: "Provider exited with
+/// code 1."` while `stdout.log`'s tail carried the actual
+/// `{"type":"error","message":"You've hit your usage limit. ..."}` event.
+pub fn looks_like_quota_limit_output(provider: &str, text: &str) -> bool {
+    let lower = text.to_lowercase();
+    match provider.to_lowercase().as_str() {
+        "codex" => lower.contains("hit your usage limit") || lower.contains("usage_limit"),
+        "grok" => lower.contains("402") || lower.contains("credits"),
+        _ => looks_like_quota_limit_error(text),
+    }
+}
+
+/// Best-effort human-readable reset-date extraction (e.g. "Aug 20th, 2026
+/// 11:50 AM" out of "...or try again at Aug 20th, 2026 11:50 AM."). Returns
+/// the exact matched substring — never a reformatted or invented date — or
+/// `None` when nothing date-shaped is present.
+pub fn extract_human_reset_date(text: &str) -> Option<String> {
+    static PATTERN: &str = r"(?i)\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}(?:,?\s+\d{1,2}:\d{2}\s*(?:am|pm))?";
+    let re = regex::Regex::new(PATTERN).ok()?;
+    re.find(text).map(|found| found.as_str().to_owned())
+}
+
 #[cfg(test)]
 mod quota_limit_error_tests {
     use super::*;
@@ -615,6 +641,39 @@ mod quota_limit_error_tests {
         assert!(!looks_like_quota_limit_error(
             "An error occurred trying to start process 'codex.exe'"
         ));
+    }
+
+    /// Verified real message (job 20260815T141347Z_ce298f32, codex,
+    /// stdout.log tail) — see bar/SYNC.md.
+    const REAL_CODEX_USAGE_LIMIT_STDOUT: &str = r#"{"type":"thread.started","thread_id":"019fe5e1-ce57-7b83-9235-6ace526d929d"}
+{"type":"turn.started"}
+{"type":"error","message":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 20th, 2026 11:50 AM."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 20th, 2026 11:50 AM."}}
+"#;
+
+    #[test]
+    fn recognizes_the_real_codex_stdout_usage_limit_message_and_ignores_unrelated_output() {
+        assert!(looks_like_quota_limit_output("codex", REAL_CODEX_USAGE_LIMIT_STDOUT));
+        assert!(looks_like_quota_limit_output("grok", "HTTP 402 Payment Required"));
+        assert!(looks_like_quota_limit_output("grok", "insufficient credits"));
+        assert!(!looks_like_quota_limit_output(
+            "codex",
+            "failed to refresh available models: unexpected status 401 Unauthorized"
+        ));
+        assert!(!looks_like_quota_limit_output("grok", "Provider exited with code 1."));
+    }
+
+    #[test]
+    fn extracts_the_human_reset_date_from_the_real_codex_message() {
+        assert_eq!(
+            extract_human_reset_date(REAL_CODEX_USAGE_LIMIT_STDOUT),
+            Some("Aug 20th, 2026 11:50 AM".to_owned())
+        );
+        assert_eq!(
+            extract_human_reset_date("resets January 3, 2027"),
+            Some("January 3, 2027".to_owned())
+        );
+        assert_eq!(extract_human_reset_date("no date shape at all here"), None);
     }
 
     #[test]

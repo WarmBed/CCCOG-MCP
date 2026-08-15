@@ -87,3 +87,37 @@ finished), so its Agent-limits card itself wasn't on screen yet; the sampled
 "card surface" is its selected-tab pill background, per the acceptance
 criteria's fallback ("if TokenBar is still on its loading screen, its
 chrome/header/tab area is already representative").
+
+## 2026-08-16 quota job-failure cross-check: process-output scan
+
+The job-failure cross-check above (walking `dispatch/jobs`, checking each
+failed job's `status.json` `error` field) missed a real, currently-active
+block: job `20260815T141347Z_ce298f32` (codex, `cwd:
+D:\code\TokenBar-Windows`) has `status.json` `error: "Provider exited with
+code 1."` — generic, matches nothing — while its `stdout.log` tail carries
+the provider CLI's own message:
+
+```
+{"type":"error","message":"You've hit your usage limit. Upgrade to Pro
+(https://chatgpt.com/explore/pro), visit
+https://chatgpt.com/codex/settings/usage to purchase more credits or try
+again at Aug 20th, 2026 11:50 AM."}
+```
+
+`cccog-bar-ffi`'s `walk_jobs_for_quota_failure` now also reads a bounded
+(4 KiB) tail of `stdout.log`/`stderr.log` next to a failed job's
+`status.json` and checks it with `cccog_bar_quota::looks_like_quota_limit_output`
+(provider-specific markers: codex `"hit your usage limit"`/`"usage_limit"`,
+grok `"402"`/`"credits"`) whenever the `status.json` `error` field itself
+didn't already match. `extract_human_reset_date` (new, `regex`-crate-backed)
+extracts a spelled-out date like `"Aug 20th, 2026 11:50 AM"` verbatim from
+the matched text; `apply_quota_limit_override`'s diagnostic now always names
+a reset — the extracted text, or the literal word `"unknown"` — never a
+guess. Verified end to end by relaunching the built app against this
+machine's real dispatch history: the codex card corrected to `"Limit / 100%
+used / limit reached (dispatch failure 14:13) · resets Aug 20th, 2026 11:50
+AM"`, and — unprompted, from the same real data — the grok card also
+corrected (a second, independently-discovered real failure, job
+`20260815T045341Z_c0d1a224`: `stdout.log` carried `"API error (status 402
+Payment Required): Grok Build usage balance exhausted"`, no date present, so
+`"resets unknown"`).
