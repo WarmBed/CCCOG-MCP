@@ -2,10 +2,16 @@
 
 [English](README.md) | 繁體中文
 
-CCCG(Claude / Codex / Grok)是 Windows 上的本地多 Agent 互通工具組。核心是
-**Dispatch MCP**:讓 Claude(Desktop 或 Code)擔任總協調,把工作派給
-Grok、Codex 或安全模式的 Claude session——包括人類自己開過的歷史 session——
-具備持久化 job、真實送達回執、每次派工可指定模型、以及可熱更新的 worker。
+你平常大概同時開著 Claude、Codex、Grok 三種視窗,但它們彼此完全不認識。
+CCCG(Claude / Codex / Grok)在你自己的電腦上解決這件事:讓 Claude 當總
+指揮——它可以把任務丟給 Codex 或 Grok、指定這一單用哪顆模型(例如
+`gpt-5.6-luna` 開 `xhigh`)、等對方做完收回結果,甚至接著你幾天前自己在
+別的視窗聊到一半的對話繼續派工。
+
+要做到這些,底下需要真正的水電工程:炸不掉的持久化 job 佇列、「對方真的
+處理完才算送達」的回執(而不是「按鍵送出去了」就當成功)、涵蓋三家的
+session 目錄、以及不用重啟就能熱換的 worker。這套水電就是 **Dispatch
+MCP**,也是這個 repo 的核心。
 
 CCCG 的定位是受控測試,不是隱藏「到底是誰回答的」。每個產生的回答都會標注
 真實的 provider 與後端模型。CCCG 不修補 Claude 執行檔、不挪用 Claude 憑證、

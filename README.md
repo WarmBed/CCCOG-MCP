@@ -2,11 +2,17 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-CCCG (Claude / Codex / Grok) is a local multi-agent interoperability toolkit for
-Windows. Its core is the **Dispatch MCP**: Claude (Desktop or Code) stays the
-coordinator and delegates work to Grok, Codex, or safe-mode Claude sessions —
-including sessions the human originally opened themselves — with durable jobs,
-real delivery receipts, per-dispatch model selection, and hot-updatable workers.
+You probably run Claude, Codex, and Grok in separate windows that know nothing
+about each other. CCCG (Claude / Codex / Grok) fixes that on your own machine:
+Claude becomes the coordinator — it can hand a task to Codex or Grok, pick
+which model answers (`gpt-5.6-luna` at `xhigh`, say), wait for the result, and
+even continue a conversation you started yourself in another window days ago.
+
+Under the hood that takes real plumbing: a durable job queue that survives
+crashes, delivery receipts that only fire when the other agent actually
+processed the message (not "keystrokes were sent"), a session directory for
+all three providers, and workers you can hot-swap without restarting anything.
+That plumbing is the **Dispatch MCP**, and it is the core of this repo.
 
 CCCG is designed for controlled testing, not for concealing which provider
 answered. Every generated answer is labeled with the actual provider and
