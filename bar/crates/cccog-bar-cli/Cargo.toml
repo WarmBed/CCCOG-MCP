@@ -11,4 +11,5 @@ path = "src/main.rs"
 cccog-bar-core = { path = "../cccog-bar-core" }
 cccog-bar-ffi = { path = "../cccog-bar-ffi" }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 

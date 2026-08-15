@@ -1,5 +1,5 @@
 use cccog_bar_core::refresh::snapshot_dispatch_root;
-use cccog_bar_ffi::{envelope_from_parts, poll_remote_quotas_with_codex};
+use cccog_bar_ffi::{control_snapshot_json, envelope_from_parts, poll_remote_quotas_with_codex};
 use std::path::PathBuf;
 
 fn dispatch_root() -> PathBuf {
@@ -19,6 +19,21 @@ fn dispatch_root() -> PathBuf {
 
 fn main() {
     let root = dispatch_root();
+
+    // --control: print the windowed/aggregated Flow view (the same payload
+    // the shell's NativeControlClient consumes) instead of the raw graph
+    // snapshot — useful for checking row counts and target-title resolution
+    // against a real dispatch root without launching the WinUI app.
+    if std::env::args_os().any(|arg| arg == "--control") {
+        let now = chrono::Utc::now();
+        let input = serde_json::json!({
+            "dispatchRoot": root.to_string_lossy(),
+            "now": now.timestamp(),
+        });
+        println!("{}", control_snapshot_json(&input.to_string()));
+        return;
+    }
+
     let snapshot = snapshot_dispatch_root(&root);
     let diagnostics = snapshot.diagnostics.clone();
     let poll = std::env::args_os().any(|arg| arg == "--poll-quotas");

@@ -63,6 +63,7 @@ version = "0.1.0"
 dependencies = [
  "cccog-bar-core",
  "cccog-bar-ffi",
+ "chrono",
  "serde_json",
 ]
 
