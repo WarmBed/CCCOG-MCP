@@ -159,8 +159,6 @@ dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 135 個
   確定性垂直切片,完整揭露 provider;已打包、可回復、不自動安裝。見
   [Desktop Luna experiment](docs/desktop-luna-experiment.md) 與
   [provider adapters](docs/provider-adapters.md)。
-- **Bridge shim**——Desktop issue `#86012` 的可回復本地 workaround,維護於
-  [experiments/claude-desktop-bridge-shim](experiments/claude-desktop-bridge-shim/README.md)。
 
 ## 文件
 

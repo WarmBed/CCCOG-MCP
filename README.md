@@ -168,9 +168,6 @@ supported path for dispatch work.)
   packaged, reversible, not auto-installed. See
   [Desktop Luna experiment](docs/desktop-luna-experiment.md) and
   [provider adapters](docs/provider-adapters.md).
-- **Bridge shim** — reversible local workaround for Desktop issue `#86012`,
-  maintained under
-  [experiments/claude-desktop-bridge-shim](experiments/claude-desktop-bridge-shim/README.md).
 
 ## Docs
 
