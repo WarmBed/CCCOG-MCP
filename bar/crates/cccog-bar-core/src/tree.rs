@@ -106,12 +106,46 @@ pub struct OwnerInput {
     pub live: bool,
 }
 
+/// Task 4 (2026-08-16, operator-approved design, then amended to be
+/// independently toggleable rather than hard-wired together): the two
+/// control-edge rules the operator wants to A/B against real data before
+/// picking one. Both default `false` — the baseline is the ORIGINAL
+/// "latest edge wins" behavior, unchanged, so an absent/default config is
+/// explicit current behavior, not a silent third mode.
+///
+/// - `initiator_wins`: within a session PAIR, only the pair's INITIATOR
+///   (whoever sent the chronologically first in-window message, in either
+///   direction, marker or not) can ever become the other's controller.
+///   Every message in the opposite direction is a reply and is dropped
+///   before it can create an edge or flip control — this removes the A⇄B
+///   mutual-edge cycle at the source (`break_cycles` stays as a safety
+///   net, but should rarely trigger with this on).
+/// - `marker_only`: only edges whose message body starts with a dispatch
+///   marker (`claude_sessions::body_has_dispatch_marker`) are even
+///   considered candidates — a bare reply/report/ack never restructures
+///   the tree, regardless of direction.
+///
+/// The two compose: with both on, only a dispatch-marked message from the
+/// pair's initiator can create an edge (the operator's original combined
+/// design); with only one on, that rule alone applies to the raw edge set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeRules {
+    pub initiator_wins: bool,
+    pub marker_only: bool,
+}
+
 pub struct TreeBuildInput {
     pub sessions: Vec<SessionSummary>,
     pub presence: HashMap<String, PresenceRecord>,
     pub jobs: Vec<DispatchJobInput>,
     pub owners: Vec<OwnerInput>,
     pub now: DateTime<Utc>,
+    pub edge_rules: EdgeRules,
+    /// Session titles (exact match) that always render top-level and never
+    /// as anyone's child, and whose own dispatch edges win over a
+    /// non-pinned controller's when both claim the same child in-window.
+    /// Empty = feature off (default; absent config key).
+    pub pinned_coordinators: Vec<String>,
 }
 
 /// Resolve a session's own display state (`RUNNING_STATE`/`IDLE_STATE`) and
@@ -236,18 +270,62 @@ fn flatten_controllers_to_root(controller_of: &mut HashMap<String, String>) {
     }
 }
 
+/// One session's inbound message, already resolved to the sending
+/// session's id (unresolvable names and self-loops are dropped before this
+/// exists at all) — the shared unit both the edge-selection loop and the
+/// pair-initiator computation below operate on.
+struct ResolvedEdge {
+    controller_id: String,
+    at: DateTime<Utc>,
+    is_dispatch_marker: bool,
+}
+
+/// Unordered pair key so `(A, B)` and `(B, A)` traffic land in the same
+/// bucket regardless of which direction is being looked at.
+fn pair_key(a: &str, b: &str) -> (String, String) {
+    if a < b {
+        (a.to_owned(), b.to_owned())
+    } else {
+        (b.to_owned(), a.to_owned())
+    }
+}
+
+/// Rule 1's direction lock: for every unordered pair with traffic in
+/// either direction within the window, the pair's initiator is whoever
+/// sent the chronologically EARLIEST message — computed from the raw
+/// (unfiltered by marker) edge set, since "who spoke first" is a fact
+/// about the conversation itself, independent of whether `marker_only`
+/// separately restricts which of those messages can become an edge.
+fn compute_pair_initiators(resolved_edges: &HashMap<String, Vec<ResolvedEdge>>) -> HashMap<(String, String), String> {
+    let mut earliest: HashMap<(String, String), (DateTime<Utc>, String)> = HashMap::new();
+    for (receiver, edges) in resolved_edges {
+        for edge in edges {
+            let key = pair_key(receiver, &edge.controller_id);
+            let is_new_earliest = earliest.get(&key).is_none_or(|(at, _)| edge.at < *at);
+            if is_new_earliest {
+                earliest.insert(key, (edge.at, edge.controller_id.clone()));
+            }
+        }
+    }
+    earliest.into_iter().map(|(key, (_, sender))| (key, sender)).collect()
+}
+
 /// Build the flattened, depth-tagged tree.
 pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
-    let TreeBuildInput { sessions, presence, jobs, owners, now } = input;
+    let TreeBuildInput { sessions, presence, jobs, owners, now, edge_rules, pinned_coordinators } = input;
 
-    // Rule 3 dedup: for every session, pick the single most-recent inbound
-    // edge whose `name` resolves to ANOTHER live session — that session
-    // becomes this one's controller and it is removed from the top-level
-    // set. A session can't be its own controller (guards a degenerate
-    // self-addressed cross-session-message from creating a cycle).
-    let mut controller_of: HashMap<String, String> = HashMap::new(); // child session_id -> controller session_id
+    let by_id: HashMap<&str, &SessionSummary> = sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
+    let is_pinned = |session_id: &str| -> bool {
+        by_id.get(session_id).is_some_and(|session| pinned_coordinators.iter().any(|name| name == &session.title))
+    };
+
+    // Resolve every session's raw inbound edges once: name -> controller
+    // session id, dropping unresolvable names and self-loops. Everything
+    // below (rule 1's initiator lock, rule 2's marker filter, rule 3's
+    // dedup/pinned-precedence) operates on this already-resolved set.
+    let mut resolved_edges: HashMap<String, Vec<ResolvedEdge>> = HashMap::new();
     for session in &sessions {
-        let mut best: Option<(DateTime<Utc>, String)> = None;
+        let mut edges = Vec::new();
         for edge in &session.inbound_edges {
             let Some(controller) = find_controller(&sessions, &edge.from_name) else {
                 continue;
@@ -255,19 +333,68 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             if controller.session_id == session.session_id {
                 continue; // self-loop guard
             }
-            if best.as_ref().is_none_or(|(at, _)| edge.at > *at) {
-                best = Some((edge.at, controller.session_id.clone()));
+            edges.push(ResolvedEdge {
+                controller_id: controller.session_id.clone(),
+                at: edge.at,
+                is_dispatch_marker: edge.is_dispatch_marker,
+            });
+        }
+        resolved_edges.insert(session.session_id.clone(), edges);
+    }
+
+    let initiator_of_pair: HashMap<(String, String), String> = if edge_rules.initiator_wins {
+        compute_pair_initiators(&resolved_edges)
+    } else {
+        HashMap::new()
+    };
+
+    // Rule 3 dedup: for every session, pick the single best surviving
+    // inbound edge — filtered by rule 1 (initiator_wins) and rule 2
+    // (marker_only) first, then a pinned coordinator's edge always beats a
+    // non-pinned one regardless of recency, then most-recent-wins among
+    // whatever remains.
+    let mut controller_of: HashMap<String, String> = HashMap::new(); // child session_id -> controller session_id
+    for session in &sessions {
+        let edges = resolved_edges.get(session.session_id.as_str()).map(Vec::as_slice).unwrap_or_default();
+        let mut best: Option<&ResolvedEdge> = None;
+        for edge in edges {
+            if edge_rules.marker_only && !edge.is_dispatch_marker {
+                continue;
+            }
+            if edge_rules.initiator_wins {
+                let key = pair_key(&session.session_id, &edge.controller_id);
+                if initiator_of_pair.get(&key) != Some(&edge.controller_id) {
+                    continue; // a reply within this pair — never creates or flips an edge
+                }
+            }
+            let replace = match best {
+                None => true,
+                Some(current) => {
+                    let this_pinned = is_pinned(&edge.controller_id);
+                    let current_pinned = is_pinned(&current.controller_id);
+                    if this_pinned != current_pinned {
+                        this_pinned // a pinned sender wins regardless of recency
+                    } else {
+                        edge.at > current.at
+                    }
+                }
+            };
+            if replace {
+                best = Some(edge);
             }
         }
-        if let Some((_, controller_id)) = best {
-            controller_of.insert(session.session_id.clone(), controller_id);
+        if let Some(best) = best {
+            controller_of.insert(session.session_id.clone(), best.controller_id.clone());
         }
     }
     break_cycles(&mut controller_of);
     flatten_controllers_to_root(&mut controller_of);
+    // Rule 3 (pinned coordinators), final enforcement: a pinned session
+    // never renders as anyone's child, whatever the edge resolution above
+    // produced — this is a hard override, not just a precedence weight.
+    controller_of.retain(|child_id, _| !is_pinned(child_id));
 
     let child_session_ids: HashSet<&str> = controller_of.keys().map(String::as_str).collect();
-    let by_id: HashMap<&str, &SessionSummary> = sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
 
     let mut rows: Vec<TreeRow> = Vec::new();
 
@@ -469,6 +596,8 @@ mod tests {
             jobs: Vec::new(),
             owners: Vec::new(),
             now: at(NOW),
+            edge_rules: EdgeRules::default(),
+            pinned_coordinators: Vec::new(),
         }
     }
 
@@ -562,6 +691,189 @@ mod tests {
         assert_eq!(top_level_count, 1, "the cycle breaks to exactly one top-level anchor, not zero, not two");
         let child_count = rows.iter().filter(|r| r.depth == 1).count();
         assert_eq!(child_count, 1, "the other session nests under the anchor instead of vanishing");
+    }
+
+    /// Task 4 (2026-08-16): the SAME mutual-edge fixture as above, but with
+    /// `initiator_wins` on — the pair never even reaches `break_cycles`,
+    /// because only the chronologically first sender ("Doc4 新增", whose
+    /// message at 11:50 predates "CCCG開發"'s reply at 11:55) can ever
+    /// become a controller. This is the deterministic, semantically
+    /// correct resolution the tiebreak-based safety net could only
+    /// approximate by luck.
+    #[test]
+    fn the_old_cycle_fixture_resolves_deterministically_via_initiator_wins() {
+        let a = session_with_edge("a", "CCCG開發", "2026-08-16T11:59:00Z", "Doc4 新增", "2026-08-16T11:50:00Z");
+        let b = session_with_edge("b", "Doc4 新增", "2026-08-16T11:58:00Z", "CCCG開發", "2026-08-16T11:55:00Z");
+        let mut input = empty_input(vec![a, b]);
+        input.edge_rules = EdgeRules { initiator_wins: true, marker_only: false };
+        let rows = build_tree(input);
+
+        let top = rows.iter().filter(|r| r.depth == 0).collect::<Vec<_>>();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].label, "Doc4 新增", "Doc4 新增 spoke first (11:50 < 11:55), so it is the pair's initiator");
+        let children = rows.iter().filter(|r| r.depth == 1).collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].label, "CCCG開發");
+    }
+
+    fn init_and_reply_sessions() -> (SessionSummary, SessionSummary) {
+        // zz_init sends aa_reply a plain (non-marker) message FIRST
+        // (11:59:00) -- establishing it as the pair's initiator. aa_reply
+        // replies LATER (11:59:20) with a message that happens to look
+        // like a dispatch marker -- a realistic shape (an ack quoting a
+        // task-shaped subject line, say), not a contrived edge case.
+        let init_content = r#"{"type":"custom-title","customTitle":"ZInit","sessionId":"zz_init"}
+{"type":"user","timestamp":"2026-08-16T11:59:20Z","message":{"content":"<cross-session-message from=\"x\" name=\"AReply\">[派工] 回頭幫我看一下</cross-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:59:25Z","message":{"model":"claude-sonnet-5"}}"#;
+        let reply_content = r#"{"type":"custom-title","customTitle":"AReply","sessionId":"aa_reply"}
+{"type":"user","timestamp":"2026-08-16T11:59:00Z","message":{"content":"<cross-session-message from=\"x\" name=\"ZInit\">嗨</cross-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:59:05Z","message":{"model":"claude-sonnet-5"}}"#;
+        let init = build_session_summary("slug", "zz_init", init_content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        let reply = build_session_summary("slug", "aa_reply", reply_content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        (init, reply)
+    }
+
+    fn tree_with_rules(sessions: Vec<SessionSummary>, edge_rules: EdgeRules) -> Vec<TreeRow> {
+        build_tree(TreeBuildInput {
+            sessions,
+            presence: HashMap::new(),
+            jobs: Vec::new(),
+            owners: Vec::new(),
+            now: at(NOW),
+            edge_rules,
+            pinned_coordinators: Vec::new(),
+        })
+    }
+
+    /// Task 4 amendment (2026-08-16): all four rule combinations, on the
+    /// SAME fixture, asserting the semantic difference each toggle makes —
+    /// exactly what the operator wants to compare before picking one.
+    /// Session ids are deliberately chosen so alphabetical order is the
+    /// OPPOSITE of chronological order ("aa_reply" < "zz_init" but
+    /// zz_init spoke first) — this exposes baseline's tiebreak as
+    /// coincidence-dependent rather than accidentally "looking correct".
+    #[test]
+    fn edge_rule_combinations_produce_different_topologies_on_the_same_fixture() {
+        let (init, reply) = init_and_reply_sessions();
+
+        // Baseline (both off): direction/content-agnostic "latest edge
+        // wins" creates a real mutual cycle (each session's own most
+        // recent inbound message names the other) — break_cycles' id-based
+        // tiebreak resolves it, but which one wins is pure alphabetical
+        // luck, not semantics. Here it happens to crown the REPLIER.
+        let rows = tree_with_rules(vec![init.clone(), reply.clone()], EdgeRules::default());
+        let top = rows.iter().find(|r| r.depth == 0).expect("someone must anchor the tree");
+        assert_eq!(top.label, "AReply", "baseline's tiebreak picks the replier here, by alphabetical accident");
+        assert!(rows.iter().any(|r| r.depth == 1 && r.label == "ZInit"));
+
+        // initiator_wins alone: the TRUE first sender always wins,
+        // independent of id ordering or which direction's message is
+        // more recent.
+        let rows = tree_with_rules(vec![init.clone(), reply.clone()], EdgeRules { initiator_wins: true, marker_only: false });
+        let top = rows.iter().find(|r| r.depth == 0).expect("someone must anchor the tree");
+        assert_eq!(top.label, "ZInit", "the real initiator wins under rule 1, not the alphabetically-lucky one");
+        assert!(rows.iter().any(|r| r.depth == 1 && r.label == "AReply"));
+
+        // marker_only alone (NO direction lock): whichever message merely
+        // LOOKS like a dispatch wins, regardless of who actually spoke
+        // first -- here that's the reply, so the REPLIER ends up
+        // "controlling" the session that actually initiated the
+        // conversation. This is exactly why marker_only in isolation is
+        // not a full fix on its own.
+        let rows = tree_with_rules(vec![init.clone(), reply.clone()], EdgeRules { initiator_wins: false, marker_only: true });
+        let top = rows.iter().find(|r| r.depth == 0).expect("someone must anchor the tree");
+        assert_eq!(top.label, "AReply", "marker_only alone still lets a marker-shaped REPLY win control");
+        assert!(rows.iter().any(|r| r.depth == 1 && r.label == "ZInit"));
+
+        // Both together (the operator's original combined design): the
+        // initiator's own message wasn't marker-tagged, so no message in
+        // either direction qualifies -- both stay independent, the
+        // conservative outcome when no genuine in-window dispatch exists.
+        let rows = tree_with_rules(vec![init, reply], EdgeRules { initiator_wins: true, marker_only: true });
+        assert_eq!(rows.iter().filter(|r| r.depth == 0).count(), 2, "no qualifying edge in either direction -- both stay independent: {rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.depth == 1).count(), 0);
+    }
+
+    /// Task 4: real non-dispatch bodies (a completion report and a recall
+    /// — the operator's own explicit non-edge examples) must never create
+    /// an edge under `marker_only`, even though under the baseline rules
+    /// they would (baseline doesn't look at content at all).
+    #[test]
+    fn marker_only_rejects_completion_reports_and_recalls_as_non_edges() {
+        let content = |body: &str| {
+            format!(
+                r#"{{"type":"custom-title","customTitle":"Worker","sessionId":"w1"}}
+{{"type":"user","timestamp":"2026-08-16T11:59:30Z","message":{{"content":"<cross-session-message from=\"x\" name=\"Ctrl\">{body}</cross-session-message>"}}}}
+{{"type":"assistant","timestamp":"2026-08-16T11:59:40Z","message":{{"model":"claude-sonnet-5"}}}}"#
+            )
+        };
+        let ctrl = session("c1", "Ctrl", "2026-08-16T11:59:00Z");
+
+        for body in ["【調查完工】結果如下", "[撤令|來自 Ctrl] 立即停止"] {
+            let worker = build_session_summary("slug", "w1", &content(body), &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+            let rows = tree_with_rules(vec![ctrl.clone(), worker], EdgeRules { initiator_wins: false, marker_only: true });
+            let worker_row = rows.iter().find(|r| r.label == "Worker").unwrap();
+            assert_eq!(worker_row.depth, 0, "body {body:?} must not create an edge under marker_only");
+        }
+    }
+
+    /// Task 4, rule 3: a pinned coordinator never renders as anyone's
+    /// child, even when another session's dispatch would otherwise have
+    /// claimed it.
+    #[test]
+    fn pinned_coordinator_never_renders_as_a_child() {
+        let coordinator = session("doc1", "Doc1 主管", "2026-08-16T11:59:00Z");
+        let other = session_with_edge("other", "Some Worker", "2026-08-16T11:59:00Z", "Doc1 主管", "2026-08-16T11:55:00Z");
+        // "Doc1 主管" dispatching to "other" is fine and expected (other
+        // nests under Doc1) -- the guarantee under test is the REVERSE:
+        // build a second scenario where something claims Doc1 as ITS
+        // child and confirm it's rejected.
+        let claims_doc1 = session_with_edge("claimer", "Claimer", "2026-08-16T11:59:00Z", "Doc1 主管", "2026-08-16T11:50:00Z");
+        let doc1_replies = session_with_edge("doc1", "Doc1 主管", "2026-08-16T11:58:00Z", "Claimer", "2026-08-16T11:55:00Z");
+
+        let mut input = empty_input(vec![claims_doc1, doc1_replies]);
+        input.pinned_coordinators = vec!["Doc1 主管".to_owned()];
+        let rows = build_tree(input);
+        let doc1_row = rows.iter().find(|r| r.label == "Doc1 主管").unwrap();
+        assert_eq!(doc1_row.depth, 0, "a pinned coordinator must stay top-level even though Claimer's message would otherwise have claimed it");
+
+        // Sanity: the same non-pinned pair (from the earlier fixture)
+        // still lets Doc1 be someone's controller normally.
+        let rows_unpinned = build_tree(empty_input(vec![coordinator, other]));
+        let child = rows_unpinned.iter().find(|r| r.label == "Some Worker").unwrap();
+        assert_eq!(child.depth, 1, "Doc1 主管 can still dispatch to others normally");
+    }
+
+    /// Task 4, rule 3: a pinned coordinator's edge wins over a non-pinned
+    /// one for the same child, even when the non-pinned edge is MORE
+    /// recent — pinned status overrides recency, not the other way round.
+    #[test]
+    fn pinned_coordinator_edge_takes_precedence_over_a_more_recent_non_pinned_one() {
+        let pinned = session("doc1", "Doc1 主管", "2026-08-16T11:59:00Z");
+        let non_pinned = session("doc2", "Doc2", "2026-08-16T11:59:00Z");
+        let content = r#"{"type":"custom-title","customTitle":"Target","sessionId":"z1"}
+{"type":"user","timestamp":"2026-08-16T11:50:00Z","message":{"content":"<cross-session-message from=\"x\" name=\"Doc1 主管\">hi</cross-session-message>"}}
+{"type":"user","timestamp":"2026-08-16T11:58:00Z","message":{"content":"<cross-session-message from=\"x\" name=\"Doc2\">hi, more recently</cross-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5"}}"#;
+        let target = build_session_summary("slug", "z1", content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+
+        let mut input = empty_input(vec![pinned, non_pinned, target]);
+        input.pinned_coordinators = vec!["Doc1 主管".to_owned()];
+        let rows = build_tree(input);
+        let target_row = rows.iter().find(|r| r.label == "Target").unwrap();
+        assert_eq!(target_row.depth, 1);
+        // Rows are emitted as (controller, its own children...) blocks in
+        // top-level order — so "Target sits between Doc1's row and Doc2's
+        // row" is a direct, rigorous proof it's Doc1's child, not Doc2's
+        // (a looser "appears somewhere after Doc1" check wouldn't rule out
+        // it actually belonging to Doc2's block).
+        let doc1_index = rows.iter().position(|r| r.label == "Doc1 主管").unwrap();
+        let doc2_index = rows.iter().position(|r| r.label == "Doc2").unwrap();
+        let target_index = rows.iter().position(|r| r.label == "Target").unwrap();
+        assert!(
+            doc1_index < target_index && target_index < doc2_index,
+            "Target must be grouped inside Doc1 主管's block (doc1_index={doc1_index}, target_index={target_index}, doc2_index={doc2_index}): {rows:?}"
+        );
     }
 
     /// Same shape, three sessions in a longer cycle (A→B→C→A) — the fix

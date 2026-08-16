@@ -120,9 +120,15 @@ pub struct ParsedEvent {
     pub model: Option<String>,
     /// Only `Some` for a `type":"custom-title"` line.
     pub custom_title: Option<String>,
-    /// The `name` attribute of an inbound `<cross-session-message>` tag
-    /// found in this line's message content, if any.
+    /// The `name` attribute of an inbound `<cross-session-message>` /
+    /// `<desktop-session-message>` tag found in this line's message
+    /// content, if any.
     pub cross_session_from_name: Option<String>,
+    /// True when the tag's BODY (the text right after its own `>`) starts
+    /// with a dispatch marker — see `body_has_dispatch_marker`. Meaningless
+    /// when `cross_session_from_name` is `None`; always `false` in that
+    /// case.
+    pub cross_session_is_dispatch_marker: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -159,11 +165,15 @@ pub fn parse_line(line: &str) -> Option<ParsedEvent> {
     let raw: RawLine = serde_json::from_str(trimmed).ok()?;
     let timestamp = raw.timestamp.as_deref().and_then(parse_rfc3339);
     let model = raw.message.as_ref().and_then(|message| message.model.clone());
-    let cross_session_from_name = raw
+    let cross_session_tag = raw
         .message
         .as_ref()
         .and_then(|message| message.content.as_ref())
-        .and_then(extract_cross_session_name);
+        .and_then(extract_cross_session_tag);
+    let (cross_session_from_name, cross_session_is_dispatch_marker) = match cross_session_tag {
+        Some((name, marker)) => (Some(name), marker),
+        None => (None, false),
+    };
     let custom_title = if raw.line_type.as_deref() == Some("custom-title") {
         raw.custom_title.filter(|title| !title.trim().is_empty())
     } else {
@@ -175,6 +185,7 @@ pub fn parse_line(line: &str) -> Option<ParsedEvent> {
         model,
         custom_title,
         cross_session_from_name,
+        cross_session_is_dispatch_marker,
     })
 }
 
@@ -208,13 +219,21 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 /// to its enclosing `<...>` open tag rather than hardcoding one exact tag
 /// name — forward-compatible with any future `<*session-message>` variant
 /// without another silent-miss bug like this one.
-fn extract_cross_session_name(content: &Value) -> Option<String> {
+///
+/// Returns `(name, is_dispatch_marker)` — `is_dispatch_marker` is whether
+/// the tag's own BODY (the text right after this opening tag's `>`) starts
+/// with one of [`DISPATCH_MARKERS`], the signal `tree::build_tree`'s
+/// marker-only edge rule keys on (task 4, 2026-08-16: "message direction
+/// alone cannot distinguish dispatch from reply/report").
+fn extract_cross_session_tag(content: &Value) -> Option<(String, bool)> {
     let text = content.as_str()?;
     let marker_pos = text.find("session-message")?;
     let tag_start = text[..marker_pos].rfind('<')?;
     let tag_end = text[tag_start..].find('>')? + tag_start;
     let tag = &text[tag_start..=tag_end];
-    extract_attr(tag, "name")
+    let name = extract_attr(tag, "name")?;
+    let body = &text[tag_end + 1..];
+    Some((name, body_has_dispatch_marker(body)))
 }
 
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {
@@ -223,6 +242,32 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
     let rest = &tag[attr_start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_owned())
+}
+
+/// Real examples confirmed on this machine: `[派工|來自 CCCG開發
+/// session,使用者指示] 調查...` IS a dispatch; `[撤令|來自 CCCG開發] 使用者指示
+/// ...` (a recall, not a new assignment) and `[edge-test|CCCG開發] 樹狀 Flow
+/// 邊渲染終驗用訊息` (a connectivity ping) are NOT — confirming the marker
+/// check must be an exact prefix match, not a substring/keyword search
+/// (`[撤令`/`[edge-test` share the `[` but not the marker text itself, so a
+/// prefix check already excludes them correctly without any extra
+/// exclusion list). ASCII markers (`[assign`, `[dispatch`) match
+/// case-insensitively; the CJK ones have no case to normalize. Checked
+/// against the body with leading whitespace/newlines trimmed (the real
+/// shape is `<tag ...>\n[派工|...`, a newline before the bracket).
+const DISPATCH_MARKERS: &[&str] = &["[派工", "【任務", "[任務", "[assign", "[dispatch", "【派工"];
+
+fn body_has_dispatch_marker(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    DISPATCH_MARKERS.iter().any(|marker| starts_with_marker(trimmed, marker))
+}
+
+fn starts_with_marker(text: &str, marker: &str) -> bool {
+    if marker.is_ascii() {
+        text.get(..marker.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+    } else {
+        text.starts_with(marker)
+    }
 }
 
 /// `"claude-sonnet-5"` → `"sonnet-5"` — the `claude-` prefix is redundant
@@ -237,6 +282,8 @@ pub fn short_model_name(model: &str) -> String {
 pub struct InboundEdge {
     pub from_name: String,
     pub at: DateTime<Utc>,
+    /// See `ParsedEvent::cross_session_is_dispatch_marker`.
+    pub is_dispatch_marker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -369,7 +416,7 @@ pub fn build_session_summary(
             if (now - at).num_seconds() > window_secs {
                 return None;
             }
-            Some(InboundEdge { from_name: name, at })
+            Some(InboundEdge { from_name: name, at, is_dispatch_marker: event.cross_session_is_dispatch_marker })
         })
         .collect();
 
@@ -773,6 +820,57 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(event.cross_session_from_name.as_deref(), Some("Doc1 主管"));
+    }
+
+    /// Task 4 (2026-08-16): "message direction alone cannot distinguish
+    /// dispatch from reply/report" — real bodies confirmed on this
+    /// machine: `[派工|...]` is a genuine dispatch; `[撤令|...]` (a recall)
+    /// and `[edge-test|...]` (a connectivity ping) share the `[` but are
+    /// NOT dispatches, and a status report like `【調查完工】...` isn't
+    /// either. A prefix (not substring/keyword) match already separates
+    /// all of these correctly with no extra exclusion list needed.
+    #[test]
+    fn parse_line_flags_real_dispatch_marker_bodies_and_rejects_lookalikes() {
+        let dispatch = parse_line(&line(
+            r#"{"type":"user","timestamp":"2026-08-16T10:00:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"CCCG開發\">\n[派工|來自 CCCG開發 session,使用者指示] 調查一下\n</desktop-session-message>"}}"#,
+        ))
+        .unwrap();
+        assert!(dispatch.cross_session_is_dispatch_marker);
+
+        let recall = parse_line(&line(
+            r#"{"type":"user","timestamp":"2026-08-16T10:00:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"CCCG開發\">\n[撤令|來自 CCCG開發] 立即停止\n</desktop-session-message>"}}"#,
+        ))
+        .unwrap();
+        assert!(!recall.cross_session_is_dispatch_marker, "[撤令 is a recall, not a dispatch");
+
+        let ping = parse_line(&line(
+            r#"{"type":"user","timestamp":"2026-08-16T10:00:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"CCCG開發\">\n[edge-test|CCCG開發] 樹狀 Flow 邊渲染終驗用訊息\n</desktop-session-message>"}}"#,
+        ))
+        .unwrap();
+        assert!(!ping.cross_session_is_dispatch_marker, "[edge-test is a connectivity ping, not a dispatch");
+
+        let report = parse_line(&line(
+            r#"{"type":"user","timestamp":"2026-08-16T10:00:00Z","message":{"content":"<cross-session-message from=\"x\" name=\"doc3\">\n【調查完工】結果如下\n</cross-session-message>"}}"#,
+        ))
+        .unwrap();
+        assert!(!report.cross_session_is_dispatch_marker, "a completion report is not a dispatch");
+
+        let ack = parse_line(&line(
+            r#"{"type":"user","timestamp":"2026-08-16T10:00:00Z","message":{"content":"<cross-session-message from=\"x\" name=\"doc3\">\n收到,馬上處理\n</cross-session-message>"}}"#,
+        ))
+        .unwrap();
+        assert!(!ack.cross_session_is_dispatch_marker, "a bare acknowledgement is not a dispatch");
+    }
+
+    #[test]
+    fn dispatch_marker_ascii_variants_match_case_insensitively_cjk_ones_do_not_need_to() {
+        assert!(body_has_dispatch_marker("[Dispatch] do the thing"));
+        assert!(body_has_dispatch_marker("[ASSIGN] do the thing"));
+        assert!(body_has_dispatch_marker("  \n [assign] leading whitespace is trimmed"));
+        assert!(body_has_dispatch_marker("【任務】中文任務"));
+        assert!(body_has_dispatch_marker("【派工】中文派工"));
+        assert!(!body_has_dispatch_marker("assign without the bracket"));
+        assert!(!body_has_dispatch_marker(""));
     }
 
     #[test]

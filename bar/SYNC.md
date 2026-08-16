@@ -779,3 +779,181 @@ fixture, even though the live app's own real-time capture above no longer
 shows it. A fresh cross-session message, if the operator wants to see it
 in a live real-time capture too, would need to be re-sent — this session
 did not send one itself, per instruction.
+
+## 2026-08-16 task 4: control-edge SEMANTICS — initiator lock, dispatch markers, pinned coordinators
+
+Operator-confirmed bug: "Doc1 主管" (the standing coordinator) rendered as
+a CHILD of "CCCG開發" — backwards. Root problem: the tree's control-edge
+resolution only ever looked at message DIRECTION and RECENCY ("whoever
+sent me a message most recently is my controller"), which cannot tell a
+genuine dispatch apart from a reply/report/ack going the other way — any
+real back-and-forth conversation looks identical to a dispatch under that
+rule. Originally specified as one combined fix; the operator then amended
+the ask to three INDEPENDENTLY TOGGLEABLE rules so real configurations
+could be A/B'd against real data before picking one, rather than landing
+a single hard-wired design.
+
+### The three rules (`cccog_bar_core::tree::EdgeRules` + pinned coordinators)
+
+```rust
+pub struct EdgeRules {
+    pub initiator_wins: bool,
+    pub marker_only: bool,
+}
+```
+
+- **`initiator_wins`** — within a session PAIR, only the pair's INITIATOR
+  (whoever sent the chronologically first in-window message, either
+  direction, marker or not) can ever become the other's controller; every
+  message in the opposite direction is a reply and can never create or
+  flip an edge. Computed once per pair from the RAW edge set
+  (`compute_pair_initiators`) — "who spoke first" is a fact about the
+  conversation, independent of whether `marker_only` separately restricts
+  which messages can become edges.
+- **`marker_only`** — only a message whose body starts with a dispatch
+  marker is even a candidate edge. Markers (`claude_sessions::DISPATCH_MARKERS`):
+  `[派工`, `【任務`, `[任務`, `[assign`, `[dispatch`, `【派工` (ASCII ones
+  case-insensitive; a prefix match on the trimmed body, not a
+  substring/keyword search — confirmed against real messages that a
+  substring search would have wrongly matched: `[撤令` (a recall) and
+  `[edge-test` (a connectivity ping) share the `[` with `[派工` but are not
+  dispatches, and a prefix check already excludes both correctly with no
+  extra denylist).
+- **Pinned coordinators** (`TreeBuildInput::pinned_coordinators: Vec<String>`,
+  exact session-title match) — always render top-level, never as anyone's
+  child (`controller_of.retain` after every other rule has run — a hard
+  override, not a precedence weight), AND their own dispatch edges win
+  over a non-pinned controller's for the same child even when the
+  non-pinned edge is more recent (baked into the candidate-selection loop:
+  pinned beats non-pinned regardless of `at`, then most-recent wins among
+  ties of the same pinned-ness).
+
+All three default OFF/empty — an absent config is EXPLICIT current
+(pre-task-4) behavior, not a silent fourth mode. `break_cycles`/
+`flatten_controllers_to_root` (the safety net from the earlier same-day
+mutual-edge-cycle bug) stay in place unconditionally: with `initiator_wins`
+off, a real bidirectional exchange can still form a cycle exactly as
+before, so the net still needs to catch it; with it on, a cycle should
+essentially never form in the first place (proved by
+`the_old_cycle_fixture_resolves_deterministically_via_initiator_wins`,
+which reuses the exact fixture that used to need the tiebreak and shows
+`initiator_wins` alone resolves it to the semantically correct answer,
+not an alphabetically-lucky one).
+
+### Config: `bar-settings.json`
+
+Two new keys in the SAME file `CCCOG.Bar.App`'s existing `LocalSettings`
+class already owns (`%LOCALAPPDATA%\CCCG\bar-settings.json`, currently a
+flat `Dictionary<string,string>` used only for the resize-grip height).
+Both new keys keep that flat-string-map shape — their VALUES are
+JSON-encoded strings, not nested JSON objects/arrays directly — so adding
+them can never make `LocalSettings.cs`'s own `Dictionary<string,string>`
+deserialization see an unexpected shape and quarantine the file (a real
+compatibility hazard that was considered and deliberately avoided, not
+just missed):
+
+```json
+{
+  "resize.grip.height": "8",
+  "flow.edgeRules": "{\"initiatorWins\":true,\"markerOnly\":false}",
+  "flow.coordinators": "[\"Doc1 主管\"]"
+}
+```
+
+Both keys are optional; a missing file, missing key, or malformed value at
+any layer degrades to the documented default (current/baseline behavior)
+rather than erroring — read-only, best-effort config, never a hard
+dependency (`cccog_bar_ffi::parse_flow_settings`, unit-tested directly
+against raw JSON strings without touching a real file).
+
+**Read fresh on every refresh, no restart needed**: `load_flow_settings()`
+is called from inside `control_snapshot_json` on every single FFI call —
+deliberately NOT read through C#'s `LocalSettings` class, which loads once
+at process start and caches in memory (a hand-edit to the file wouldn't be
+picked up by that cache without a restart). Since `RefreshView` already
+calls `cccog_bar_control_snapshot` on every Flow refresh tick, toggling
+either key in the settings file takes effect on the very next tick — this
+was achievable, so no restart-required fallback was needed.
+
+### CLI overrides (`cccog-bar-cli`) — compare configurations without touching the settings file
+
+`control_snapshot_json`'s input JSON gained optional `edgeRules`/
+`coordinators` fields that, when present, bypass `bar-settings.json`
+entirely for that one call (the production C# path never sets them, so it
+always reads the settings file). `cccog-bar-cli --control` exposes this as
+two new flags:
+
+```bash
+cccog-bar-cli --control --edge-rules none
+cccog-bar-cli --control --edge-rules initiator
+cccog-bar-cli --control --edge-rules marker
+cccog-bar-cli --control --edge-rules initiator,marker
+cccog-bar-cli --control --edge-rules initiator,marker --coordinators "Doc1 主管"
+```
+
+`--edge-rules` takes a comma list of `initiator`/`marker` (any
+combination/order); anything else (including `none`, or omitting values)
+means both off. `--coordinators` takes a comma-separated list of exact
+session titles. Either flag, even `--edge-rules none`, always overrides
+the settings file for that run — only OMITTING both flags entirely falls
+through to the settings file, matching the app's own path.
+
+### Fixtures (`cccog-bar-core/src/tree.rs`, `claude_sessions.rs`)
+
+- `parse_line_flags_real_dispatch_marker_bodies_and_rejects_lookalikes` /
+  `dispatch_marker_ascii_variants_match_case_insensitively...` —
+  marker detection against real bodies (`[派工|...]` true; `[撤令|...]`,
+  `[edge-test|...]`, `【調查完工】...`, a bare "收到,馬上處理" ack all
+  false) plus the ASCII case-insensitivity rule.
+- `the_old_cycle_fixture_resolves_deterministically_via_initiator_wins` —
+  the same-day mutual-edge fixture, now resolved by rule 1 alone (not the
+  tiebreak), to the provably correct winner (whoever spoke first).
+- `edge_rule_combinations_produce_different_topologies_on_the_same_fixture`
+  — the amendment's core ask: baseline / initiator-only / marker-only /
+  both, asserted on ONE shared fixture (deliberately: session ids sort
+  alphabetically OPPOSITE of chronological send order, so baseline's
+  tiebreak-driven answer is visibly "an accident", not "looks right for
+  the wrong reason"). Confirms marker_only ALONE can be actively
+  misleading (a marker-shaped REPLY can still "win" control over the true
+  initiator) — the reason the operator wanted these separable and
+  comparable rather than one hard-wired design.
+- `marker_only_rejects_completion_reports_and_recalls_as_non_edges` — the
+  operator's own explicit non-edge examples (「調查完工」/[撤令), tree-level.
+- `pinned_coordinator_never_renders_as_a_child` /
+  `pinned_coordinator_edge_takes_precedence_over_a_more_recent_non_pinned_one`
+  — both pinned-coordinator guarantees, independently.
+- `cccog-bar-ffi`'s `flow_settings_tests` module: `parse_flow_settings`
+  round-trips both keys, degrades safely at every malformed-input layer
+  (bad top level, bad individual key value, an accidentally-nested shape),
+  and `ControlSnapshotInput`'s `edgeRules`/`coordinators` fields
+  deserialize from the exact JSON shape the CLI flags produce.
+
+No C# changes were needed for this task — the wire shape of a `TreeRow`
+is completely unchanged; only WHICH rows the Rust side decides to nest
+changed, so `DashboardView`/`FlyoutWindow` render whatever comes back
+exactly as before.
+
+### Verification
+
+`cargo test --workspace`: 133 tests green (up from 125 at the end of task
+3 — 2 new marker-detection fixtures in `claude_sessions.rs`, 5 new
+`tree.rs` fixtures for the three rules, 5 new inline `cccog-bar-ffi`
+tests for settings parsing and the CLI-override JSON shape; module
+totals: `claude_sessions` 23, `tree` 16, `presence` 10, `control` 9,
+`cccog-bar-ffi` lib 5). `dotnet build -c Release -p:Platform=x64`: 0
+warnings, 0 errors. Coordinator's running instance (pid 12296) killed
+first as instructed; live app relaunched from a freshly-rebuilt DLL
+(mtime-verified) after every change.
+
+Real-data CLI run at verification time showed all four configurations
+producing an IDENTICAL tree (`doc2 api-gateway上線`, `CCCG開發` +its live
+agent, `Doc1 主管`, all independent top-level, plus the terminal
+aggregate) — because, same as the end of the previous task-3 section, no
+cross-session-message edge was actually in-window at that exact moment
+(the real ones from earlier in this session had aged past the 10-minute
+window during the debug/rebuild/re-verify cycle). This is expected and
+correctly proves the CLI/settings wiring doesn't crash or misbehave on
+real data with zero edges in play; it does NOT exercise the actual rule
+differences live — that requires an in-window edge, which the fixtures
+above prove deterministically and the coordinator can re-verify live by
+re-running the exact CLI invocations above once a fresh dispatch exists.

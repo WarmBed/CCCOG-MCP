@@ -17,6 +17,44 @@ fn dispatch_root() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// The raw string value following `flag` in argv, if present — shared by
+/// `--edge-rules`/`--coordinators` below.
+fn flag_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args_os();
+    while let Some(arg) = args.next() {
+        if arg == flag {
+            return args.next().map(|value| value.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// `--edge-rules initiator,marker` / `--edge-rules marker` / `--edge-rules
+/// none` — a comma list of `initiator`/`marker` (any combination, any
+/// order), or `none`/anything else for the baseline (both off). Returns
+/// `None` only when the flag itself wasn't passed at all, so the CLI's
+/// default (no flag) falls through to whatever `bar-settings.json` says —
+/// same production path the app uses — while an explicit flag, even
+/// `--edge-rules none`, always bypasses the settings file for that run
+/// (task 4 amendment: "compare configurations WITHOUT touching the
+/// settings file").
+fn edge_rules_override() -> Option<serde_json::Value> {
+    let raw = flag_value("--edge-rules")?;
+    let initiator_wins = raw.split(',').any(|part| part.trim() == "initiator");
+    let marker_only = raw.split(',').any(|part| part.trim() == "marker");
+    Some(serde_json::json!({ "initiatorWins": initiator_wins, "markerOnly": marker_only }))
+}
+
+/// `--coordinators "Doc1 主管"` / `--coordinators "Doc1 主管,Doc2"` — a
+/// comma-separated list of exact session titles. Absent flag = fall
+/// through to `bar-settings.json`'s `flow.coordinators`, same rationale as
+/// `edge_rules_override`.
+fn coordinators_override() -> Option<serde_json::Value> {
+    let raw = flag_value("--coordinators")?;
+    let names: Vec<String> = raw.split(',').map(|part| part.trim().to_owned()).filter(|part| !part.is_empty()).collect();
+    Some(serde_json::json!(names))
+}
+
 fn main() {
     let root = dispatch_root();
 
@@ -24,12 +62,27 @@ fn main() {
     // the shell's NativeControlClient consumes) instead of the raw graph
     // snapshot — useful for checking row counts and target-title resolution
     // against a real dispatch root without launching the WinUI app.
+    //
+    // --edge-rules / --coordinators (task 4 amendment, 2026-08-16): compare
+    // Flow control-edge configurations against real transcripts without
+    // touching bar-settings.json or restarting the app — e.g.:
+    //   cccog-bar-cli --control --edge-rules none
+    //   cccog-bar-cli --control --edge-rules initiator
+    //   cccog-bar-cli --control --edge-rules marker
+    //   cccog-bar-cli --control --edge-rules initiator,marker
+    //   cccog-bar-cli --control --edge-rules initiator,marker --coordinators "Doc1 主管"
     if std::env::args_os().any(|arg| arg == "--control") {
         let now = chrono::Utc::now();
-        let input = serde_json::json!({
+        let mut input = serde_json::json!({
             "dispatchRoot": root.to_string_lossy(),
             "now": now.timestamp(),
         });
+        if let Some(edge_rules) = edge_rules_override() {
+            input["edgeRules"] = edge_rules;
+        }
+        if let Some(coordinators) = coordinators_override() {
+            input["coordinators"] = coordinators;
+        }
         println!("{}", control_snapshot_json(&input.to_string()));
         return;
     }

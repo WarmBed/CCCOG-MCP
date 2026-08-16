@@ -10,7 +10,7 @@ use cccog_bar_core::dispatch::parse_status;
 use cccog_bar_core::graph::GraphSnapshot;
 use cccog_bar_core::owners::{is_archived_path, parse_owner};
 use cccog_bar_core::presence::{collect_presence, prune_stale_presence_files};
-use cccog_bar_core::tree::{build_tree, DispatchJobInput, OwnerInput, TreeBuildInput, TreeRow};
+use cccog_bar_core::tree::{build_tree, DispatchJobInput, EdgeRules, OwnerInput, TreeBuildInput, TreeRow};
 use cccog_bar_quota::{
     extract_human_reset_date, extract_reset_date, fetch_claude_quota, fetch_grok_quota,
     format_window_line, load_claude_credential, load_codex_quota_from_sessions, load_grok_token,
@@ -887,6 +887,35 @@ struct ControlSnapshotInput {
     /// Unix seconds; `None`/absent uses the real current time (production
     /// default) — tests pass an explicit value for determinism.
     now: Option<i64>,
+    /// Task 4 amendment (2026-08-16): explicit override for the Flow
+    /// control-edge rules, bypassing `bar-settings.json` entirely for this
+    /// call — what `cccog-bar-cli --edge-rules` sets, so configurations
+    /// can be A/B'd without touching the settings file or restarting the
+    /// app. Absent (the production/C# path) falls back to whatever
+    /// `bar-settings.json` says, read fresh on every call (see
+    /// `load_flow_settings`).
+    #[serde(default)]
+    edge_rules: Option<RawEdgeRules>,
+    /// Same override shape for pinned coordinators — what
+    /// `cccog-bar-cli --coordinators` sets. Absent falls back to the
+    /// settings file.
+    #[serde(default)]
+    coordinators: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEdgeRules {
+    #[serde(default)]
+    initiator_wins: bool,
+    #[serde(default)]
+    marker_only: bool,
+}
+
+impl From<RawEdgeRules> for EdgeRules {
+    fn from(raw: RawEdgeRules) -> Self {
+        EdgeRules { initiator_wins: raw.initiator_wins, marker_only: raw.marker_only }
+    }
 }
 
 /// Process-wide tailer for the Claude-session scan's skip-parse shortcut
@@ -906,6 +935,66 @@ fn presence_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .map(|base| base.join("CCCG").join("presence"))
+}
+
+/// `%LOCALAPPDATA%\CCCG\bar-settings.json` — the SAME physical file
+/// `CCCOG.Bar.App`'s `LocalSettings.cs` already owns (currently a flat
+/// `Dictionary<string,string>`, used today only for the resize-grip
+/// height). Read directly here, independently of that C# class, for two
+/// reasons documented in `bar/SYNC.md`: (1) `LocalSettings` loads once at
+/// process start and caches in memory — re-reading fresh on every
+/// `control_snapshot_json` call (this function) is what makes toggling
+/// `flow.edgeRules`/`flow.coordinators` take effect on the very next Flow
+/// refresh tick, no app restart needed; (2) the values these two keys need
+/// (a nested object, an array) don't fit a `Dictionary<string,string>`'s
+/// string-typed values directly, so each is stored as a JSON-encoded
+/// STRING under its own flat dotted key — the top-level file shape stays
+/// exactly what `LocalSettings.cs` already expects (a flat string map), so
+/// adding these keys can never make C#'s own deserialization see an
+/// unexpected shape and quarantine the file.
+fn bar_settings_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|base| base.join("CCCG").join("bar-settings.json"))
+}
+
+/// Reads `flow.edgeRules` (a JSON-encoded `{"initiatorWins":bool,
+/// "markerOnly":bool}` string) and `flow.coordinators` (a JSON-encoded
+/// `["title", ...]` string) from `bar-settings.json`. Missing file, missing
+/// keys, or malformed JSON at any layer all degrade to the documented
+/// default (current/baseline behavior) rather than erroring — this is a
+/// read-only, best-effort config layer, never a hard dependency.
+fn load_flow_settings() -> (EdgeRules, Vec<String>) {
+    let Some(path) = bar_settings_path() else {
+        return (EdgeRules::default(), Vec::new());
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return (EdgeRules::default(), Vec::new());
+    };
+    parse_flow_settings(&raw)
+}
+
+/// Pure parse of `bar-settings.json`'s raw text — split out from
+/// [`load_flow_settings`] so the interesting logic (two JSON-encoded-string
+/// keys inside a flat string map, missing/malformed at any layer degrading
+/// to defaults) is unit-testable without touching a real file, same
+/// "IO stays thin, parsing is pure and tested directly" convention as
+/// every `collect_*`/`parse_*` split in `cccog-bar-core`.
+fn parse_flow_settings(raw: &str) -> (EdgeRules, Vec<String>) {
+    let Ok(map) = serde_json::from_str::<HashMap<String, String>>(raw) else {
+        return (EdgeRules::default(), Vec::new());
+    };
+    let edge_rules = map
+        .get("flow.edgeRules")
+        .and_then(|encoded| serde_json::from_str::<RawEdgeRules>(encoded).ok())
+        .map(EdgeRules::from)
+        .unwrap_or_default();
+    let coordinators = map
+        .get("flow.coordinators")
+        .and_then(|encoded| serde_json::from_str::<Vec<String>>(encoded).ok())
+        .unwrap_or_default();
+    (edge_rules, coordinators)
 }
 
 /// Active + terminal dispatch jobs reduced to what the tree needs — a
@@ -1025,7 +1114,12 @@ fn walk_owners_for_tree(dir: &Path, out: &mut Vec<OwnerInput>) {
 /// codex/grok children and bottom aggregate. Every root is resolved at
 /// runtime from the environment — nothing here is hardcoded to a specific
 /// user profile.
-fn build_flow_tree(dispatch_root: Option<&Path>, now: DateTime<Utc>) -> Vec<TreeRow> {
+fn build_flow_tree(
+    dispatch_root: Option<&Path>,
+    now: DateTime<Utc>,
+    edge_rules: EdgeRules,
+    pinned_coordinators: Vec<String>,
+) -> Vec<TreeRow> {
     let sessions = match default_projects_root() {
         Some(root) if root.is_dir() => claude_session_tailer().tick(&root, now),
         _ => Vec::new(),
@@ -1047,7 +1141,7 @@ fn build_flow_tree(dispatch_root: Option<&Path>, now: DateTime<Utc>) -> Vec<Tree
         None => (Vec::new(), Vec::new()),
     };
 
-    build_tree(TreeBuildInput { sessions, presence, jobs, owners, now })
+    build_tree(TreeBuildInput { sessions, presence, jobs, owners, now, edge_rules, pinned_coordinators })
 }
 
 /// The windowed, aggregated Flow view: Active + last-2h terminal window,
@@ -1072,7 +1166,15 @@ pub fn control_snapshot_json(input: &str) -> String {
         .unwrap_or_else(Utc::now);
     let root = parsed.dispatch_root.map(PathBuf::from);
     let payload = control_snapshot_at(root.as_deref(), now);
-    let tree = build_flow_tree(root.as_deref(), now);
+    // CLI overrides (parsed.edge_rules / parsed.coordinators, present only
+    // when the caller explicitly set them — cccog-bar-cli's
+    // --edge-rules/--coordinators flags) bypass bar-settings.json entirely
+    // for this one call; the production C# path never sets them, so it
+    // always gets whatever the settings file says, read fresh right now.
+    let (settings_edge_rules, settings_coordinators) = load_flow_settings();
+    let edge_rules = parsed.edge_rules.map(EdgeRules::from).unwrap_or(settings_edge_rules);
+    let coordinators = parsed.coordinators.unwrap_or(settings_coordinators);
+    let tree = build_flow_tree(root.as_deref(), now, edge_rules, coordinators);
     serde_json::to_string(&json!({
         "schemaVersion": CCCOG_BAR_SCHEMA_VERSION,
         "ok": true,
@@ -1207,4 +1309,67 @@ pub unsafe extern "C" fn cccog_bar_poll_quotas(input_json: *const c_char) -> *mu
     CString::new(result)
         .unwrap_or_else(|_| CString::new(error_json("NUL in response".to_owned())).unwrap())
         .into_raw()
+}
+
+#[cfg(test)]
+mod flow_settings_tests {
+    use super::*;
+
+    #[test]
+    fn parse_flow_settings_reads_both_keys_when_present() {
+        let raw = r#"{"resize.grip.height":"8","flow.edgeRules":"{\"initiatorWins\":true,\"markerOnly\":true}","flow.coordinators":"[\"Doc1 主管\",\"Doc2\"]"}"#;
+        let (edge_rules, coordinators) = parse_flow_settings(raw);
+        assert!(edge_rules.initiator_wins);
+        assert!(edge_rules.marker_only);
+        assert_eq!(coordinators, vec!["Doc1 主管".to_owned(), "Doc2".to_owned()]);
+    }
+
+    #[test]
+    fn parse_flow_settings_defaults_when_keys_absent() {
+        // The exact shape LocalSettings.cs writes today for its one
+        // existing key — proves adding the flow.* keys elsewhere doesn't
+        // require every settings file to already have them.
+        let raw = r#"{"resize.grip.height":"8"}"#;
+        let (edge_rules, coordinators) = parse_flow_settings(raw);
+        assert_eq!(edge_rules, EdgeRules::default());
+        assert!(coordinators.is_empty());
+    }
+
+    #[test]
+    fn parse_flow_settings_degrades_to_defaults_on_malformed_json_at_any_layer() {
+        // Malformed at the top level (not even a flat string map).
+        assert_eq!(parse_flow_settings("not json"), (EdgeRules::default(), Vec::new()));
+        assert_eq!(parse_flow_settings(""), (EdgeRules::default(), Vec::new()));
+
+        // Top level parses, but the flow.edgeRules VALUE isn't valid JSON.
+        let bad_edge_rules = r#"{"flow.edgeRules":"not json","flow.coordinators":"[\"X\"]"}"#;
+        let (edge_rules, coordinators) = parse_flow_settings(bad_edge_rules);
+        assert_eq!(edge_rules, EdgeRules::default(), "a malformed edgeRules value must not poison the whole read");
+        assert_eq!(coordinators, vec!["X".to_owned()], "the OTHER key must still parse independently");
+
+        // A top-level shape LocalSettings.cs would never actually write
+        // (a raw nested object instead of a flat string map) still
+        // degrades safely here rather than panicking.
+        let nested_shape = r#"{"flow":{"edgeRules":{"initiatorWins":true}}}"#;
+        assert_eq!(parse_flow_settings(nested_shape), (EdgeRules::default(), Vec::new()));
+    }
+
+    #[test]
+    fn edge_rules_input_deserializes_from_the_cli_json_shape() {
+        let parsed: ControlSnapshotInput = serde_json::from_str(
+            r#"{"dispatchRoot":"C:\\x","now":1,"edgeRules":{"initiatorWins":true,"markerOnly":false},"coordinators":["Doc1 主管"]}"#,
+        )
+        .unwrap();
+        let edge_rules: EdgeRules = parsed.edge_rules.unwrap().into();
+        assert!(edge_rules.initiator_wins);
+        assert!(!edge_rules.marker_only);
+        assert_eq!(parsed.coordinators, Some(vec!["Doc1 主管".to_owned()]));
+    }
+
+    #[test]
+    fn edge_rules_and_coordinators_are_optional_and_absent_by_default() {
+        let parsed: ControlSnapshotInput = serde_json::from_str(r#"{"dispatchRoot":"C:\\x"}"#).unwrap();
+        assert!(parsed.edge_rules.is_none());
+        assert!(parsed.coordinators.is_none());
+    }
 }
