@@ -15,9 +15,10 @@ use cccog_bar_quota::{
     extract_human_reset_date, extract_reset_date, fetch_claude_quota, fetch_grok_quota,
     format_window_line, load_claude_credential, load_codex_quota_from_sessions, load_grok_token,
     looks_like_quota_limit_error, looks_like_quota_limit_output, normalize_reset_display,
-    HttpClient, HttpRequest, HttpResponse, PollGate, QuotaCards, QuotaState, QuotaWindow,
+    parse_reset_instant, HttpClient, HttpRequest, HttpResponse, PollGate, QuotaCards, QuotaState,
+    QuotaWindow,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::ffi::{c_char, CStr, CString};
@@ -366,6 +367,7 @@ fn format_age(seconds: u64) -> String {
 struct QuotaLimitFailure {
     at: DateTime<Utc>,
     reset_hint: Option<String>,
+    job_id: String,
 }
 
 /// Walk `dispatch/jobs` (excluding archived branches, same convention as
@@ -482,6 +484,7 @@ fn walk_jobs_for_quota_failure(
             at,
             reset_hint: extract_human_reset_date(&signal_text)
                 .or_else(|| extract_reset_date(&signal_text)),
+            job_id: status.job_id.clone(),
         };
         let is_newer = found.as_ref().is_none_or(|existing| candidate.at > existing.at);
         if is_newer {
@@ -560,6 +563,138 @@ pub fn enrich_quota_cards(
         .collect()
 }
 
+/// The window past which an EVIDENCE's own age gets a small dim "as of X
+/// ago" marker appended to the limit diagnostic — reused from
+/// [`SNAPSHOT_STALE_AFTER_SECS`] (1h) so "how old is this data" reads the
+/// same everywhere in this file, not a second threshold with its own
+/// meaning.
+const LIMIT_EVIDENCE_AGE_MARKER_SECS: i64 = SNAPSHOT_STALE_AFTER_SECS;
+
+/// Task 6's persist-until-T variant of [`enrich_quota_cards`]: same
+/// stale-annotation pass, but the codex/grok limit override is backed by
+/// `limit_evidence` (mutated in place) instead of always requiring a fresh
+/// scan hit this round. Three rules, in order:
+///
+/// 1. If a fresh scan hit is found this round (the existing
+///    `find_quota_limit_failure` mechanism, unchanged) AND its reset hint
+///    parses to a real instant, (re)establish `limit_evidence[provider]`
+///    from it — this is always the most current observation available.
+/// 2. Otherwise, if the raw card's own `observed_at` is NEWER than the
+///    persisted evidence's `observed_at` (a genuine new non-limit
+///    rollout/HTTP snapshot arrived since the limit was recorded), that
+///    newer good data wins: drop the persisted evidence and render the
+///    card as-is, un-overridden.
+/// 3. Otherwise, if persisted evidence still exists: apply the override
+///    when `now < reset_at` (still in force — this is what makes the lock
+///    survive the evidence job aging out of the scan window or getting
+///    archived); drop it and fall through to the normal card when `now >=
+///    reset_at` (T has passed).
+///
+/// `enrich_quota_cards` above is kept byte-for-byte unchanged (and is what
+/// its own existing tests still exercise) — this is a new, additive
+/// function; `poll_remote_quotas_json` is the only production caller,
+/// wired to the real, disk-persisted `QuotaResilienceCache::limit_evidence`.
+pub fn enrich_quota_cards_persistent(
+    cards: Vec<QuotaCards>,
+    dispatch_jobs_root: Option<&Path>,
+    now_seconds: u64,
+    limit_evidence: &mut HashMap<String, PersistedLimitEvidence>,
+) -> Vec<QuotaCards> {
+    let now = DateTime::<Utc>::from_timestamp(now_seconds as i64, 0).unwrap_or_else(Utc::now);
+    cards
+        .into_iter()
+        .map(|card| {
+            let annotated = annotate_stale_snapshot(card, now_seconds);
+            if !JOB_FAILURE_OVERRIDE_PROVIDERS.contains(&annotated.client_id.as_str()) {
+                return annotated;
+            }
+            let provider = annotated.client_id.clone();
+
+            // Rule 1: a fresh scan hit always refreshes the persisted
+            // evidence — but only when its reset hint actually parses to
+            // an instant we can compare `now` against; evidence without a
+            // usable T never persists (stays exactly as ephemeral as
+            // `enrich_quota_cards`'s existing behavior for that case).
+            let fresh_failure = dispatch_jobs_root.and_then(|root| find_quota_limit_failure(root, &provider, now));
+            let mut refreshed_this_round = false;
+            if let Some(failure) = &fresh_failure {
+                if let Some(reset_at) = failure.reset_hint.as_deref().and_then(parse_reset_instant) {
+                    limit_evidence.insert(
+                        provider.clone(),
+                        PersistedLimitEvidence {
+                            provider: provider.clone(),
+                            reset_at,
+                            evidence_job_id: failure.job_id.clone(),
+                            observed_at: failure.at,
+                        },
+                    );
+                    refreshed_this_round = true;
+                }
+            }
+
+            // Rule 2: a genuinely newer non-limit snapshot supersedes
+            // whatever's persisted — never checked on a round that just
+            // refreshed the evidence itself (nothing to supersede with,
+            // and comparing a fresh entry's own observed_at against
+            // itself would be meaningless).
+            if !refreshed_this_round {
+                if let Some(persisted) = limit_evidence.get(&provider) {
+                    let card_is_newer = annotated
+                        .observed_at
+                        .is_some_and(|observed_ms| (observed_ms / 1000) as i64 > persisted.observed_at.timestamp());
+                    if card_is_newer {
+                        limit_evidence.remove(&provider);
+                    }
+                }
+            }
+
+            // Rule 3: apply or expire whatever's left.
+            let Some(persisted) = limit_evidence.get(&provider).cloned() else {
+                return annotated; // no limit state in play
+            };
+            if now >= persisted.reset_at {
+                limit_evidence.remove(&provider); // T has passed
+                return annotated;
+            }
+            apply_persistent_limit_override(annotated, &persisted, now_seconds)
+        })
+        .collect()
+}
+
+/// Same rendering as [`apply_quota_limit_override`] — one condensed
+/// diagnostic line, the unified `resetsAt` — but backed by (possibly
+/// several-hours-old, still-in-force) persisted evidence instead of an
+/// always-this-round scan hit, and with a small dim "as of X ago" marker
+/// appended whenever the EVIDENCE itself (not this render) is older than
+/// [`LIMIT_EVIDENCE_AGE_MARKER_SECS`] — exactly the case where the operator
+/// is looking at a limit state the app remembers rather than one it just
+/// re-confirmed.
+fn apply_persistent_limit_override(card: QuotaCards, evidence: &PersistedLimitEvidence, now_seconds: u64) -> QuotaCards {
+    let time_text = evidence.observed_at.format("%H:%M").to_string();
+    let reset_display = evidence.reset_at.with_timezone(&Local).format("%m/%d %H:%M").to_string();
+    let evidence_age_seconds = now_seconds.saturating_sub(evidence.observed_at.timestamp().max(0) as u64);
+    let mut diagnostic = format!("limit · {reset_display}");
+    if evidence_age_seconds as i64 > LIMIT_EVIDENCE_AGE_MARKER_SECS {
+        diagnostic = format!("{diagnostic} · as of {} ago", format_age(evidence_age_seconds));
+    }
+    let diagnostic_detail = format!("limit reached (dispatch failure {time_text}) · {reset_display}");
+    QuotaCards {
+        client_id: card.client_id,
+        windows: vec![QuotaWindow {
+            card_id: "limit".to_owned(),
+            label: "Limit".to_owned(),
+            used_percent: 100.0,
+            remaining_percent: 0.0,
+            resets_at: Some(reset_display),
+        }],
+        state: QuotaState::Stale,
+        observed_at: card.observed_at,
+        diagnostic: Some(diagnostic),
+        diagnostic_detail: Some(diagnostic_detail),
+        retry_after_seconds: None,
+    }
+}
+
 // ── HTTP quota resilience: TTL cache, stale-on-failure fallback, 429 backoff ──
 //
 // Two problems observed on the operator's machine, both from claude/grok
@@ -610,9 +745,40 @@ struct QuotaBackoff {
     reason: String,
 }
 
-/// All in-memory except `last_success`, which is also mirrored to disk (see
-/// [`load_persisted_cache`]/[`save_persisted_cache`]) so a card that has
-/// ever succeeded never regresses to a bare error again, even across a
+/// Task 6 (2026-08-16/17): once limit-reached evidence with a PARSED reset
+/// instant is established, the limit state must persist until `now >=
+/// reset_at` — independent of whether the original dispatch-job evidence
+/// is still discoverable in a scan (its status.json can age out of
+/// `JOB_FAILURE_LOOKBACK_SECS`, or get archived/rotated away entirely,
+/// long before the real provider-side block actually lifts). Live-confirmed
+/// bug this fixes: the Codex card fell back from `Limit 100% · 08/20
+/// 19:50` to a stale 22h-old rollout snapshot overnight purely because the
+/// evidence job aged out of the scan window — read by the operator as
+/// "quota reset", when a fresh probe run minutes later hit the exact same
+/// limit. Persisted to disk (see [`PersistedQuotaCache`]) so it survives an
+/// app restart too, not just an in-process cache.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedLimitEvidence {
+    pub provider: String,
+    /// The parsed reset instant T (via `cccog_bar_quota::parse_reset_instant`
+    /// on the evidence's own reset-hint text) — the ONLY thing that decides
+    /// whether the limit state is still in force. Never re-derived from a
+    /// display string; this is the same correctly-timezoned instant used
+    /// for both the "has this passed" comparison and the rendered display
+    /// text, so the two can never disagree.
+    pub reset_at: DateTime<Utc>,
+    pub evidence_job_id: String,
+    /// When the evidence was actually observed (the failed job's own
+    /// finished/started/created time) — NOT when this cache entry was last
+    /// written. Used for the diagnostic's failure-time text and to decide
+    /// whether a newer non-limit snapshot supersedes this entry.
+    pub observed_at: DateTime<Utc>,
+}
+
+/// All in-memory except `last_success`/`limit_evidence`, which are also
+/// mirrored to disk (see [`load_persisted_cache`]/[`save_persisted_cache`])
+/// so a card that has ever succeeded never regresses to a bare error again,
+/// and an established quota-limit lock survives a restart, even across a
 /// fresh app launch.
 #[derive(Default)]
 pub struct QuotaResilienceCache {
@@ -622,6 +788,7 @@ pub struct QuotaResilienceCache {
     /// or failure) — what the TTL/manual-interval gate measures from. Never
     /// updated by a cache-hit (skipped) round.
     last_attempt_at: HashMap<String, u64>,
+    limit_evidence: HashMap<String, PersistedLimitEvidence>,
 }
 
 impl QuotaResilienceCache {
@@ -669,21 +836,24 @@ fn quota_cache_path() -> Option<PathBuf> {
 struct PersistedQuotaCache {
     #[serde(default)]
     last_success: HashMap<String, CachedQuotaSuccess>,
+    #[serde(default)]
+    limit_evidence: HashMap<String, PersistedLimitEvidence>,
 }
 
-fn load_persisted_cache() -> HashMap<String, CachedQuotaSuccess> {
+fn load_persisted_cache() -> PersistedQuotaCache {
     let Some(path) = quota_cache_path() else {
-        return HashMap::new();
+        return PersistedQuotaCache::default();
     };
     let Ok(raw) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
+        return PersistedQuotaCache::default();
     };
-    serde_json::from_str::<PersistedQuotaCache>(&raw)
-        .map(|persisted| persisted.last_success)
-        .unwrap_or_default()
+    serde_json::from_str::<PersistedQuotaCache>(&raw).unwrap_or_default()
 }
 
-fn save_persisted_cache(last_success: &HashMap<String, CachedQuotaSuccess>) {
+fn save_persisted_cache(
+    last_success: &HashMap<String, CachedQuotaSuccess>,
+    limit_evidence: &HashMap<String, PersistedLimitEvidence>,
+) {
     let Some(path) = quota_cache_path() else {
         return;
     };
@@ -692,6 +862,7 @@ fn save_persisted_cache(last_success: &HashMap<String, CachedQuotaSuccess>) {
     }
     if let Ok(json) = serde_json::to_string(&PersistedQuotaCache {
         last_success: last_success.clone(),
+        limit_evidence: limit_evidence.clone(),
     }) {
         let _ = std::fs::write(path, json);
     }
@@ -700,8 +871,10 @@ fn save_persisted_cache(last_success: &HashMap<String, CachedQuotaSuccess>) {
 fn quota_resilience_cache() -> &'static Mutex<QuotaResilienceCache> {
     static CACHE: OnceLock<Mutex<QuotaResilienceCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
+        let persisted = load_persisted_cache();
         Mutex::new(QuotaResilienceCache {
-            last_success: load_persisted_cache(),
+            last_success: persisted.last_success,
+            limit_evidence: persisted.limit_evidence,
             ..QuotaResilienceCache::default()
         })
     })
@@ -1257,14 +1430,20 @@ pub fn poll_remote_quotas_json(input: &str) -> String {
     cards.extend(claude_precheck);
     cards.extend(grok_precheck);
 
-    save_persisted_cache(&cache.last_success);
-    drop(cache);
-
-    let cards = enrich_quota_cards(
+    // enrich_quota_cards_persistent (task 6) mutates cache.limit_evidence
+    // in place, so the save below has to happen AFTER it runs, not before
+    // — otherwise a freshly-(re)established or newly-expired limit lock
+    // would never make it to disk.
+    let cards = enrich_quota_cards_persistent(
         cards,
         parsed.dispatch_jobs_path.as_deref().map(Path::new),
         now,
+        &mut cache.limit_evidence,
     );
+
+    save_persisted_cache(&cache.last_success, &cache.limit_evidence);
+    drop(cache);
+
     serde_json::to_string(&json!({
         "schemaVersion": CCCOG_BAR_SCHEMA_VERSION,
         "ok": true,
@@ -1309,6 +1488,52 @@ pub unsafe extern "C" fn cccog_bar_poll_quotas(input_json: *const c_char) -> *mu
     CString::new(result)
         .unwrap_or_else(|_| CString::new(error_json("NUL in response".to_owned())).unwrap())
         .into_raw()
+}
+
+#[cfg(test)]
+mod limit_evidence_persistence_tests {
+    use super::*;
+
+    fn evidence(reset_at: &str, observed_at: &str) -> PersistedLimitEvidence {
+        PersistedLimitEvidence {
+            provider: "codex".to_owned(),
+            reset_at: reset_at.parse().unwrap(),
+            evidence_job_id: "20260816T162448Z_07d41b5f".to_owned(),
+            observed_at: observed_at.parse().unwrap(),
+        }
+    }
+
+    /// Task 6's literal "cache roundtrip across restart" ask: the exact
+    /// on-disk shape (`PersistedQuotaCache`, both fields together) survives
+    /// a serialize/deserialize cycle — the same operation a real app
+    /// restart performs (in-memory `QuotaResilienceCache` is lost; only
+    /// what made it to `bar-quota-cache.json` comes back). Deliberately
+    /// tests the serde round-trip directly rather than the real
+    /// `%LOCALAPPDATA%` file path, matching this file's existing
+    /// `parse_flow_settings` convention of keeping pure logic testable
+    /// without touching a real, possibly-shared settings file.
+    #[test]
+    fn persisted_quota_cache_roundtrips_limit_evidence_across_a_simulated_restart() {
+        let mut limit_evidence = HashMap::new();
+        limit_evidence.insert("codex".to_owned(), evidence("2026-08-20T11:50:00Z", "2026-08-16T22:24:48Z"));
+        let persisted = PersistedQuotaCache {
+            last_success: HashMap::new(),
+            limit_evidence: limit_evidence.clone(),
+        };
+        let json = serde_json::to_string(&persisted).unwrap();
+        let restored: PersistedQuotaCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.limit_evidence, limit_evidence);
+    }
+
+    /// A cache file written before task 6 (`last_success` only, no
+    /// `limit_evidence` key at all) must still load cleanly — `#[serde(default)]`
+    /// on the new field, not a hard requirement every existing on-disk
+    /// cache file suddenly needs to satisfy.
+    #[test]
+    fn persisted_quota_cache_defaults_limit_evidence_when_absent_from_an_older_file() {
+        let restored: PersistedQuotaCache = serde_json::from_str(r#"{"last_success":{}}"#).unwrap();
+        assert!(restored.limit_evidence.is_empty());
+    }
 }
 
 #[cfg(test)]

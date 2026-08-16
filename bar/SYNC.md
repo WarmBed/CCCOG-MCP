@@ -1053,3 +1053,153 @@ Quit verified clean afterward (UI Automation `InvokePattern.Invoke()` —
 process exited fully per `tasklist`; a dead process cannot tick a timer,
 which is the strongest form of "does not tick after Quit"). No
 `bar-crash.log` at any point across this entire verification pass.
+
+## 2026-08-16/17 task 6: quota-limit state must persist until T, and a live timezone bug in the reset-time formatter
+
+Two live-confirmed bugs in `cccog-bar-quota`/`cccog-bar-ffi`'s quota-limit
+override machinery, landed together since the second was found investigating
+the first.
+
+### Bug 1: limit state silently "reset" overnight when the evidence job aged out
+
+The Codex card showed `Limit 100% · 08/20 19:50` (see bug 2 below for why
+that time was itself wrong), then overnight fell back to a stale, ~22h-old
+rollout snapshot (`7d 37% · as of 22h ago`) — read by the operator as "quota
+reset". It hadn't: a fresh probe run minutes later hit the identical limit.
+Root cause: `find_quota_limit_failure`'s scan only ever looks at whatever
+dispatch job status.json files exist RIGHT NOW, within `JOB_FAILURE_LOOKBACK_SECS`
+(24h) — once the evidence job's file is no longer found (lookback expiry,
+archival, retention cleanup — any of these), `enrich_quota_cards` had
+nothing to override with, even though the real provider-side block (whose
+own reset time is still in the future) never went anywhere.
+
+**Fix**: `PersistedLimitEvidence { provider, reset_at, evidence_job_id,
+observed_at }`, persisted in the SAME on-disk file as the existing quota
+resilience cache (`%LOCALAPPDATA%\CCCG\bar-quota-cache.json`,
+`QuotaResilienceCache::limit_evidence` in memory / `PersistedQuotaCache::limit_evidence`
+on disk) — survives both a scan miss AND a full app restart. New function
+`enrich_quota_cards_persistent` (the production path now; the original
+`enrich_quota_cards` is kept byte-for-byte unchanged as a still-tested,
+non-persistent building block) applies three rules per codex/grok card,
+in order:
+
+1. A fresh scan hit (unchanged `find_quota_limit_failure` mechanism)
+   ALWAYS refreshes the persisted evidence — but only when its reset hint
+   actually parses to a real instant (`cccog_bar_quota::parse_reset_instant`,
+   now `pub`). Evidence without a usable T never persists, staying exactly
+   as ephemeral as before for that case — literally "once evidence WITH A
+   PARSED RESET TIME is established" (task 6's own phrasing).
+2. Absent a fresh hit, a genuinely NEWER non-limit snapshot (the raw
+   card's own `observed_at` newer than the persisted evidence's) super­sedes
+   and clears the persisted state — a real new observation (the block
+   actually lifted, or a corrected read) beats stale memory. Never checked
+   on a round that just refreshed the evidence itself (nothing to compare
+   against, comparing a fresh entry to itself is meaningless).
+3. Whatever's left: apply the override while `now < reset_at`; drop it and
+   fall through to normal sources the moment `now >= reset_at`. This is the
+   actual fix — the lock now survives the evidence file disappearing
+   entirely, because "is it still in force" no longer depends on finding
+   that file again.
+
+A small dim `· as of X ago` marker (reusing `SNAPSHOT_STALE_AFTER_SECS`,
+1h, as the same "how old is this data" threshold used everywhere else in
+this file) is appended to the diagnostic only when the EVIDENCE's own age
+exceeds it — i.e. exactly when the render is relying on memory rather than
+a fresh re-confirmation this round. `poll_remote_quotas_json` now holds the
+`QuotaResilienceCache` lock across `enrich_quota_cards_persistent` (it used
+to `save_persisted_cache`+`drop(cache)` BEFORE the enrich step, back when
+enrich was stateless) so the mutated `limit_evidence` map makes it to disk
+every time, not just `last_success`.
+
+### Bug 2: the reset-time formatter treated Codex's local-time string as UTC
+
+Found investigating bug 1 with the real evidence: the running card showed
+`08/20 19:50`, but the upstream string (jobs `20260816T162448Z_07d41b5f`/
+`...17e490df`, stdout) literally says `"...try again at Aug 20th, 2026
+11:50 AM."` — 11:50 + 8h (this machine's UTC offset) = 19:50. Root cause:
+`parse_reset_instant`'s English `"Mon D, YYYY H:MM AM/PM"` branch (the
+exact shape `extract_human_reset_date` extracts from real Codex messages)
+called `Utc.from_utc_datetime(&naive)`, i.e. treated the parsed wall-clock
+numbers as a UTC instant — but Codex CLI emits that string in the machine's
+OWN local time already, so converting UTC→Local for display shifted it by
+a full UTC-offset for no reason.
+
+**Fix**: that ONE branch now calls `Local.from_local_datetime(&naive).earliest()`
+instead — interprets the naive value as already-local (falling back to a
+UTC-equivalent instant only in the practically-unreachable DST spring-forward
+Gap case, so the function never panics). Every OTHER shape
+(`parse_reset_instant`'s RFC3339/epoch/naive-ISO branches) is UNCHANGED —
+this is deliberately scoped to the one shape that's actually ambiguous
+AND wrong today, not a blanket "everything is local now" rewrite; the
+module-level doc comment above `normalize_reset_display` now documents
+this shape as the one exception to the "assume UTC" rule the others still
+follow. Since `PersistedLimitEvidence.reset_at` is derived from THIS SAME
+function, the fix doubles as the correctness fix for bug 1's `now >=
+reset_at` comparison too — one correctly-computed instant, used
+consistently for both "what time does this show" and "has this passed
+yet" (verified live: the persisted `bar-quota-cache.json` entry shows
+`"reset_at":"2026-08-20T03:50:00Z"` — exactly 11:50 local minus this
+machine's +8h offset, the correct UTC instant, not the buggy 19:50-shifted
+one).
+
+### Fixtures
+
+- `cccog-bar-quota`: `parse_reset_instant_treats_iso_as_utc_and_english_as_local`
+  (direct parser-level coverage, not just through the display formatter) +
+  the existing `normalizes_english_verbatim_dates_with_and_without_a_time`
+  updated to assert the literal `"08/20 11:50"` (no conversion) instead of
+  the old UTC-then-Local expectation.
+- `cccog-bar-ffi` (`tests/ffi.rs`): `evidence_ages_out_of_the_scan_window_but_t_is_still_future_so_the_limit_persists`
+  (empty dispatch root, pre-seeded evidence, override still applies + `as
+  of 4h ago` marker), `once_now_passes_t_the_limit_is_dropped_and_normal_sources_show_through`,
+  `a_newer_non_limit_snapshot_supersedes_and_clears_the_persisted_limit`,
+  `a_fresh_scan_hit_refreshes_the_persisted_evidence_with_no_as_of_marker`
+  (byte-identical to the old ephemeral override's diagnostic — no marker).
+  The pre-existing `job_failure_override_scans_stdout_tail_when_status_error_is_generic`
+  was updated to the corrected `"08/20 11:50"` expectation (it exercises
+  the same real evidence text and was asserting the bug 2 behavior before
+  this fix).
+- `cccog-bar-ffi` (inline, `limit_evidence_persistence_tests`):
+  `persisted_quota_cache_roundtrips_limit_evidence_across_a_simulated_restart`
+  (the literal "cache roundtrip across restart" ask — a serde round-trip
+  of the exact on-disk shape, not a real-file touch, matching this
+  module's existing `parse_flow_settings` convention of keeping pure
+  logic testable without depending on `%LOCALAPPDATA%`) and
+  `persisted_quota_cache_defaults_limit_evidence_when_absent_from_an_older_file`
+  (an existing pre-task-6 cache file, `last_success` only, must still
+  load).
+- `chrono`'s `serde` feature enabled on `cccog-bar-ffi` (was missing —
+  needed for `DateTime<Utc>` to (de)serialize inside `PersistedLimitEvidence`).
+
+### Verification
+
+`cargo test --workspace`: 140 tests green, up from 133 (8 net new: 2 in
+`cccog-bar-quota`, 4 new behavioral tests in `cccog-bar-ffi`'s
+`tests/ffi.rs` — plus one pre-existing test there corrected to the
+now-accurate expectation, not counted as "new" — 2 new inline
+`cccog-bar-ffi` roundtrip tests). `dotnet build -c Release
+-p:Platform=x64`: 0 warnings, 0 errors (no C# changes this task — the fix
+is entirely in the two Rust crates the FFI/quota logic already lived in).
+`cargo build --release --workspace`: clean, 0 warnings.
+
+Coordinator's running instance (pid 47008) killed first as instructed;
+live app relaunched from freshly-rebuilt DLLs (mtime-verified). Live UI
+Automation read-back of the real, running flyout confirmed the exact fix
+the operator asked to see:
+
+```
+Codex
+  Limit  100%
+  08/20 11:50
+  limit · 08/20 11:50
+```
+
+— matching the real upstream evidence string verbatim, no timezone
+shift, no stale-fallback regression. No `as of` marker at this exact
+moment because the evidence job was still directly scannable (this
+verification ran shortly after the probe, well inside the lookback
+window) — the "still limit hours after the job aged out" half of the fix
+is what the four new `tests/ffi.rs` cases above prove deterministically;
+reproducing that specific timing live would need waiting out the real
+job's actual aging-out, which the fixtures already cover exactly. Quit
+verified clean; no `bar-crash.log` at any point.

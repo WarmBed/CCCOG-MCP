@@ -1,13 +1,14 @@
 use cccog_bar_core::graph::{build_snapshot, DispatchRecord, GraphInput};
 use cccog_bar_ffi::{
-    enrich_quota_cards, envelope_from_json, envelope_from_parts, postprocess_http_provider,
-    precheck_http_provider, render_with_cache_fallback, BackgroundQuotaPoller,
-    QuotaResilienceCache, CCCOG_BAR_SCHEMA_VERSION, CLAUDE_GROK_TTL_SECS,
-    MANUAL_REFRESH_MIN_INTERVAL_SECS,
+    enrich_quota_cards, enrich_quota_cards_persistent, envelope_from_json, envelope_from_parts,
+    postprocess_http_provider, precheck_http_provider, render_with_cache_fallback,
+    BackgroundQuotaPoller, PersistedLimitEvidence, QuotaResilienceCache, CCCOG_BAR_SCHEMA_VERSION,
+    CLAUDE_GROK_TTL_SECS, MANUAL_REFRESH_MIN_INTERVAL_SECS,
 };
-use cccog_bar_quota::{QuotaCards, QuotaState, QuotaWindow};
+use cccog_bar_quota::{parse_reset_instant, QuotaCards, QuotaState, QuotaWindow};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 
 /// Same string `normalize_reset_display` (cccog-bar-quota) would produce for
@@ -318,14 +319,16 @@ fn job_failure_override_scans_stdout_tail_when_status_error_is_generic() {
     let cards = enrich_quota_cards(vec![codex_card(None)], Some(root.path()), NOW_SECONDS);
     let card = &cards[0];
     assert_eq!(card.windows[0].used_percent, 100.0, "red 100% bar");
-    let want_reset = expected_reset_display(Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
-    assert_eq!(
-        card.diagnostic.as_deref(),
-        Some(format!("limit · {want_reset}").as_str())
-    );
+    // "Aug 20th, 2026 11:50 AM" is Codex CLI's own LOCAL-time string (task 6
+    // addendum, 2026-08-16/17) — format-only, never shifted by the test
+    // machine's UTC offset, so the expected text is the literal source
+    // numbers, not `expected_reset_display`'s UTC->Local conversion (that
+    // helper is still correct for every OTHER reset source in this file,
+    // which do carry an explicit/unambiguous UTC instant).
+    assert_eq!(card.diagnostic.as_deref(), Some("limit · 08/20 11:50"));
     assert_eq!(
         card.diagnostic_detail.as_deref(),
-        Some(format!("limit reached (dispatch failure 09:13) · {want_reset}").as_str())
+        Some("limit reached (dispatch failure 09:13) · 08/20 11:50")
     );
 }
 
@@ -411,6 +414,113 @@ fn job_failure_override_is_scoped_to_codex_and_grok_only() {
     };
     let result = enrich_quota_cards(vec![claude_card], Some(root.path()), NOW_SECONDS);
     assert_eq!(result[0].windows[0].used_percent, 6.0, "claude is out of scope for this cross-check");
+}
+
+// ── Task 6: persist-until-T quota-limit evidence ────────────────────────
+// Live-confirmed bug: the Codex card fell back from "Limit 100% ·
+// 08/20 19:50" to a stale, 22h-old rollout snapshot overnight purely
+// because the evidence job aged out of the scan window/lookback — read by
+// the operator as "quota reset" when it hadn't. `enrich_quota_cards_persistent`
+// is the fix: once evidence with a parsed reset instant T is established,
+// the limit persists until `now >= T`, independent of whether a fresh scan
+// still finds the originating job.
+
+/// `reset_at_english` goes through the SAME `parse_reset_instant` production
+/// code parses a Codex evidence string with — not a hand-built RFC3339
+/// string — so this fixture exercises the real local-time interpretation
+/// (task 6 addendum) instead of accidentally asserting UTC-instant
+/// semantics that don't apply to this shape.
+fn persistent_codex_evidence(reset_at_english: &str, observed_at_rfc3339: &str) -> PersistedLimitEvidence {
+    PersistedLimitEvidence {
+        provider: "codex".to_owned(),
+        reset_at: parse_reset_instant(reset_at_english).expect("valid English reset text"),
+        evidence_job_id: "20260816T162448Z_07d41b5f".to_owned(),
+        observed_at: observed_at_rfc3339.parse().unwrap(),
+    }
+}
+
+#[test]
+fn evidence_ages_out_of_the_scan_window_but_t_is_still_future_so_the_limit_persists() {
+    // Empty dispatch root: nothing for `find_quota_limit_failure` to find
+    // this round — simulates the job's status.json having aged out of the
+    // 24h lookback, or been archived/rotated away entirely, while the
+    // evidence is pre-seeded as already-established (a previous round DID
+    // see it).
+    let root = tempfile::tempdir().unwrap();
+    let mut limit_evidence = HashMap::new();
+    // NOW_SECONDS is 2026-08-15T12:00:00Z; reset_at is nearly a week later
+    // and observed_at is well over an hour before NOW -- both conditions
+    // for "still in force" AND "old enough to carry the as-of marker".
+    limit_evidence.insert("codex".to_owned(), persistent_codex_evidence("Aug 20th, 2026 11:50 AM", "2026-08-15T08:00:00Z"));
+
+    let cards = enrich_quota_cards_persistent(vec![codex_card(Some((NOW_SECONDS - 22 * 3600) * 1000))], Some(root.path()), NOW_SECONDS, &mut limit_evidence);
+
+    let card = &cards[0];
+    assert_eq!(card.windows[0].used_percent, 100.0, "the persisted evidence must still override, not the 22h-old rollout snapshot");
+    assert_eq!(card.diagnostic.as_deref(), Some("limit · 08/20 11:50 · as of 4h ago"));
+    assert!(limit_evidence.contains_key("codex"), "evidence must remain persisted -- T hasn't passed");
+}
+
+#[test]
+fn once_now_passes_t_the_limit_is_dropped_and_normal_sources_show_through() {
+    let root = tempfile::tempdir().unwrap();
+    let mut limit_evidence = HashMap::new();
+    // reset_at is BEFORE NOW_SECONDS -- T has already passed.
+    limit_evidence.insert("codex".to_owned(), persistent_codex_evidence("2026-08-15T09:00:00Z", "2026-08-14T20:00:00Z"));
+
+    let normal_card = codex_card(Some((NOW_SECONDS - 300) * 1000));
+    let cards = enrich_quota_cards_persistent(vec![normal_card], Some(root.path()), NOW_SECONDS, &mut limit_evidence);
+
+    let card = &cards[0];
+    assert_eq!(card.windows[0].used_percent, 37.0, "normal rollout data must show through once T has passed");
+    assert!(card.diagnostic.is_none(), "no limit diagnostic once expired");
+    assert!(!limit_evidence.contains_key("codex"), "expired evidence must be dropped from the cache");
+}
+
+#[test]
+fn a_newer_non_limit_snapshot_supersedes_and_clears_the_persisted_limit() {
+    // No fresh failure evidence this round (empty dispatch root) -- but the
+    // incoming card's own observed_at is NEWER than the persisted
+    // evidence's observed_at, meaning a real, more recent successful read
+    // happened since the block was recorded (e.g. the provider-side block
+    // was lifted early, or the persisted state was simply wrong).
+    let root = tempfile::tempdir().unwrap();
+    let mut limit_evidence = HashMap::new();
+    limit_evidence.insert("codex".to_owned(), persistent_codex_evidence("Aug 20th, 2026 11:50 AM", "2026-08-15T08:00:00Z"));
+
+    let fresh_card = codex_card(Some((NOW_SECONDS - 60) * 1000)); // observed 1 minute ago -- newer than the evidence
+    let cards = enrich_quota_cards_persistent(vec![fresh_card], Some(root.path()), NOW_SECONDS, &mut limit_evidence);
+
+    let card = &cards[0];
+    assert_eq!(card.windows[0].used_percent, 37.0, "the newer successful snapshot wins over the stale limit lock");
+    assert!(card.diagnostic.is_none());
+    assert!(!limit_evidence.contains_key("codex"), "a newer good observation must clear the persisted limit state");
+}
+
+#[test]
+fn a_fresh_scan_hit_refreshes_the_persisted_evidence_with_no_as_of_marker() {
+    // The evidence's own observed_at (the failed job's finished_at) is
+    // recent -- this round's scan finds it directly, so the render must
+    // look exactly like the pre-task-6 ephemeral override (no "as of"
+    // marker): the app just re-confirmed this itself, it isn't relying on
+    // memory.
+    let root = tempfile::tempdir().unwrap();
+    write_failed_job(
+        root.path(),
+        "fresh1",
+        "codex",
+        "2026-08-15T11:30:00Z",
+        "You've hit your usage limit. try again at Aug 20th, 2026 11:50 AM.",
+    );
+    let mut limit_evidence = HashMap::new();
+
+    let cards = enrich_quota_cards_persistent(vec![codex_card(None)], Some(root.path()), NOW_SECONDS, &mut limit_evidence);
+
+    let card = &cards[0];
+    assert_eq!(card.windows[0].used_percent, 100.0);
+    assert_eq!(card.diagnostic.as_deref(), Some("limit · 08/20 11:50"), "no as-of marker on a freshly-reconfirmed round");
+    let stored = limit_evidence.get("codex").expect("a fresh hit with a parseable reset must be persisted");
+    assert_eq!(stored.evidence_job_id, "fresh1");
 }
 
 #[test]

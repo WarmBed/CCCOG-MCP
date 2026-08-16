@@ -619,11 +619,17 @@ fn format_percent_compact(value: f64) -> String {
 // follows for reset dates (see `extract_reset_date`/`extract_human_reset_date`
 // above).
 //
-// A source with no explicit UTC offset (a bare epoch, a naive
-// "YYYY-MM-DD[T ]HH:MM[:SS]", or an English date/time) is treated as UTC
-// before converting to the display's local time — the epoch case is
-// unambiguous, and the others carry no offset information to do otherwise
-// with; this is a deliberate, documented assumption, not a silent guess.
+// A source with no explicit UTC offset (a bare epoch, or a naive
+// "YYYY-MM-DD[T ]HH:MM[:SS]") is treated as UTC before converting to the
+// display's local time — the epoch case is unambiguous, and the naive-ISO
+// case carries no offset information to do otherwise with; this is a
+// deliberate, documented assumption, not a silent guess.
+//
+// The English "Mon D, YYYY H:MM AM/PM" shape (`extract_human_reset_date`'s
+// output) is the ONE exception: it is treated as ALREADY LOCAL, format-only,
+// never shifted — see `parse_reset_instant`'s own doc comment for why
+// (Codex CLI emits that exact shape in the host's own local time, not UTC;
+// live-confirmed 2026-08-16/17 after a real reset rendered 8 hours off).
 pub fn normalize_reset_display(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -643,7 +649,23 @@ pub fn normalize_reset_display(raw: &str) -> String {
 /// (assumed UTC — see the module comment above), and the English
 /// "Mon D[st|nd|rd|th], YYYY H:MM AM/PM" shape `extract_human_reset_date`
 /// extracts.
-fn parse_reset_instant(raw: &str) -> Option<DateTime<Utc>> {
+///
+/// **Zone handling differs by shape, and this is deliberate, not an
+/// oversight**: RFC3339/epoch carry an explicit or unambiguous absolute
+/// instant, converted to local for display as always. The naive
+/// `YYYY-MM-DD[T ]HH:MM[:SS]` shape keeps the existing UTC assumption
+/// (unchanged). The English "Mon D, YYYY H:MM AM/PM" shape is different:
+/// it is treated as ALREADY LOCAL, not UTC — live-confirmed 2026-08-16/17
+/// (jobs `20260816T162448Z_07d41b5f`/`...17e490df`): Codex CLI's own
+/// usage-limit message ("...try again at Aug 20th, 2026 11:50 AM") is
+/// emitted in the machine's own local time, not UTC. The old
+/// UTC-then-convert-to-local handling shifted a real "11:50 AM" reset into
+/// a wrong "19:50" on this +8h machine. Public so `cccog-bar-ffi` can
+/// derive a real, correctly-timezoned `DateTime<Utc>` from the SAME parse
+/// this function's callers use for display — one correct instant, used
+/// consistently for both "what time does this show" and "has this instant
+/// passed yet".
+pub fn parse_reset_instant(raw: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
         return Some(dt.with_timezone(&Utc));
     }
@@ -665,7 +687,21 @@ fn parse_reset_instant(raw: &str) -> Option<DateTime<Utc>> {
     let stripped = strip_ordinal_suffix(raw);
     for format in ["%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(&stripped, format) {
-            return Some(Utc.from_utc_datetime(&naive));
+            // Interpret as LOCAL wall-clock time (not UTC) so the eventual
+            // `.with_timezone(&Local)` display round-trips back to the
+            // exact same numbers instead of shifting by the host's UTC
+            // offset. `.earliest()` resolves the ordinary (Single) and
+            // DST-Ambiguous cases identically to picking the
+            // earlier-occurring instant; only the theoretically possible
+            // DST spring-forward Gap case (this exact naive time never
+            // occurs locally) falls through to a UTC-equivalent instant as
+            // a defensive, never-panic default — real quota reset times
+            // essentially never land in that narrow gap.
+            let local = Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .unwrap_or_else(|| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).with_timezone(&Local));
+            return Some(local.with_timezone(&Utc));
         }
     }
     None
@@ -971,6 +1007,24 @@ mod reset_display_tests {
         utc.with_timezone(&Local).format("%m/%d %H:%M").to_string()
     }
 
+    /// Direct coverage of `parse_reset_instant` (not just through the
+    /// display formatter above) — this is the function `cccog-bar-ffi`
+    /// calls to get a real, comparable `DateTime<Utc>` for the
+    /// persist-until-T quota-limit logic, so its zone handling has to be
+    /// right independent of how `normalize_reset_display` happens to
+    /// render it.
+    #[test]
+    fn parse_reset_instant_treats_iso_as_utc_and_english_as_local() {
+        let iso = parse_reset_instant("2026-08-20T11:50:00Z").unwrap();
+        assert_eq!(iso, Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
+
+        let english = parse_reset_instant("Aug 20th, 2026 11:50 AM").unwrap();
+        // The English shape is local-time; converting it BACK to local for
+        // display must reproduce the exact same wall-clock numbers.
+        let local_display = english.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string();
+        assert_eq!(local_display, "2026-08-20 11:50");
+    }
+
     #[test]
     fn normalizes_iso8601_with_and_without_z() {
         let want = expected(Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
@@ -987,11 +1041,15 @@ mod reset_display_tests {
 
     #[test]
     fn normalizes_english_verbatim_dates_with_and_without_a_time() {
-        let with_time = expected(Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
-        assert_eq!(
-            normalize_reset_display("Aug 20th, 2026 11:50 AM"),
-            with_time
-        );
+        // Unlike every other case in this module, this shape is NOT run
+        // through the UTC->Local conversion `expected()` above applies —
+        // it is treated as already-local and rendered verbatim, so the
+        // expected output is the exact same wall-clock numbers regardless
+        // of the test machine's own timezone (task 6 addendum,
+        // 2026-08-16/17: Codex CLI emits this exact shape in local time;
+        // the old UTC-then-convert behavior shifted a real "11:50 AM"
+        // reset into "19:50" on a +8h machine).
+        assert_eq!(normalize_reset_display("Aug 20th, 2026 11:50 AM"), "08/20 11:50");
         assert_eq!(normalize_reset_display("January 3, 2027"), "01/03");
     }
 
