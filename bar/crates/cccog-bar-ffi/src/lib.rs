@@ -4,10 +4,13 @@
 //! All parse failures are data-shaped JSON errors; they never cross the ABI as
 //! a panic or process abort.
 
+use cccog_bar_core::claude_sessions::{default_projects_root, ClaudeSessionTailer};
 use cccog_bar_core::control::snapshot_at as control_snapshot_at;
 use cccog_bar_core::dispatch::parse_status;
 use cccog_bar_core::graph::GraphSnapshot;
-use cccog_bar_core::owners::is_archived_path;
+use cccog_bar_core::owners::{is_archived_path, parse_owner};
+use cccog_bar_core::presence::{collect_presence, prune_stale_presence_files};
+use cccog_bar_core::tree::{build_tree, DispatchJobInput, OwnerInput, TreeBuildInput, TreeRow};
 use cccog_bar_quota::{
     extract_human_reset_date, extract_reset_date, fetch_claude_quota, fetch_grok_quota,
     format_window_line, load_claude_credential, load_codex_quota_from_sessions, load_grok_token,
@@ -886,11 +889,178 @@ struct ControlSnapshotInput {
     now: Option<i64>,
 }
 
+/// Process-wide tailer for the Claude-session scan's skip-parse shortcut
+/// (`cccog_bar_core::claude_sessions::ClaudeSessionTailer::tick`) — the FFI
+/// boundary is stateless per call, so this static is the long-lived home for
+/// the "did anything change since last tick" token, same pattern as
+/// `quota_resilience_cache()` above.
+fn claude_session_tailer() -> &'static ClaudeSessionTailer {
+    static TAILER: std::sync::OnceLock<ClaudeSessionTailer> = std::sync::OnceLock::new();
+    TAILER.get_or_init(ClaudeSessionTailer::new)
+}
+
+/// `%LOCALAPPDATA%\CCCG\presence` — resolved at runtime, same convention as
+/// `quota_cache_path()`.
+fn presence_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|base| base.join("CCCG").join("presence"))
+}
+
+/// Active + terminal dispatch jobs reduced to what the tree needs — a
+/// second, much simpler walk of `dispatch/jobs` than `control.rs`'s own
+/// (which does windowed same-path aggregation for the legacy flat `rows`);
+/// the tree only needs "is this job attachable under a live controller right
+/// now, or does it belong in the bottom terminal bucket". Only `codex`/
+/// `grok` jobs are considered — a `claude` dispatch job's target is better
+/// represented by the Claude-session scan itself once that session starts
+/// writing its own transcript, so it is not double-counted here.
+fn collect_dispatch_jobs_for_tree(jobs_root: &Path) -> Vec<DispatchJobInput> {
+    let mut jobs = Vec::new();
+    walk_jobs_for_tree(jobs_root, &mut jobs);
+    jobs
+}
+
+fn walk_jobs_for_tree(dir: &Path, out: &mut Vec<DispatchJobInput>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_archived_path(&path) {
+            continue;
+        }
+        if path.is_dir() {
+            walk_jobs_for_tree(&path, out);
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) != Some("status.json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(status) = parse_status(&raw) else {
+            continue;
+        };
+        let provider = status.provider.to_lowercase();
+        if provider != "codex" && provider != "grok" {
+            continue;
+        }
+        let normalized_status = status.status.to_lowercase();
+        let active = matches!(normalized_status.as_str(), "running" | "queued" | "starting" | "working");
+        let running = matches!(normalized_status.as_str(), "running" | "working");
+        let time = status
+            .started_at
+            .as_deref()
+            .or(status.created_at.as_deref())
+            .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let target_label = status
+            .session_id
+            .as_deref()
+            .or(status.requested_session_id.as_deref())
+            .map(|id| id.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "unknown".to_owned());
+        out.push(DispatchJobInput {
+            provider,
+            caller_label: status.caller_label,
+            hop_chain: status.hop_chain,
+            active,
+            running,
+            model: status.model,
+            time,
+            target_label,
+        });
+    }
+}
+
+/// Live vs. resumable owner leases for `codex`/`grok` — the "A layer" the
+/// bottom-of-tree aggregate rows read (rule 5). `claude` owner leases are
+/// skipped: a live Claude session is already represented richly by the
+/// transcript scan, an owner-lease row for it would just be a duller
+/// duplicate.
+fn collect_owners_for_tree(owners_root: &Path) -> Vec<OwnerInput> {
+    let mut owners = Vec::new();
+    walk_owners_for_tree(owners_root, &mut owners);
+    owners
+}
+
+fn walk_owners_for_tree(dir: &Path, out: &mut Vec<OwnerInput>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_archived_path(&path) {
+            continue;
+        }
+        if path.is_dir() {
+            walk_owners_for_tree(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(owner) = parse_owner(&raw) else {
+            continue;
+        };
+        let provider = owner.provider.to_lowercase();
+        if provider != "codex" && provider != "grok" {
+            continue;
+        }
+        let live = path.with_extension("lock").is_file();
+        out.push(OwnerInput { provider, live });
+    }
+}
+
+/// Assemble the Flow tree (see `cccog_bar_core::tree` for the shape and the
+/// rules it implements): live Claude sessions/agents (C-layer, via the
+/// process-wide tailer's skip-parse shortcut) refined by presence heartbeats
+/// (A/B layer) where available, plus CCCG dispatch jobs/owners for the
+/// codex/grok children and bottom aggregate. Every root is resolved at
+/// runtime from the environment — nothing here is hardcoded to a specific
+/// user profile.
+fn build_flow_tree(dispatch_root: Option<&Path>, now: DateTime<Utc>) -> Vec<TreeRow> {
+    let sessions = match default_projects_root() {
+        Some(root) if root.is_dir() => claude_session_tailer().tick(&root, now),
+        _ => Vec::new(),
+    };
+
+    let presence = match presence_root() {
+        Some(root) if root.is_dir() => {
+            prune_stale_presence_files(&root, now.timestamp_millis());
+            collect_presence(&root)
+        }
+        _ => std::collections::HashMap::new(),
+    };
+
+    let (jobs, owners) = match dispatch_root {
+        Some(root) => (
+            collect_dispatch_jobs_for_tree(&root.join("jobs")),
+            collect_owners_for_tree(&root.join("owners")),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    build_tree(TreeBuildInput { sessions, presence, jobs, owners, now })
+}
+
 /// The windowed, aggregated Flow view: Active + last-2h terminal window,
 /// same-path `×N` aggregation, resolved target titles. Replaces the shell's
 /// previous from-scratch dispatch-root scan — see
 /// `cccog_bar_core::control` for the windowing rules and `bar/SYNC.md` for
 /// why this now lives in Rust instead of C#.
+///
+/// `tree` is the newer, second Flow data source (live local Claude Code
+/// sessions/agents alongside the legacy `rows`) — see
+/// `cccog_bar_core::tree`. Both are populated on every call; the shell reads
+/// `tree` for the section it now renders and `rows`/`lastDispatchAt` remain
+/// for the debug CLI and back-compat.
 pub fn control_snapshot_json(input: &str) -> String {
     let parsed = match serde_json::from_str::<ControlSnapshotInput>(input) {
         Ok(value) => value,
@@ -902,10 +1072,12 @@ pub fn control_snapshot_json(input: &str) -> String {
         .unwrap_or_else(Utc::now);
     let root = parsed.dispatch_root.map(PathBuf::from);
     let payload = control_snapshot_at(root.as_deref(), now);
+    let tree = build_flow_tree(root.as_deref(), now);
     serde_json::to_string(&json!({
         "schemaVersion": CCCOG_BAR_SCHEMA_VERSION,
         "ok": true,
         "control": payload,
+        "tree": tree,
     }))
     .unwrap_or_else(|error| error_json(format!("control serialization failed: {error}")))
 }

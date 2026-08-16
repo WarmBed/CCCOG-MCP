@@ -932,11 +932,13 @@ internal static class NativeQuotaClient
 }
 
 /// <summary>
-/// Flow rows via <c>cccog_bar_control_snapshot</c> — the windowed (Active +
-/// last-2h terminal), same-path-aggregated, target-title-resolved view built
-/// by <c>cccog_bar_core::control</c>. Replaces the previous
-/// <c>LocalSnapshotReader</c>, which re-scanned the whole dispatch root
-/// unbounded by age on every refresh; see bar/SYNC.md.
+/// The Flow tree via <c>cccog_bar_control_snapshot</c>'s <c>tree</c> field —
+/// two live data sources combined in Rust
+/// (<c>cccog_bar_core::tree::build_tree</c>): CCCG dispatch jobs (as before)
+/// PLUS live local Claude Code sessions/subagents (new — see
+/// <c>cccog_bar_core::claude_sessions</c>/<c>presence</c>). Replaces the
+/// previous flat, aggregated-rows-only <c>NativeControlClient</c>, which
+/// read the legacy <c>control.rows</c> field; see bar/SYNC.md.
 /// </summary>
 internal static class NativeControlClient
 {
@@ -946,16 +948,9 @@ internal static class NativeControlClient
     [DllImport("cccog_bar_ffi", CallingConvention = CallingConvention.Cdecl)]
     private static extern void cccog_bar_free_string(IntPtr value);
 
-    private static readonly SolidColorBrush StaleGroupBrush =
-        new(Windows.UI.Color.FromArgb(255, 0x6B, 0x72, 0x80));
-    private static readonly SolidColorBrush NormalLabelBrush =
-        new(Windows.UI.Color.FromArgb(255, 0xF8, 0xFA, 0xFC));
-    private static readonly SolidColorBrush UnknownSourceLabelBrush =
-        new(Windows.UI.Color.FromArgb(180, 0x9A, 0xA5, 0xB4));
-
-    public static IReadOnlyList<FlowRowViewModel> TryFetch(out int visibleJobs)
+    public static IReadOnlyList<FlowTreeRowViewModel> TryFetch(out int visibleRows)
     {
-        visibleJobs = 0;
+        visibleRows = 0;
         var dispatchRoot = IOPath.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CCCG", "dispatch");
@@ -974,7 +969,7 @@ internal static class NativeControlClient
             try
             {
                 var json = Marshal.PtrToStringUTF8(pointer);
-                return Parse(json, out visibleJobs);
+                return Parse(json, out visibleRows);
             }
             finally
             {
@@ -999,9 +994,9 @@ internal static class NativeControlClient
         }
     }
 
-    private static IReadOnlyList<FlowRowViewModel> Parse(string? json, out int visibleJobs)
+    private static IReadOnlyList<FlowTreeRowViewModel> Parse(string? json, out int visibleRows)
     {
-        visibleJobs = 0;
+        visibleRows = 0;
         if (string.IsNullOrWhiteSpace(json))
         {
             return [];
@@ -1009,24 +1004,16 @@ internal static class NativeControlClient
         try
         {
             using var document = JsonDocument.Parse(json);
-            if (!document.RootElement.TryGetProperty("control", out var control))
+            if (!document.RootElement.TryGetProperty("tree", out var tree) || tree.ValueKind != JsonValueKind.Array)
             {
                 return [];
             }
-            if (!control.TryGetProperty("available", out var availableValue) || !availableValue.GetBoolean())
-            {
-                return [];
-            }
-            if (!control.TryGetProperty("rows", out var rows))
-            {
-                return [];
-            }
-            var result = new List<FlowRowViewModel>();
-            foreach (var row in rows.EnumerateArray())
+            var result = new List<FlowTreeRowViewModel>();
+            foreach (var row in tree.EnumerateArray())
             {
                 result.Add(ToRow(row));
             }
-            visibleJobs = result.Count;
+            visibleRows = result.Count;
             return result;
         }
         catch (JsonException)
@@ -1035,47 +1022,32 @@ internal static class NativeControlClient
         }
     }
 
-    private static FlowRowViewModel ToRow(JsonElement row)
+    private static FlowTreeRowViewModel ToRow(JsonElement row)
     {
-        var source = String(row, "source") ?? "unknown";
-        var target = String(row, "target") ?? "";
-        var targetProvider = String(row, "targetProvider") ?? "unknown";
-        var status = String(row, "status") ?? "unknown";
-        var active = row.TryGetProperty("active", out var activeValue) && activeValue.GetBoolean();
-        var isStaleGroup = row.TryGetProperty("isStaleGroup", out var staleValue) && staleValue.GetBoolean();
+        var depth = row.TryGetProperty("depth", out var depthValue) ? depthValue.GetInt32() : 0;
+        var kind = String(row, "kind") ?? "controller";
+        var label = String(row, "label") ?? "";
+        var typeModelText = String(row, "typeModelText");
+        var provider = String(row, "provider") ?? "unknown";
+        var stateLabel = String(row, "stateLabel") ?? "";
+        var pulse = row.TryGetProperty("pulse", out var pulseValue) && pulseValue.GetBoolean();
         long? elapsedSeconds = row.TryGetProperty("elapsedSeconds", out var elapsedValue)
             && elapsedValue.ValueKind == JsonValueKind.Number
                 ? elapsedValue.GetInt64()
                 : null;
-        var count = row.TryGetProperty("count", out var countValue) ? countValue.GetInt32() : 1;
-        var sourceIsUnknown = row.TryGetProperty("sourceIsUnknown", out var unknownValue) && unknownValue.GetBoolean();
 
-        var summaries = new List<string>();
-        if (row.TryGetProperty("taskSummaries", out var summariesValue))
+        return new FlowTreeRowViewModel
         {
-            foreach (var item in summariesValue.EnumerateArray())
-            {
-                var text = item.GetString();
-                if (!string.IsNullOrEmpty(text))
-                {
-                    summaries.Add(text);
-                }
-            }
-        }
-
-        return new FlowRowViewModel
-        {
-            ChainText = isStaleGroup ? target : $"{source} → {target}",
-            CountText = count > 1 ? $"×{count}" : "",
-            ElapsedText = FormatElapsed(elapsedSeconds, active, isStaleGroup),
-            TaskSummary = summaries.Count == 0 ? "No task summary" : string.Join(Environment.NewLine, summaries),
-            DotBrush = isStaleGroup
-                ? StaleGroupBrush
-                : new SolidColorBrush(ProviderPalette.Color(targetProvider)),
-            DotOpacity = isStaleGroup ? StatusVisual.Opacity("stale") : StatusVisual.Opacity(status),
-            Pulse = !isStaleGroup && StatusVisual.Pulses(status),
-            LabelBrush = sourceIsUnknown ? UnknownSourceLabelBrush : NormalLabelBrush,
-            IsStaleGroup = isStaleGroup,
+            Depth = depth,
+            Kind = kind,
+            Label = label,
+            TypeModelText = typeModelText,
+            Provider = provider,
+            StateLabel = stateLabel,
+            Pulse = pulse,
+            ElapsedText = FormatTreeElapsed(elapsedSeconds),
+            DotBrush = new SolidColorBrush(ProviderPalette.Color(provider)),
+            DotOpacity = StatusVisual.Opacity(stateLabel),
         };
     }
 
@@ -1084,20 +1056,23 @@ internal static class NativeControlClient
             ? value.GetString()
             : null;
 
-    private static string FormatElapsed(long? elapsedSeconds, bool active, bool isStaleGroup)
+    /// <summary>Bare duration, no "ago" suffix (operator's own tree mock:
+    /// "45s", "2m", "12m", "2h" on the right edge) — every tree row shows an
+    /// elapsed time next to its state word, so the word itself already says
+    /// whether that's "still going" or "since it went idle".</summary>
+    private static string FormatTreeElapsed(long? elapsedSeconds)
     {
-        if (isStaleGroup)
+        if (elapsedSeconds is not { } seconds || seconds < 0)
         {
-            return "> 6h queued";
+            return "";
         }
-        if (elapsedSeconds is not { } seconds)
+        if (seconds < 60)
         {
-            return active ? "active" : "";
+            return $"{seconds}s";
         }
-        var span = TimeSpan.FromSeconds(Math.Max(seconds, 0));
-        var elapsed = span < TimeSpan.FromMinutes(1) ? "<1m" :
-            span < TimeSpan.FromHours(1) ? $"{(int)span.TotalMinutes}m" :
-            $"{(int)span.TotalHours}h{(int)span.TotalMinutes % 60:00}m";
-        return active ? elapsed : $"{elapsed} ago";
+        var span = TimeSpan.FromSeconds(seconds);
+        return span < TimeSpan.FromHours(1)
+            ? $"{(int)span.TotalMinutes}m"
+            : $"{(int)span.TotalHours}h{(int)span.TotalMinutes % 60:00}m";
     }
 }

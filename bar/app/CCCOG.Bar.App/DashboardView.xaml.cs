@@ -1,5 +1,7 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Documents;
+using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
 
 namespace CCCOG.Bar.App;
@@ -58,10 +60,10 @@ public sealed partial class DashboardView : UserControl
         GrokQuotaHost.Content = BuildProviderQuotaCard("grok", "Grok", cards, everHadQuota);
     }
 
-    public void RenderFlow(IReadOnlyList<FlowRowViewModel> rows, int visibleJobs)
+    public void RenderFlow(IReadOnlyList<FlowTreeRowViewModel> rows, int visibleRows)
     {
         FlowHost.Content = Ui.Card("Flow", BuildFlowContent(rows));
-        FooterText.Text = $"{visibleJobs} flow row(s) - tokens only";
+        FooterText.Text = $"{visibleRows} flow row(s) - tokens only";
     }
 
     /// <summary>Route the flyout's WH_MOUSE_LL wheel event onto the Flow
@@ -159,49 +161,88 @@ public sealed partial class DashboardView : UserControl
             return root;
         }
 
-        root.Children.Add(Ui.Text(card.DisplayLine, 11, bold: true));
+        // Operator styling pass: the window/percent cluster ("5h 11%")
+        // keeps its bold left position; the reset date/time moves to the
+        // right edge of the card, non-bold, smaller, dim-secondary (Ui.Dim,
+        // the same treatment TokenBar uses for its own timestamp text) —
+        // C#-side layout only, `card.DisplayLine` (the single Rust-composed
+        // string) is no longer used here, but the field itself stays for
+        // the tooltip/back-compat callers already depending on it.
+        var mainText = Ui.Text($"{card.WindowLabel}  {card.UsedText}", 11, bold: true);
+        var timeText = Ui.Dim(card.ResetText, 9);
+        root.Children.Add(Ui.Row(mainText, timeText));
         root.Children.Add(Ui.GaugeBar(card.UsedPercent));
         return root;
     }
 
     // ── Flow section: TokenBar row primitives (status disc, text,
-    // right-aligned meta) — Ui.Row()/Ui.Text(), fed by FlowRowViewModel.
-    // Behavior (chains, ×N, stale group, tooltips) is unchanged from the
-    // previous ItemsControl/DataTemplate shell.
+    // right-aligned meta) — Ui.Row()/Ui.Text(), fed by the flattened,
+    // depth-tagged Flow tree (FlowTreeRowViewModel — one controller session
+    // per top-level row, its agent/session/codex/grok children indented
+    // beneath). Two-level tree, rendered from a flat list rather than a
+    // real recursive tree control: depth 0 is a controller/resumable row,
+    // depth 1 is always its immediately-preceding depth-0 row's child (the
+    // Rust side already groups children under their controller in order —
+    // see cccog_bar_core::tree::build_tree), so indentation is just "extra
+    // left margin when Depth == 1", no parent/child object graph needed on
+    // this side. See bar/SYNC.md for the fuller derivation record.
 
-    private static FrameworkElement BuildFlowContent(IReadOnlyList<FlowRowViewModel> rows)
+    private static FrameworkElement BuildFlowContent(IReadOnlyList<FlowTreeRowViewModel> rows)
     {
         if (rows.Count == 0)
         {
-            return Ui.Dim("No active or recent jobs");
+            return Ui.Dim("No live sessions or recent jobs");
         }
 
         var panel = new StackPanel { Spacing = 6 };
         foreach (var row in rows)
         {
-            var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-            // Not Ui.Disc(hex): a flow dot's brush/opacity are dynamic
-            // (status-driven, already resolved to a Brush by
-            // LocalSnapshotReader), where Ui.Disc only takes a static hex
-            // string — this is the one primitive that needed adapting
-            // rather than reuse as-is.
+            var left = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                Margin = row.Depth > 0 ? new Thickness(18, 0, 0, 0) : new Thickness(0),
+            };
             left.Children.Add(new Ellipse
             {
-                Width = 8,
-                Height = 8,
+                Width = row.Depth > 0 ? 6 : 8,
+                Height = row.Depth > 0 ? 6 : 8,
                 Fill = row.DotBrush,
                 Opacity = row.DotOpacity,
                 VerticalAlignment = VerticalAlignment.Center,
             });
-            var chainText = Ui.Text(row.ChainText, 11);
-            chainText.Foreground = row.LabelBrush;
-            left.Children.Add(chainText);
+            left.Children.Add(FlowLabelText(row));
 
-            var rowGrid = Ui.Row(left, Ui.Text(row.MetaText, 10, 0.62));
-            ToolTipService.SetToolTip(rowGrid, row.TaskSummary);
+            var stateElapsed = string.IsNullOrEmpty(row.ElapsedText)
+                ? row.StateLabel
+                : $"{row.StateLabel} · {row.ElapsedText}";
+            var rowGrid = Ui.Row(left, Ui.Text(stateElapsed, 10, 0.62));
             panel.Children.Add(rowGrid);
         }
 
         return panel;
+    }
+
+    /// <summary>A child row's label carries its own "(type · model)"
+    /// parenthetical, colored with that child's own provider color
+    /// (operator rule 2: "same palette as the dots") — everything else in
+    /// the line stays the default label color. Built as two
+    /// <see cref="Run"/>s inside one TextBlock rather than two separate
+    /// TextBlocks so the colored segment visually reads as part of the same
+    /// name, not a second column.</summary>
+    private static TextBlock FlowLabelText(FlowTreeRowViewModel row)
+    {
+        var text = new TextBlock { FontSize = 11, TextTrimming = TextTrimming.CharacterEllipsis };
+        text.Inlines.Add(new Run { Text = row.Label });
+        if (!string.IsNullOrEmpty(row.TypeModelText))
+        {
+            text.Inlines.Add(new Run { Text = "  " });
+            text.Inlines.Add(new Run
+            {
+                Text = $"({row.TypeModelText})",
+                Foreground = new SolidColorBrush(ProviderPalette.Color(row.Provider)),
+            });
+        }
+        return text;
     }
 }

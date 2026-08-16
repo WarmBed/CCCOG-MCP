@@ -315,3 +315,284 @@ column at the flyout's standard 500-DIP width (its card's right edge sat
 green across all four crates, including new coverage for
 `normalize_reset_display`, `resolve_window_label`, `format_window_line`,
 and the `displayLine`/`diagnosticDetail` wire fields.
+
+## 2026-08-16 second Flow data source: live Claude Code sessions/agents, presence heartbeats, the Flow tree
+
+Operator complaint: "我至少兩個 Claude session 活著,還有各自 agent,都沒顯示" —
+Flow only ever read `%LOCALAPPDATA%\CCCG\dispatch\{jobs,owners}`, which
+CCD-internal Claude Code sessions never touch. This pass adds a second Flow
+data source (live local Claude Code sessions/subagents) and, mid-flight,
+the operator escalated the display itself from a flat row list to a
+two-level tree with a third liveness layer (presence heartbeat files).
+Scope grew across the session; this section documents the final shape.
+
+### Mechanism imitated from TokenBar (operator directive), and what differs
+
+Read (read-only, not modified) `D:\code\TokenBar-Windows\crates\tb_core_ffi\src\usage_tail.rs`.
+Its `UsageTailer` mechanism — stat-sweep candidates, re-parse only files
+whose mtime falls inside the event window plus a margin, liveness from
+EVENT TIMESTAMPS inside the file (never mtime alone), a trailing window
+snapshot-replaced each tick (no cross-tick accumulation), and a skip-parse
+shortcut keyed on "has the newest source mtime moved since last tick" — is
+replicated in `cccog-bar-core/src/claude_sessions.rs`'s `ClaudeSessionTailer`.
+
+What differs: `UsageTailer` parses local CLIENT USAGE (token counts per
+message) via `tokscale_core`, a dependency this repo does not have and was
+never asked to take on. This module parses SESSION IDENTITY/liveness
+instead (title, model, alive subagents, cross-session-message edges)
+directly from the same JSONL transcript files, with its own from-scratch
+JSON line parser (`parse_line`/`parse_transcript`) rather than a shared
+crate. The skip-parse shortcut, the mtime-margin candidate filter, and the
+snapshot-replace-per-tick contract are the same shape; the domain being
+parsed is not. Everything past the C-layer scanner — presence heartbeats,
+cross-session-message edge extraction, dispatch-job/owner integration, and
+the tree itself — is CCCOG-original, not from TokenBar (TokenBar has no
+equivalent to any of it).
+
+### What real transcripts on this machine turned out to look like
+
+Investigated three live sessions under
+`C:\Users\mike2\.claude\projects\<project-slug>\<session-uuid>.jsonl`
+(project-slug = cwd with path separators replaced by `-`, e.g.
+`d--code-openruterati`) — including this very session, mid-write, while
+investigating. ~40 distinct `type` values exist per line; only a handful of
+fields are keyed on (full detail in `claude_sessions.rs`'s module doc
+comment):
+
+- `timestamp` (RFC3339 `Z`) — present on essentially every substantive
+  line; the sole liveness signal.
+- `isSidechain` (bool) — recorded but not load-bearing: on this machine the
+  session/agent split comes from *which file* a line is in (a subagent gets
+  its own file), not this flag; no top-level session transcript inspected
+  ever had it `true`.
+- `message.model` — assistant lines only, e.g. `"claude-sonnet-5"`.
+- `type":"custom-title"` + `customTitle` — **this turned out to BE the
+  title store the task asked to look for.** Re-emitted verbatim on
+  (apparently) every turn; the last occurrence in the file is the current
+  title. There is no separate sqlite/json title index anywhere under
+  `~/.claude` — checked: no `*.db`/`*.sqlite*` files exist at all,
+  `history.jsonl` only has prompt text keyed by session id (not a title),
+  and `sessions/*.json` are PID-lock files, not a title index. No second
+  file needs to be read.
+- `message.content` (String, on a `user` line) — the shape a
+  `send_message`-delivered cross-session message actually takes:
+  `<cross-session-message from="local_<uuid>" name="<title>" encoded="1">
+  ...`. Confirmed against real transcripts that `from`'s `local_<uuid>`
+  does NOT match any session-uuid `.jsonl` filename on this machine — it is
+  a separate peer-id namespace. Matching therefore goes through `name`
+  (the sender's own title text) against another live session's resolved
+  title, not `from`.
+
+Subagents: `<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl`, each
+with a sibling `agent-<id>.meta.json`
+(`{"agentType":...,"description":...,"toolUseId":...,"spawnDepth":1,"model":"sonnet"}`).
+Confirmed present and actively growing on three different real sessions
+during investigation.
+
+### A real bug the live-run gate itself caught (not a fixture-only find)
+
+First live run showed only one of the two-plus actually-alive sessions —
+specifically, it silently dropped the session running *this very task*.
+Root cause, found by adding a throwaway debug binary
+(`cargo run --example debug_session`, since deleted) against the real
+`~/.claude/projects` tree: a controller session that dispatches a Task-tool
+subagent and then goes quiet (waiting for it) has a STALE top-level
+transcript mtime/last-event for the entire time the subagent keeps actively
+writing its own file. Two places assumed "parent transcript freshness" was
+the right liveness signal and both were wrong:
+
+1. **The mtime candidate prefilter** (`collect_claude_sessions`) checked
+   only the parent `.jsonl` file's own mtime before deciding whether to
+   read the session at all — a session whose parent file was untouched for
+   >15 minutes was skipped before its `subagents/` directory was ever even
+   listed, regardless of how fresh those files were. Fixed by
+   `any_subagent_candidate`: a session is a scan candidate when EITHER its
+   own file's mtime is fresh OR any subagent file's is.
+2. **The content-level aliveness check** (`build_session_summary`) computed
+   "alive" from the parent transcript's own newest event only. Fixed to
+   `max(own newest event, every subagent's own newest event)` — a session
+   with a genuinely-active agent is alive even while its own top-level
+   activity is stale.
+
+Both are covered by regression fixtures:
+`stale_parent_mtime_with_a_fresh_subagent_file_still_scans_the_session`
+(FS-level) and `session_stays_alive_via_an_active_agent_even_when_its_own_activity_is_stale`
+(pure-function level). Re-verified against the real tree after the fix:
+both this task's own coordinator session ("CCCG開發", alive via this very
+subagent) and a second real session ("doc2 api-gateway上線", 9 alive
+agents at the time) appeared correctly.
+
+### The tree (rules from the operator's mid-flight message)
+
+`cccog-bar-core/src/tree.rs`'s `build_tree` combines Claude
+sessions+agents+cross-session edges, presence records, and dispatch
+jobs/owners into a flattened, `depth`-tagged `Vec<TreeRow>` (0 = top-level
+controller/resumable/terminal row, 1 = its child) rather than a nested DTO
+— the shell renders indentation from `depth` instead of hosting a real
+recursive tree control, since the tree is exactly two levels deep by
+construction and a flat list with a depth tag is strictly simpler on both
+sides of the FFI boundary.
+
+- **Dedup** ("a node appears once"): for every session, the single
+  most-recent inbound `<cross-session-message>` edge whose `name` resolves
+  (via `find_controller`: exact title match, else a leading-ASCII-alnum-key
+  heuristic — e.g. `"doc1"` matches a session titled `"Doc1 主管"`) to
+  ANOTHER live session makes that session the controller; the child is
+  removed from the top-level set. A session with no resolvable inbound edge
+  renders top-level.
+- **Active dispatch jobs** (codex/grok) attach as children under whichever
+  live session's title matches the job's `callerLabel`/`hopChain` (same
+  precedence as `control.rs::source_label`, minus the "ambiguous"
+  placeholder — an unattachable job just doesn't render as a child). If the
+  matched session is itself someone's child, the job is forwarded up to
+  that session's own controller, keeping the tree exactly two levels deep.
+- **Terminal dispatch jobs and non-live owner leases** aggregate at the
+  bottom, one row per provider (terminal) or per (provider, live) pair
+  (owners) — never attached anywhere, per rule 4.
+- **Three-word state vocabulary**, same for parent and child: `執行中`
+  (running a turn) / `閒置` (open, idle) / `resumable`|`terminal` (bottom
+  aggregate only). A session's own state resolves via presence when
+  available (see below), else the C-layer transcript-recency fallback
+  (≤60s since last event ⇒ 執行中). An agent's state is always the
+  C-layer recency check (agents have no presence file of their own — a
+  Task-tool subagent runs inside its PARENT session's OS process, so any
+  heartbeat is written under the parent's session id, not a distinct one
+  per agent).
+
+### Presence heartbeats — the A/B layer
+
+New hook `hooks/cccg-presence-hook.js` (same conventions as
+`hooks/cccg-state-hook.js`: <1s, stdin JSON with `session_id`/`cwd`
+per the standard Claude Code hook contract — same fields
+`cc-hub/hooks/miki-emit.ps1` already reads from the identical contract —
+argv[2] carries the event name, never crashes, always exits 0). Writes
+`%LOCALAPPDATA%\CCCG\presence\<session-id>.json`:
+
+```json
+{"sessionId":"<uuid>","cwd":"D:\\code\\CCCG","event":"PostToolUse","ts":1786868945408}
+```
+
+(`ts` = `Date.now()`, matching JS convention — `cccog_bar_core::presence`
+treats it as Unix epoch milliseconds.) Write is atomic (`.tmp-<pid>` then
+`renameSync`) so the bar's reader never has to handle a torn file it can't
+already tolerate anyway (`presence::collect_presence` skips unparseable
+files silently either way). Also prunes any presence file older than 48h on
+every invocation, same bound as `cccg-state-hook.js`'s own dispatch-jobs
+sweep. **Not registered in `settings.json` by this change** — the operator
+said the coordinator does that at landing time, so this repo only ships the
+script.
+
+State resolution (`presence::resolve_presence_state`): a
+`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`SessionStart` heartbeat
+fresher than 60s ⇒ 執行中; `Stop` always means turn-ended (閒置), even if
+it's the freshest possible heartbeat; anything else fresh enough to trust
+⇒ 閒置; older than 10 minutes ⇒ `Unknown`, which makes the tree fall back
+to the C-layer transcript judgment for that session. Verified end to end
+against the real, running app: writing a synthetic fresh `PostToolUse`
+presence file for the real "doc2 api-gateway上線" session (whose own
+transcript had gone quiet minutes earlier) flipped its tree row from
+`閒置 · Nm` to `執行中 · Ns` after a Refresh-button click — the override
+path, not just its unit tests, actually fires.
+
+### FFI wiring (`cccog-bar-ffi`)
+
+`control_snapshot_json`'s output envelope gained a sibling `tree` field
+next to the existing `control` object (the legacy flat `control.rows` stays
+untouched, for the debug CLI and back-compat). `build_flow_tree` resolves
+every root at runtime, never hardcoded: `claude_sessions::default_projects_root()`
+(`USERPROFILE`, falling back to `HOME` for non-Windows test/CI
+exercisability) for the transcript tree, `%LOCALAPPDATA%\CCCG\presence` for
+heartbeats, and the same dispatch root the caller already passes in for
+jobs/owners. A process-wide `OnceLock<ClaudeSessionTailer>` static gives
+the skip-parse shortcut somewhere to live across FFI calls (the ABI itself
+is stateless per call) — same pattern as this file's pre-existing
+`quota_resilience_cache()`.
+
+### C# side (`CCCOG.Bar.App`)
+
+`FlowRowViewModel` → `FlowTreeRowViewModel` (`ViewModels.cs`); the flat
+`NativeControlClient` row parser now reads `tree` instead of `control.rows`
+(`FlyoutWindow.xaml.cs`). `DashboardView.BuildFlowContent` renders each row
+with a dot (smaller/dimmer at depth 1) plus a label `TextBlock` built from
+two `Run`s — the child's own `"(type · model)"` parenthetical is a second
+`Run` colored with `ProviderPalette.Color(row.Provider)` (operator rule:
+"same palette as the dots"), everything else in the line stays the default
+label color; indentation is a left `Margin` on depth-1 rows, not a nested
+tree control. `StatusVisual`'s opacity/pulse table gained the tree's three
+Chinese/English state words (執行中/閒置/resumable/terminal) alongside the
+pre-existing English dispatch-status words, so a Flow row's brightness
+always comes from the one shared table regardless of which of the two Flow
+sources produced it. **Simplification vs. the operator's ASCII mock**: the
+mock shows top-level rows repeating their own provider word ("claude ·
+執行中") in the middle column; this build omits that specific word (the dot
+color already conveys it) and shows state+elapsed only, to avoid needing a
+three-column grid for a distinction the dot already makes — documented here
+as a deliberate, not accidental, deviation.
+
+Also folded into this pass (operator styling feedback, C#-side only, no
+Rust change): quota card window rows now split their composed
+`DisplayLine` text into two pieces via the existing `Ui.Row` two-column
+primitive — the window/percent cluster (`"5h  11%"`, `WindowLabel` +
+`UsedText`, bold, left-aligned, unchanged weight/position) and the reset
+date/time (`ResetText`, right-aligned, `Ui.Dim` — non-bold, smaller,
+dim-secondary, the same treatment TokenBar uses for its own timestamp
+text). Both fields already existed on `QuotaCardViewModel`; `DisplayLine`
+itself is no longer read by `QuotaRow` but stays on the view model for any
+other caller depending on it.
+
+### A build/verification trap discovered along the way (not a code bug)
+
+`CCCOG.Bar.App.csproj`'s `CopyCccogBarFfi` target copies the freshly-built
+native DLL into `$(TargetDir)` (the base `bin/x64/Release/net10.0-...\`
+folder) after `dotnet build`, but NOT into the RID-specific
+`...\win-x64\` subfolder that also contains a full, independently-runnable
+copy of the exe + both DLLs. A `dotnet build` therefore updates the base
+folder's native+managed DLLs but silently leaves `win-x64\`'s copies exactly
+as stale as they were before — launching the `win-x64\` exe after a rebuild
+runs OLD code with no error or warning of any kind. Hit this firsthand
+during this task's own live-run verification (saw pre-`normalize_reset_display`-era
+quota text render from a build that had shipped that feature hours
+earlier). Not fixed here (out of scope for this task); the live-run
+verification below used the base `bin\x64\Release\net10.0-windows...\CCCOG.Bar.App.exe`,
+confirmed via DLL mtimes to be the actual just-built artifact.
+
+### Verification
+
+`cargo test --workspace`: 116 tests green — 37 net new this pass (19 in
+the new `claude_sessions` module, 9 in `presence`, 9 in `tree`) plus every
+pre-existing suite unchanged (`control`'s own 9, plus `graph`/`parsers`/
+`refresh`/`usage`/`ffi`/`quota`). `dotnet build -c Release -p:Platform=x64`:
+0 warnings, 0 errors.
+
+Live run (base output folder, DLL mtimes confirmed fresh; the coordinator's
+previously-launched instance, pid 41268, was killed first as instructed):
+UI Automation read-back of the real, running flyout —
+
+```
+Flow
+CCCG開發                      執行中 · 3s
+  Add Claude session li…  (agent · sonnet-5)     執行中 · 3s
+doc2 api-gateway上線          執行中 · 7s   [after a presence-heartbeat test]
+  Translate solutions p…  (agent · sonnet-5)     閒置 · 8m
+  Translate solutions p…  (agent · sonnet-5)     閒置 · 9m
+  Translate solutions p…  (agent · sonnet-5)     閒置 · 9m
+  Translate solutions p…  (agent · sonnet-5)     閒置 · 9m
+codex ×58                     terminal
+grok ×34                      terminal
+
+Claude   5h  16%   08/16 19:20
+         7d  4%    08/23 14:00
+Codex    Limit  100%   08/20 19:50
+         limit · 08/20 19:50
+Grok     no credit data
+```
+
+— both actually-alive Claude sessions on this machine appeared (including
+the one running this very task, via its own live agent — the operator's
+literal complaint, now fixed), each with correct elapsed/model/agent-count;
+the bottom terminal aggregate rows render; quota cards kept the new
+split-line date styling; the footer/Quit button worked (UI Automation
+`InvokePattern.Invoke()` — process exited fully, verified via `tasklist`).
+`bar-crash.log` did not exist before, during, or after this entire
+verification pass (checked at every stage, not just "no growth") — zero
+exceptions anywhere in the new code paths under real conditions.

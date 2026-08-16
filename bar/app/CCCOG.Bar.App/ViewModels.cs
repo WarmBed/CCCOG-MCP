@@ -26,7 +26,11 @@ internal static class ProviderPalette
 
 /// <summary>Status maps to dot brightness (and pulse for active work) —
 /// never to hue. Keeping this table in one place is what stops a future
-/// edit from quietly overriding a provider's color for "failed" etc.</summary>
+/// edit from quietly overriding a provider's color for "failed" etc. The
+/// tree's own three-word vocabulary (執行中/閒置/resumable, plus the
+/// "terminal" bottom-aggregate bucket — see <c>cccog_bar_core::tree</c>)
+/// lives in the same table so a Flow row's brightness always comes from one
+/// place regardless of which of the two Flow data sources it came from.</summary>
 internal static class StatusVisual
 {
     public static double Opacity(string status) => status.ToLowerInvariant() switch
@@ -36,33 +40,43 @@ internal static class StatusVisual
         "succeeded" or "live" or "owned" => 0.85,
         "failed" => 0.4,
         "stale" => 0.32,
+        "執行中" => 1.0,
+        "閒置" => 0.75,
+        "resumable" => 0.4,
+        "terminal" => 0.32,
         _ => 0.55,
     };
 
     public static bool Pulses(string status) =>
         status.Equals("running", StringComparison.OrdinalIgnoreCase) ||
-        status.Equals("working", StringComparison.OrdinalIgnoreCase);
+        status.Equals("working", StringComparison.OrdinalIgnoreCase) ||
+        status == "執行中";
 }
 
-/// <summary>A single flyout row, built from one windowed/aggregated row of
-/// <c>cccog_bar_control_snapshot</c>'s payload — see
-/// <see cref="NativeControlClient"/> in FlyoutWindow.xaml.cs. Never bound
-/// directly to the wire JSON so the view stays decoupled from its shape.</summary>
-public sealed class FlowRowViewModel
+/// <summary>One row of the Flow tree (<c>cccog_bar_core::tree::TreeRow</c>,
+/// via <c>cccog_bar_control_snapshot</c>'s new <c>tree</c> field — see
+/// <see cref="NativeControlClient"/> in FlyoutWindow.xaml.cs). The tree is
+/// exactly two levels deep and is sent already flattened with a
+/// <see cref="Depth"/> tag rather than a nested DTO — the shell renders
+/// indentation from <see cref="Depth"/> instead of hosting a real recursive
+/// tree control (see bar/SYNC.md for why).</summary>
+public sealed class FlowTreeRowViewModel
 {
-    public required string ChainText { get; init; }
-    public string CountText { get; init; } = "";
+    public required int Depth { get; init; }
+    public required string Kind { get; init; }
+    public required string Label { get; init; }
+    /// <summary>"agent · sonnet-5" etc — present on child rows (Depth 1),
+    /// null on top-level rows.</summary>
+    public string? TypeModelText { get; init; }
+    /// <summary>Drives both the dot color and — for a child row only — the
+    /// <see cref="TypeModelText"/> run's own color (operator rule: "same
+    /// palette as the dots").</summary>
+    public required string Provider { get; init; }
+    public required string StateLabel { get; init; }
+    public bool Pulse { get; init; }
     public required string ElapsedText { get; init; }
-    /// <summary>The locked "elapsed | ×N" format, collapsing to just the
-    /// elapsed text when there is nothing to aggregate.</summary>
-    public string MetaText => string.IsNullOrEmpty(CountText) ? ElapsedText : $"{ElapsedText} | {CountText}";
-    public required string TaskSummary { get; init; }
     public required Microsoft.UI.Xaml.Media.Brush DotBrush { get; init; }
     public double DotOpacity { get; init; } = 1.0;
-    public bool Pulse { get; init; }
-    public Microsoft.UI.Xaml.Media.Brush LabelBrush { get; init; } =
-        new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 0xF8, 0xFA, 0xFC));
-    public bool IsStaleGroup { get; init; }
 }
 
 public sealed class QuotaCardViewModel
