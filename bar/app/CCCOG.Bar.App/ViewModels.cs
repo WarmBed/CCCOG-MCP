@@ -75,11 +75,28 @@ public sealed class QuotaCardViewModel
     /// repeat the provider name on every row.</summary>
     public required string WindowLabel { get; init; }
     public double UsedPercent { get; init; }
-    public string UsedText => $"{UsedPercent:0.#}% used";
+    /// <summary>No "used" suffix (operator direction, bar/SYNC.md).</summary>
+    public string UsedText => $"{UsedPercent:0.#}%";
     public string ResetText { get; init; } = "Reset time unavailable";
+    /// <summary>The single composed row text — "&lt;abbreviated
+    /// window&gt;  &lt;NN%&gt;  &lt;date&gt;" (e.g. "5h  7%  08/20 11:50") —
+    /// assembled once in Rust (cccog_bar_quota::format_window_line) so this
+    /// view stays display-only; see bar/SYNC.md. Falls back to composing
+    /// the same shape locally only if an older FFI build omitted the field
+    /// (defense against a stale DLL, not the normal path).</summary>
+    public string DisplayLine { get; init; } = "";
     /// <summary>Concrete failure reason (e.g. "HTTP 401", "token refresh
-    /// rejected") — never a vague "unavailable" (locked UX requirement).</summary>
+    /// rejected") — never a vague "unavailable" (locked UX requirement).
+    /// Condensed to one short line (operator direction, bar/SYNC.md): the
+    /// fuller sentence this was trimmed from lives in
+    /// <see cref="DiagnosticDetail"/> instead of being dropped.</summary>
     public string StateText { get; init; } = "fresh";
+    /// <summary>The un-condensed diagnostic (dispatch-failure time, verbatim
+    /// provider text) — shown as a hover tooltip on the card's status line
+    /// so nothing <see cref="StateText"/> trimmed off is actually lost.
+    /// `null` when there was nothing extra to trim (StateText already told
+    /// the whole story).</summary>
+    public string? DiagnosticDetail { get; init; }
     public bool IsFailure { get; init; }
     /// <summary>True only for the synthesized single-entry card a provider
     /// gets when it has no windows at all (auth failure before any quota

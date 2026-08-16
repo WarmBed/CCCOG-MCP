@@ -7,15 +7,22 @@
          (namespace only): same Grid Padding/RowSpacing, same header Grid
          shape (title left, refresh button+spinner right in a 26x26 overlay
          Grid), same ScrollViewer/ContentPresenter section pattern, same
-         footer row. See bar/SYNC.md for what was dropped and why (year
-         filter, client tabs, today/total/rate stat row, 3D graph host,
-         gear/Quit buttons — none of those exist in CCCOG's two-section
-         shell) and Ui.cs for the ported card/row primitives this view's
-         code-behind builds with. -->
+         footer row (status text left, Quit hugging the right edge — the
+         gear was dropped, see bar/SYNC.md). See bar/SYNC.md for what else
+         was dropped and why (year filter, client tabs, today/total/rate
+         stat row, 3D graph host — none of those exist in CCCOG's
+         Flow-then-Quota shell) and Ui.cs for the ported card/row
+         primitives this view's code-behind builds with.
+
+         Row order (operator layout pass): Flow on top (scrollable — it's
+         the section with unbounded row count), Quota at the bottom as
+         three fixed-order side-by-side cards (Claude / Codex / Grok),
+         footer under the quota row. -->
     <Grid Padding="16,14,16,10" RowSpacing="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
@@ -49,33 +56,57 @@
             <TextBlock x:Name="RefreshedText" Opacity="0.65" FontSize="11" Text="refreshing…" />
         </StackPanel>
 
-        <!-- Section content: TokenBar's ScrollViewer + ContentPresenter
-             pattern, reused twice for CCCOG's two always-present sections
-             (Quota, Flow) instead of TokenBar's single lens-swapped
-             ContentHost. Each host's content is a TokenBar Ui.Card() border,
-             rebuilt independently on its own refresh cadence (Flow is
-             synchronous/file-only; Quota arrives async). -->
+        <!-- Flow section (top): TokenBar's ScrollViewer + ContentPresenter
+             pattern. x:Name="CardsScroll" matches TokenBar's own naming —
+             the WH_MOUSE_LL wheel-focus workaround (FlyoutWindow.xaml.cs)
+             routes into this ScrollViewer via RouteGlobalWheel/ScrollBy. -->
         <ScrollViewer
+            x:Name="CardsScroll"
             Grid.Row="1"
             VerticalScrollBarVisibility="Auto"
             VerticalScrollMode="Enabled"
             IsVerticalScrollChainingEnabled="False">
-            <StackPanel Spacing="10">
-                <ContentPresenter x:Name="QuotaHost" />
-                <ContentPresenter x:Name="FlowHost" />
-            </StackPanel>
+            <ContentPresenter x:Name="FlowHost" />
         </ScrollViewer>
 
+        <!-- Quota section (bottom): three equal-width, fixed-order cards —
+             left/center/right = Claude/Codex/Grok — instead of one grouped
+             card. Each host renders independently so a still-loading
+             provider never blanks the whole row (lessons-learned #1). -->
+        <Grid Grid.Row="2" ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <ContentPresenter x:Name="ClaudeQuotaHost" Grid.Column="0" />
+            <ContentPresenter x:Name="CodexQuotaHost" Grid.Column="1" />
+            <ContentPresenter x:Name="GrokQuotaHost" Grid.Column="2" />
+        </Grid>
+
         <!-- Footer: TokenBar's footer pattern (status text, left-aligned,
-             opacity 0.5, FontSize 10). No gear/Quit buttons — CCCOG has no
-             settings window or in-flyout quit action. -->
-        <Grid Grid.Row="2">
+             opacity 0.5, FontSize 10) plus a Quit button hugging the right
+             edge (TokenBar's Padding/FontSize/Background/BorderThickness,
+             verbatim). No gear — CCCOG has no settings window. -->
+        <Grid Grid.Row="3">
             <TextBlock
                 x:Name="FooterText"
                 VerticalAlignment="Center"
                 Opacity="0.5"
                 FontSize="10"
                 Text="" />
+            <StackPanel
+                Orientation="Horizontal"
+                Spacing="2"
+                HorizontalAlignment="Right">
+                <Button
+                    x:Name="QuitButton"
+                    Padding="7,2,7,3"
+                    FontSize="11"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Content="Quit" />
+            </StackPanel>
         </Grid>
     </Grid>
 </UserControl>

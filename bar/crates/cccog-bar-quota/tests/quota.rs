@@ -3,6 +3,7 @@ use cccog_bar_quota::{
     load_grok_token, parse_codex_rate_limits, HttpClient, HttpRequest, HttpResponse,
     OAuthCredential, PollGate, QuotaState,
 };
+use chrono::{Local, TimeZone, Utc};
 
 #[derive(Default)]
 struct FakeHttp {
@@ -155,8 +156,12 @@ fn claude_transport_failure_and_malformed_body_after_success_are_stale() {
 
     let mut empty_windows = FakeHttp::with(vec![HttpResponse::json(200, "{}")]);
     let empty = fetch_claude_quota(&mut empty_windows, &credential, 1_000).expect("stale cards");
+    // Condensed on-card line (operator direction, bar/SYNC.md: "status ·
+    // optional-time" grammar, never a sentence); the full sentence survives
+    // in diagnostic_detail for a hover tooltip.
+    assert_eq!(empty.diagnostic.as_deref(), Some("no quota data"));
     assert_eq!(
-        empty.diagnostic.as_deref(),
+        empty.diagnostic_detail.as_deref(),
         Some("quota response contained no windows")
     );
 }
@@ -189,8 +194,11 @@ fn grok_transport_failure_and_http_status_report_exact_diagnostics() {
 
     let mut no_credits = FakeHttp::with(vec![HttpResponse::json(200, "{}")]);
     let no_credits_cards = fetch_grok_quota(&mut no_credits, Some("token")).expect("stale cards");
+    // Condensed on-card line (operator direction, bar/SYNC.md); the full
+    // sentence survives in diagnostic_detail for a hover tooltip.
+    assert_eq!(no_credits_cards.diagnostic.as_deref(), Some("no credit data"));
     assert_eq!(
-        no_credits_cards.diagnostic.as_deref(),
+        no_credits_cards.diagnostic_detail.as_deref(),
         Some("quota response contained no credit usage")
     );
 }
@@ -275,7 +283,16 @@ fn codex_rollout_tail_reads_real_event_msg_rate_limits_and_numeric_reset() {
     let cards = load_codex_quota_from_sessions(root.path()).expect("rate limits");
     assert_eq!(cards.client_id, "codex");
     assert_eq!(cards.windows[0].used_percent, 37.0);
-    assert_eq!(cards.windows[0].resets_at.as_deref(), Some("1787197821"));
+    // window_minutes:10080 == 7 days -> the abbreviated "7d" label (see
+    // cccog_bar_quota::resolve_window_label / bar/SYNC.md), never the
+    // spelled-out id text.
+    assert_eq!(cards.windows[0].label, "7d");
+    // resets_at now carries the unified bare "MM/DD HH:MM" local-time
+    // display, not the raw epoch (see cccog_bar_quota::normalize_reset_display
+    // / bar/SYNC.md).
+    let want = Utc.timestamp_opt(1787197821, 0).unwrap();
+    let want_reset = want.with_timezone(&Local).format("%m/%d %H:%M").to_string();
+    assert_eq!(cards.windows[0].resets_at.as_deref(), Some(want_reset.as_str()));
 }
 
 #[test]

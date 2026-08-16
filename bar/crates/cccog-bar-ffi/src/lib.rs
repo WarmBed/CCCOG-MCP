@@ -10,9 +10,9 @@ use cccog_bar_core::graph::GraphSnapshot;
 use cccog_bar_core::owners::is_archived_path;
 use cccog_bar_quota::{
     extract_human_reset_date, extract_reset_date, fetch_claude_quota, fetch_grok_quota,
-    load_claude_credential, load_codex_quota_from_sessions, load_grok_token,
-    looks_like_quota_limit_error, looks_like_quota_limit_output, HttpClient, HttpRequest,
-    HttpResponse, PollGate, QuotaCards, QuotaState, QuotaWindow,
+    format_window_line, load_claude_credential, load_codex_quota_from_sessions, load_grok_token,
+    looks_like_quota_limit_error, looks_like_quota_limit_output, normalize_reset_display,
+    HttpClient, HttpRequest, HttpResponse, PollGate, QuotaCards, QuotaState, QuotaWindow,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -86,10 +86,7 @@ pub fn envelope_from_parts(
         Ok(value) => value,
         Err(error) => return error_json(format!("snapshot serialization failed: {error}")),
     };
-    let quota_cards = match serde_json::to_value(quota_cards) {
-        Ok(value) => value,
-        Err(error) => return error_json(format!("quota serialization failed: {error}")),
-    };
+    let quota_cards = quota_cards_wire_json(quota_cards);
     let diagnostics = match serde_json::to_value(diagnostics) {
         Ok(value) => value,
         Err(error) => return error_json(format!("diagnostic serialization failed: {error}")),
@@ -100,6 +97,48 @@ pub fn envelope_from_parts(
         "diagnostics": diagnostics,
     });
     envelope_from_json(&input.to_string())
+}
+
+/// Serializes `QuotaCards` to the wire `Value` shape and stamps a
+/// `displayLine` onto every window object — the single composed row
+/// (`cccog_bar_quota::format_window_line`) the flyout shows per window, so
+/// the C# side never re-assembles the label/percent/date text itself. Every
+/// call site that emits `quotaCards` (this combined-envelope path and
+/// `poll_remote_quotas_json`'s quota-only path) routes through here so both
+/// carry the identical wire shape.
+fn quota_cards_wire_json(cards: &[QuotaCards]) -> Value {
+    let mut value = match serde_json::to_value(cards) {
+        Ok(value) => value,
+        Err(_) => return Value::Array(Vec::new()),
+    };
+    let Value::Array(card_array) = &mut value else {
+        return value;
+    };
+    for card in card_array {
+        let Some(windows) = card.get_mut("windows").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for window in windows {
+            let label = window
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let used_percent = window
+                .get("usedPercent")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let resets_at = window
+                .get("resetsAt")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let line = format_window_line(&label, used_percent, resets_at.as_deref());
+            if let Value::Object(fields) = window {
+                fields.insert("displayLine".to_owned(), Value::String(line));
+            }
+        }
+    }
+    value
 }
 
 fn error_json(message: String) -> String {
@@ -266,6 +305,7 @@ fn diagnostic_card(client_id: &str, state: QuotaState, diagnostic: String) -> Qu
         state,
         observed_at: None,
         diagnostic: Some(diagnostic),
+        diagnostic_detail: None,
         retry_after_seconds: None,
     }
 }
@@ -449,13 +489,25 @@ fn walk_jobs_for_quota_failure(
 
 /// Overrides a card to an honest "we saw this happen" state: a single 100%
 /// window — the red-bar color communicates blocked-ness as a status color,
-/// never a synthesized percentage — and a diagnostic naming the dispatch
-/// failure's own timestamp plus the reset date literally found in its
-/// message, or the word "unknown" when none was found (never invented).
+/// never a synthesized percentage — and a condensed one-line diagnostic
+/// (operator direction, bar/SYNC.md: "at most ONE short status line" —
+/// `"limit · 08/20 11:50"`, status word plus the unified bare reset date,
+/// nothing else). The reset text goes through `normalize_reset_display`
+/// (the single reset-time-format normalizer) so it matches the bare
+/// `MM/DD HH:MM` format the regular per-window `resetsAt` field renders.
+/// The fuller story this was condensed from — the dispatch failure's own
+/// timestamp and the verbatim provider reset text — is never discarded:
+/// it goes in `diagnostic_detail` for a hover tooltip instead.
 fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> QuotaCards {
     let time_text = failure.at.format("%H:%M").to_string();
-    let reset_text = failure.reset_hint.as_deref().unwrap_or("unknown");
-    let diagnostic = format!("limit reached (dispatch failure {time_text}) · resets {reset_text}");
+    let reset_display = failure
+        .reset_hint
+        .as_deref()
+        .map(normalize_reset_display)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let diagnostic = format!("limit · {reset_display}");
+    let diagnostic_detail =
+        format!("limit reached (dispatch failure {time_text}) · {reset_display}");
     QuotaCards {
         client_id: card.client_id,
         windows: vec![QuotaWindow {
@@ -463,11 +515,12 @@ fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> 
             label: "Limit".to_owned(),
             used_percent: 100.0,
             remaining_percent: 0.0,
-            resets_at: failure.reset_hint.clone(),
+            resets_at: failure.reset_hint.as_deref().map(normalize_reset_display),
         }],
         state: QuotaState::Stale,
         observed_at: card.observed_at,
         diagnostic: Some(diagnostic),
+        diagnostic_detail: Some(diagnostic_detail),
         retry_after_seconds: None,
     }
 }
@@ -663,7 +716,10 @@ fn is_http_429(card: &QuotaCards) -> bool {
 /// stale with the failure reason and the cached fetch's own time — or, when
 /// there has never been a successful fetch for this provider, the bare
 /// failure (nothing to fall back to). Public so tests can exercise both
-/// branches directly.
+/// branches directly. The on-card diagnostic is condensed to "status ·
+/// cause-code · time" (operator direction, bar/SYNC.md — no "data from"
+/// prose); the full sentence survives in `diagnostic_detail` for a hover
+/// tooltip.
 pub fn render_with_cache_fallback(
     client_id: &str,
     reason: &str,
@@ -680,7 +736,8 @@ pub fn render_with_cache_fallback(
                 windows: cached.card.windows.clone(),
                 state: QuotaState::Stale,
                 observed_at: cached.card.observed_at,
-                diagnostic: Some(format!("stale · {reason} · data from {time_text}")),
+                diagnostic: Some(format!("stale · {reason} · {time_text}")),
+                diagnostic_detail: Some(format!("stale · {reason} · data from {time_text}")),
                 retry_after_seconds: None,
             }
         }
@@ -690,6 +747,7 @@ pub fn render_with_cache_fallback(
             state: QuotaState::Unavailable,
             observed_at: None,
             diagnostic: Some(reason.to_owned()),
+            diagnostic_detail: None,
             retry_after_seconds: None,
         },
     }
@@ -936,7 +994,7 @@ pub fn poll_remote_quotas_json(input: &str) -> String {
     serde_json::to_string(&json!({
         "schemaVersion": CCCOG_BAR_SCHEMA_VERSION,
         "ok": true,
-        "quotaCards": cards,
+        "quotaCards": quota_cards_wire_json(&cards),
         "diagnostics": [],
     }))
     .unwrap_or_else(|error| error_json(format!("quota serialization failed: {error}")))

@@ -6,8 +6,17 @@ use cccog_bar_ffi::{
     MANUAL_REFRESH_MIN_INTERVAL_SECS,
 };
 use cccog_bar_quota::{QuotaCards, QuotaState, QuotaWindow};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json::Value;
 use std::ffi::{CStr, CString};
+
+/// Same string `normalize_reset_display` (cccog-bar-quota) would produce for
+/// a UTC instant — deterministic on any machine since both sides run the
+/// same `Local` conversion, never a hardcoded offset. Bare `MM/DD HH:MM`,
+/// no leading word (operator direction: bar/SYNC.md).
+fn expected_reset_display(utc: DateTime<Utc>) -> String {
+    utc.with_timezone(&Local).format("%m/%d %H:%M").to_string()
+}
 
 #[test]
 fn snapshot_envelope_is_versioned_and_contains_all_sections() {
@@ -94,6 +103,7 @@ fn synthetic_quota_cards() -> Vec<QuotaCards> {
             state: QuotaState::Unavailable,
             observed_at: None,
             diagnostic: Some("Codex rollout rate_limits not found in bounded tails".to_owned()),
+            diagnostic_detail: None,
             retry_after_seconds: None,
         },
         QuotaCards {
@@ -102,6 +112,7 @@ fn synthetic_quota_cards() -> Vec<QuotaCards> {
             state: QuotaState::Stale,
             observed_at: None,
             diagnostic: Some("HTTP 401".to_owned()),
+            diagnostic_detail: None,
             retry_after_seconds: None,
         },
         QuotaCards {
@@ -110,6 +121,7 @@ fn synthetic_quota_cards() -> Vec<QuotaCards> {
             state: QuotaState::Unavailable,
             observed_at: None,
             diagnostic: Some("Grok auth credential not found".to_owned()),
+            diagnostic_detail: None,
             retry_after_seconds: None,
         },
     ]
@@ -142,6 +154,33 @@ fn combined_flow_and_quota_envelope_is_versioned_and_preserves_client_order() {
 }
 
 #[test]
+fn quota_windows_carry_a_composed_display_line() {
+    let snapshot = synthetic_snapshot();
+    let cards = vec![QuotaCards {
+        client_id: "codex".to_owned(),
+        windows: vec![QuotaWindow {
+            card_id: "primary".to_owned(),
+            label: "5h".to_owned(),
+            used_percent: 7.0,
+            remaining_percent: 93.0,
+            resets_at: Some("08/20 11:50".to_owned()),
+        }],
+        state: QuotaState::Fresh,
+        observed_at: None,
+        diagnostic: None,
+        diagnostic_detail: None,
+        retry_after_seconds: None,
+    }];
+    let output = envelope_from_parts(&snapshot, &cards, &[]);
+    let value: Value = serde_json::from_str(&output).expect("envelope JSON");
+    assert_eq!(
+        value["quotaCards"][0]["windows"][0]["displayLine"],
+        "5h  7%  08/20 11:50",
+        "displayLine composes label/percent/date in the operator's locked order (bar/SYNC.md), not just passing usedPercent/resetsAt through separately"
+    );
+}
+
+#[test]
 fn combined_envelope_serialization_is_byte_for_byte_deterministic() {
     let snapshot = synthetic_snapshot();
     let cards = synthetic_quota_cards();
@@ -167,6 +206,7 @@ fn codex_card(observed_at_ms: Option<u64>) -> QuotaCards {
         state: QuotaState::Fresh,
         observed_at: observed_at_ms,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     }
 }
@@ -242,9 +282,17 @@ fn job_failure_override_beats_the_stale_annotation_and_carries_the_failure_time(
     assert_eq!(card.windows.len(), 1);
     assert_eq!(card.windows[0].used_percent, 100.0, "red 100% bar");
     assert_eq!(card.windows[0].remaining_percent, 0.0);
+    // Condensed on-card line (operator direction, bar/SYNC.md: "at most ONE
+    // short status line"): status word + the unified bare date only — the
+    // dispatch-failure time and "reached" prose move to diagnostic_detail.
+    let want_reset = expected_reset_display(Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap());
     assert_eq!(
         card.diagnostic.as_deref(),
-        Some("limit reached (dispatch failure 09:30) · resets 2026-08-20T00:00:00Z")
+        Some(format!("limit · {want_reset}").as_str())
+    );
+    assert_eq!(
+        card.diagnostic_detail.as_deref(),
+        Some(format!("limit reached (dispatch failure 09:30) · {want_reset}").as_str())
     );
 }
 
@@ -270,9 +318,14 @@ fn job_failure_override_scans_stdout_tail_when_status_error_is_generic() {
     let cards = enrich_quota_cards(vec![codex_card(None)], Some(root.path()), NOW_SECONDS);
     let card = &cards[0];
     assert_eq!(card.windows[0].used_percent, 100.0, "red 100% bar");
+    let want_reset = expected_reset_display(Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
     assert_eq!(
         card.diagnostic.as_deref(),
-        Some("limit reached (dispatch failure 09:13) · resets Aug 20th, 2026 11:50 AM")
+        Some(format!("limit · {want_reset}").as_str())
+    );
+    assert_eq!(
+        card.diagnostic_detail.as_deref(),
+        Some(format!("limit reached (dispatch failure 09:13) · {want_reset}").as_str())
     );
 }
 
@@ -298,11 +351,20 @@ fn job_failure_override_applies_to_grok_and_is_skipped_without_a_match() {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     };
     let overridden = enrich_quota_cards(vec![grok_card.clone()], Some(root.path()), NOW_SECONDS);
     assert_eq!(overridden[0].windows[0].used_percent, 100.0);
-    assert!(overridden[0].diagnostic.as_deref().unwrap().contains("10:00"));
+    // No date-shaped text in "HTTP 402 Payment Required" -> honest "unknown",
+    // never a guess; the condensed diagnostic never carries the
+    // dispatch-failure time (moved to diagnostic_detail instead).
+    assert_eq!(overridden[0].diagnostic.as_deref(), Some("limit · unknown"));
+    assert!(overridden[0]
+        .diagnostic_detail
+        .as_deref()
+        .unwrap()
+        .contains("10:00"));
 
     // An unrelated failure (no quota-limit phrasing) must never trigger the
     // override — a real process crash is not a quota signal.
@@ -344,6 +406,7 @@ fn job_failure_override_is_scoped_to_codex_and_grok_only() {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     };
     let result = enrich_quota_cards(vec![claude_card], Some(root.path()), NOW_SECONDS);
@@ -426,6 +489,7 @@ fn fresh_claude_card() -> QuotaCards {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     }
 }
@@ -437,6 +501,7 @@ fn failed_429_card(retry_after_seconds: Option<u64>) -> QuotaCards {
         state: QuotaState::Stale,
         observed_at: None,
         diagnostic: Some("HTTP 429".to_owned()),
+        diagnostic_detail: None,
         retry_after_seconds,
     }
 }
@@ -450,8 +515,12 @@ fn cached_fallback_render_keeps_bars_and_labels_stale_with_the_cached_time() {
     assert_eq!(rendered.state, QuotaState::Stale);
     assert_eq!(rendered.windows.len(), 1, "bars must survive the failure");
     assert_eq!(rendered.windows[0].used_percent, 6.0, "the cached value, unchanged");
+    // Condensed on-card line (operator direction, bar/SYNC.md: "at most ONE
+    // short status line" — no "data from" prose); the full sentence
+    // survives in diagnostic_detail for a hover tooltip.
+    assert_eq!(rendered.diagnostic.as_deref(), Some("stale · HTTP 429 · 12:00"));
     assert_eq!(
-        rendered.diagnostic.as_deref(),
+        rendered.diagnostic_detail.as_deref(),
         Some("stale · HTTP 429 · data from 12:00")
     );
 }

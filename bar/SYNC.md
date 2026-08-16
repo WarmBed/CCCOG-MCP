@@ -170,3 +170,148 @@ seven day   100% used  stale · HTTP 429 · data from 20:26
 with the exact bars/percentages from the previous successful fetch — loaded
 from `bar-quota-cache.json` on a brand-new process, confirming the disk
 persistence path, not just the in-memory one.
+
+## 2026-08-16 interaction-layer parity: tray menu, footer Quit, resize drag, wheel hook
+
+The 2026-08-16 corrective rebuild above (verbatim shell port) named two gaps
+it deliberately did not close: resize-grip drag-to-resize (no settings
+store to persist the height into) and the `WH_MOUSE_LL` wheel-focus
+workaround. This pass closes those two, plus two features CCCOG never had
+at all — a tray right-click menu and an in-flyout Quit path — bringing
+interaction-layer coverage to parity with TokenBar-Windows (same upstream
+commit, `a829d51deb0f37bcff211c83de5e9d2f99f7663f`), ported line-by-line
+where CCCOG has the same dependencies and adapted (with the deviation
+recorded) where it doesn't.
+
+| Upstream file | Used for | What landed in CCCOG Bar v2 |
+| --- | --- | --- |
+| `src/TokenBar.App/TrayService.cs` (`RebuildMenu`, the `ContextMenuMode.PopupMenu` pattern and its Command-vs-Click/ToggleMenuFlyoutItem caveats, `QuitApp`) | The native right-click context menu and the single shutdown path | `bar/app/CCCOG.Bar.App/App.xaml.cs`: `RebuildMenu()` (Open CCCOG Bar / Refresh now / Quit — three `MenuFlyoutItem`s, all `Command`-wired per the PopupMenu caveat) and `Quit()`/`QuitApp` (disposes the tray icon, calls `FlyoutWindow.Shutdown()`, then `Application.Current.Exit()`, guarded against a double-invoke). **Named deviation**: TokenBar's menu also has "Menu bar shows" (7-mode tray-icon radio group) and "Quota source" submenus, plus a "Settings" item — none ported. CCCOG's tray icon has no live-number display mode to pick a source for, and has no settings window to open (see the original derivation table above for the same "no settings window" gap). |
+| `src/TokenBar.App/DashboardView.xaml` / `.xaml.cs` (the footer `Grid`: `FooterText` left, `SettingsButton`+`QuitButton` right, `Padding="7,2,7,3"`/`FontSize="11"`/transparent background/no border on `QuitButton`; `QuitButton.Click += (_, _) => TrayService.QuitApp?.Invoke();`) | The footer row layout and the Quit button's exact styling/wiring | `bar/app/CCCOG.Bar.App/DashboardView.xaml`: added the same `StackPanel`/`QuitButton` to the existing footer `Grid`, verbatim Padding/FontSize/Background/BorderThickness. `DashboardView.xaml.cs`: `QuitButton.Click += (_, _) => App.QuitApp?.Invoke();`. **Named deviation**: no `SettingsButton`/gear — same "no settings window" gap. |
+| `src/TokenBar.App/FlyoutWindow.xaml.cs` (`WireResizeGrip`'s `PointerPressed`/`PointerMoved`/`PointerReleased`/`PointerCaptureLost` drag handlers, `EndResize`'s `AppSettings.Store.SetDouble("tokenbar.popover.height", ...)`, `PositionNearTray`'s `AppSettings.Store.GetDouble` read/clamp) | Top-edge drag-to-resize with height persistence | `bar/app/CCCOG.Bar.App/FlyoutWindow.xaml.cs`: `WireResizeGrip()` (replacing the old hover-only `WireResizeGripHover()`), `EndResize()`, and `PositionNearTray()`'s height-read — logic ported verbatim, `AppSettings.Store` swapped for the new `LocalSettings` (see below), key `"cccog.popover.height"`. |
+| `src/TokenBar.App/FlyoutWindow.xaml.cs` (`InstallWheelHook`/`RemoveWheelHook`, the `WH_MOUSE_LL` hook proc, `MSLLHOOKSTRUCT`/`PointL`, the `SetWindowsHookExW`/`UnhookWindowsHookEx`/`CallNextHookEx`/`GetModuleHandleW` P/Invokes; called from `ShowFlyout`/`HideFlyout`) | The focusless-popup wheel-scroll workaround | `bar/app/CCCOG.Bar.App/FlyoutWindow.xaml.cs`: same hook lifecycle (install on `ShowFlyout`, remove on `HideFlyout`, plus a `Closed`-handler safety net so Quit while visible can't leak the hook), same struct/P-Invoke shapes, ported verbatim. |
+| `src/TokenBar.App/DashboardView.xaml.cs` (`RouteGlobalWheel`, `ScrollBy`) | Routing the hook's wheel event into the scrollable section | `bar/app/CCCOG.Bar.App/DashboardView.xaml.cs`: `RouteGlobalWheel`/`ScrollBy` on the renamed `CardsScroll` (now the Flow section's `ScrollViewer` — see the layout-reorder entry below). **Named deviation**: TokenBar's version first tries `TryZoomGraphAt` (3D contribution-graph hit-test) before falling back to `ScrollBy`; CCCOG has no 3D graph, so it goes straight to `ScrollBy`. |
+| `src/TokenBar.Core/SettingsStore.cs` (the atomic-write/quarantine-on-corruption/refuse-to-clobber-on-load-failure JSON store pattern) | A settings store for the resize-grip height, which CCCOG never had | `bar/app/CCCOG.Bar.App/LocalSettings.cs` (new file) — a trimmed port: same atomic-write (temp file + rename), corruption-quarantine, and load-failure-refuses-to-save behavior, at `%LOCALAPPDATA%\CCCG\bar-settings.json`. **Named deviation**: TokenBar's `SettingsStore` is a typed String/Bool/Int/Double store with a `Changed` event (other windows/panels react live to a setting written elsewhere); `LocalSettings` is a static string-only Get/Set with no `Changed` event — CCCOG has exactly one writer (the grip) and one reader (`PositionNearTray` at next show), so there is nothing else to notify. |
+
+Verified end to end against the real, running app (built `dotnet build -c
+Release -r win-x64`, launched, driven via real Win32 mouse/keyboard input
+injection plus UI Automation since this environment's screen-capture API
+returns a stale/cached frame for composited WinUI content — `PrintWindow`
+with `PW_RENDERFULLCONTENT` also renders this Acrylic window's client area
+black for the same reason, so verification here reads the live control
+tree and drives real cursor/click/wheel input instead of relying on
+pixels, except for the native `#32768` tray menu, which is plain GDI and
+does capture correctly via `PrintWindow`):
+
+- Tray right-click: real right-click on the tray icon (via the taskbar's
+  overflow flyout, `顯示隱藏的圖示`) opened a genuine native popup menu
+  (`FindWindow("#32768", ...)` resolved to a real hwnd); `PrintWindow`
+  captured it showing exactly "Open CCCOG Bar" / separator / "Refresh now"
+  / separator / "Quit".
+- Resize grip: a real mouse-down on the grip (DPI-aware physical
+  coordinates via `SetThreadDpiAwarenessContext`) + drag + mouse-up moved
+  `AppWindow`'s real `GetWindowRect` height from 800px to 860px live, and
+  wrote `{"cccog.popover.height":"688"}` (688 DIP × 1.25 scale = 860px) to
+  `%LOCALAPPDATA%\CCCG\bar-settings.json`. Quitting and relaunching the
+  process restored the flyout at height 860px — the persisted value
+  survives a cold start, not just the running process.
+- Wheel hook: real `mouse_event(MOUSEEVENTF_WHEEL, ...)` events sent over
+  the flyout produced no exception and no new `bar-crash.log` entry across
+  several notches in both directions; the live Flow section had no
+  overflowing content on the verification machine (0 active/recent jobs)
+  so a nonzero scroll-offset change could not additionally be observed,
+  but the install → route → uninstall path ran clean end to end.
+- Quit (both the tray menu item and the footer button, via UI Automation
+  `InvokePattern.Invoke()` on `QuitButton`): the process exited fully
+  (`tasklist` found no `CCCOG.Bar.App.exe`) with zero new `bar-crash.log`
+  entries, confirming the tray icon, timers, acrylic controller, and
+  `WH_MOUSE_LL` hook were all released — not just the window closing.
+
+## 2026-08-16 quota-card formatting: unified reset time, abbreviated windows, composed row, condensed status
+
+Same session, operator-driven refinement pass (not a TokenBar port — the
+formatting rules below are this repo's own, adopting only TokenBar's
+general "the number leads" agent-card visual language as a reference
+point). All of it lives in `cccog-bar-quota`/`cccog-bar-ffi` so the C# view
+stays display-only, per this repo's existing "formatter in Rust, not C#"
+convention (see the HTTP-resilience section above).
+
+- **`cccog_bar_quota::normalize_reset_display`** (new): the three quota
+  providers previously showed their reset time in three different raw
+  shapes (Codex epoch seconds, Claude ISO-8601 `Z`, the job-failure
+  override's free-text extraction). This function parses all of them
+  (RFC3339, epoch, naive `YYYY-MM-DD[T ]HH:MM[:SS]`, and the English "Aug
+  20th, 2026 11:50 AM" shape `extract_human_reset_date` returns) and
+  renders one bare local-time string: `"MM/DD HH:MM"`, or `"MM/DD"` for a
+  date-only source. A source with no explicit UTC offset is treated as UTC
+  before the local conversion — documented, not a silent guess. Genuinely
+  unparseable input passes through completely unchanged. Wired into
+  `window()` (every provider's per-window `resetsAt`) and
+  `apply_quota_limit_override`'s reset text.
+- **`cccog_bar_quota::resolve_window_label`** (new): window labels
+  ("five hour", "seven day", "Primary") are abbreviated to `"Nh"`/`"Nd"` —
+  primarily from Codex's `window_minutes` field (exact, no text-guessing),
+  falling back to parsing English duration text (`"five hour"` → `5h`) when
+  `window_minutes` isn't present (Claude). A label that isn't
+  duration-shaped at all (`"Credits"`, `"Limit"`) is left untouched.
+- **`cccog_bar_quota::format_window_line`** (new): composes the locked
+  per-window row order — `"<abbreviated window>  <NN%>  <date>"`, e.g.
+  `"5h  7%  08/20 11:50"` — from an already-abbreviated label, a percent
+  (whole when it rounds cleanly, one decimal otherwise), and an
+  already-normalized reset string. `cccog-bar-ffi`'s
+  `quota_cards_wire_json` stamps this onto every window object's
+  `displayLine` field at the JSON-envelope boundary (both
+  `envelope_from_parts` and `poll_remote_quotas_json`), so C# renders it
+  verbatim instead of re-composing label/percent/date itself.
+- **Condensed one-line diagnostics + `diagnostic_detail`**: the on-card
+  status line is capped at one short line — `"limit · 08/20 11:50"`
+  (`apply_quota_limit_override`, was "limit reached (dispatch failure
+  HH:MM) · resets ...") and `"stale · HTTP 429 · 14:13"`
+  (`render_with_cache_fallback`, was "... · data from HH:MM"); the
+  "quota response contained no X" sentences (`fetch_claude_quota`,
+  `fetch_grok_quota`) condense to `"no quota data"`/`"no credit data"`. The
+  fuller sentence each was condensed from is never discarded — it moves to
+  the new `QuotaCards.diagnostic_detail` field (`Option<String>`,
+  `#[serde(skip_serializing_if = "Option::is_none")]`, so it costs nothing
+  on the wire when absent) via the new `stale_with_detail` helper.
+  `bar/app/CCCOG.Bar.App/DashboardView.xaml.cs` renders it once per card
+  (not once per window — the earlier per-window placement duplicated an
+  identical card-level line under every row) as a dim line with
+  `ToolTipService.SetToolTip` carrying `diagnostic_detail` when present.
+- **Card anatomy + layout** (`bar/app/CCCOG.Bar.App/DashboardView.xaml`):
+  Flow moved to the top (`Grid.Row="1"`, the scrollable section — it's the
+  one with unbounded row count), Quota moved to the bottom as three
+  fixed-order, equal-width side-by-side cards (`Grid.Row="2"`, three star
+  columns) — left/center/right = Claude/Codex/Grok, via three named
+  `ContentPresenter`s (`ClaudeQuotaHost`/`CodexQuotaHost`/`GrokQuotaHost`)
+  instead of one grouped card. Footer stays at the very bottom
+  (`Grid.Row="3"`). A provider that hasn't reported data yet still renders
+  its own "Loading…" line in its own slot (lessons-learned #1: never hide
+  a section while loading) rather than the whole row vanishing.
+
+Verified end to end against the real, live, running app (not a synthetic
+fixture — this machine's actual Claude/Codex/Grok credentials, including a
+real active Codex quota-limit block): the UI Automation control tree read
+back
+
+```
+Claude
+  5h  10%  08/16 19:20
+  7d  2%  08/23 14:00
+Codex
+  Limit  100%  08/20 19:50
+  limit · 08/20 19:50
+Grok
+  no credit data
+```
+
+— three cards, fixed order, unified bare-time format on all three
+(including the real job-failure override, which independently confirmed
+the UTC→local conversion: the raw provider text "Aug 20th, 2026 11:50 AM"
+became "08/20 19:50", the correct +8h for this machine's Asia/Taipei
+local time), abbreviated window labels, no "used"/"resets" words, at most
+one condensed status line per card, and no clipping of the third (Grok)
+column at the flyout's standard 500-DIP width (its card's right edge sat
+35px inside the window's right edge). `cargo test --workspace`: 108 tests
+green across all four crates, including new coverage for
+`normalize_reset_display`, `resolve_window_label`, `format_window_line`,
+and the `displayLine`/`diagnosticDetail` wire fields.

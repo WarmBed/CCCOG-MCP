@@ -1,6 +1,8 @@
 using H.NotifyIcon;
+using H.NotifyIcon.Core;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using System.Runtime.InteropServices;
 using System.Windows.Input;
 
@@ -11,6 +13,7 @@ public partial class App : Application
     private FlyoutWindow? _flyout;
     private TaskbarIcon? _tray;
     private DispatcherQueue? _uiQueue;
+    private bool _quitting;
 
     public App()
     {
@@ -29,8 +32,50 @@ public partial class App : Application
         {
             ToolTipText = "CCCOG-Bar - quota and flow",
             LeftClickCommand = new DelegateCommand(_ => ToggleFlyout()),
+            // NOT SecondWindow: that mode parks a transparent helper window
+            // over the desktop, which would swallow hover/wheel input meant
+            // for the flyout — TokenBar's TrayService carries the same
+            // note (ContextMenuMode.PopupMenu instead).
+            ContextMenuMode = ContextMenuMode.PopupMenu,
         };
+        QuitApp = Quit;
+        RebuildMenu();
         _tray.ForceCreate();
+    }
+
+    /// <summary>Ported from TokenBar's TrayService.RebuildMenu: PopupMenu
+    /// mode converts this MenuFlyout to a NATIVE Win32 menu, so only
+    /// Command fires (Click never does), and only ToggleMenuFlyoutItem's
+    /// IsChecked survives the conversion — every actionable item here is
+    /// Command-wired accordingly. CCCOG's menu is fixed (Open / Refresh now
+    /// / Quit — no quota-source or menu-bar-mode radios, since this shell
+    /// has no live tray-icon number and no settings window to route to;
+    /// see bar/SYNC.md), so unlike TokenBar's per-tick rebuild this is
+    /// built once, right after the icon is created.</summary>
+    private void RebuildMenu()
+    {
+        var menu = new MenuFlyout();
+        menu.Items.Add(new MenuFlyoutItem
+        {
+            Text = "Open CCCOG Bar",
+            Command = new DelegateCommand(_ => _flyout?.ShowFlyout()),
+        });
+        menu.Items.Add(new MenuFlyoutSeparator());
+        menu.Items.Add(new MenuFlyoutItem
+        {
+            Text = "Refresh now",
+            Command = new DelegateCommand(_ => _flyout?.RefreshNow()),
+        });
+        menu.Items.Add(new MenuFlyoutSeparator());
+        menu.Items.Add(new MenuFlyoutItem
+        {
+            Text = "Quit",
+            Command = new DelegateCommand(_ => QuitApp?.Invoke()),
+        });
+        if (_tray is not null)
+        {
+            _tray.ContextFlyout = menu;
+        }
     }
 
     private void ToggleFlyout()
@@ -46,6 +91,26 @@ public partial class App : Application
     private void ToggleFlyoutCore()
     {
         _flyout?.ToggleFlyout();
+    }
+
+    /// <summary>The single shutdown path — the tray menu's Quit and the
+    /// flyout footer's Quit button both route here (App.QuitApp), so the
+    /// icon and the WH_MOUSE_LL hook are always released before the
+    /// process exits, whichever entry point fired. Safe to call twice
+    /// (a tray click racing the footer button, say).</summary>
+    public static Action? QuitApp { get; private set; }
+
+    private void Quit()
+    {
+        if (_quitting)
+        {
+            return; // every Quit entry routes here; make it safe to call twice
+        }
+
+        _quitting = true;
+        _tray?.Dispose();
+        _flyout?.Shutdown();
+        Application.Current.Exit();
     }
 
     private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs args)

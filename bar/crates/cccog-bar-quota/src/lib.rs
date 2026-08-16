@@ -20,6 +20,7 @@
 //! Failures always carry a concrete, short diagnostic string (e.g. `HTTP
 //! 401`, `token refresh rejected`) — never a vague "unavailable".
 
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
@@ -50,7 +51,18 @@ pub struct QuotaCards {
     pub windows: Vec<QuotaWindow>,
     pub state: QuotaState,
     pub observed_at: Option<u64>,
+    /// Short, one-line status text meant to sit under a card's window rows
+    /// (operator direction, bar/SYNC.md: "at most ONE short status line" —
+    /// `"stale · HTTP 429 · 14:13"`, `"limit · 08/20 11:50"`). Never a
+    /// sentence.
     pub diagnostic: Option<String>,
+    /// The fuller explanation `diagnostic` was condensed from (evidence
+    /// source, the dispatch-failure's own time, the verbatim provider
+    /// reset text) — never deleted, just moved out of the compact card
+    /// line into here for a hover tooltip. `None` when `diagnostic` is
+    /// already the whole story (nothing was trimmed off it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_detail: Option<String>,
     /// Set only on an HTTP 429 that carried a `Retry-After` header (seconds
     /// form) — the caller's backoff scheduling honors this over its own
     /// default when present.
@@ -238,11 +250,11 @@ pub fn parse_codex_rate_limits(input: &str) -> Result<QuotaCards, String> {
         .unwrap_or(&value);
     let mut windows = Vec::new();
     if let Some(used) = percent(root, "used_percent") {
-        windows.push(window("primary", "Primary", used, root));
+        windows.push(window("primary", &resolve_window_label(root, "Primary"), used, root));
     } else if let Some(object) = root.as_object() {
         for (id, child) in object {
             if let Some(used) = percent(child, "used_percent") {
-                windows.push(window(id, &label_for(id, child), used, child));
+                windows.push(window(id, &resolve_window_label(child, &label_for(id, child)), used, child));
             }
         }
     }
@@ -255,6 +267,7 @@ pub fn parse_codex_rate_limits(input: &str) -> Result<QuotaCards, String> {
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     })
 }
@@ -407,7 +420,11 @@ pub fn fetch_claude_quota<C: HttpClient>(
     };
     let windows = parse_named_windows(&value, &["five_hour", "seven_day", "seven_day_oauth_apps"]);
     if windows.is_empty() {
-        return Some(stale("claude", "quota response contained no windows"));
+        return Some(stale_with_detail(
+            "claude",
+            "no quota data",
+            Some("quota response contained no windows".to_owned()),
+        ));
     }
     Some(QuotaCards {
         client_id: "claude".to_owned(),
@@ -415,6 +432,7 @@ pub fn fetch_claude_quota<C: HttpClient>(
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     })
 }
@@ -437,14 +455,19 @@ pub fn fetch_grok_quota<C: HttpClient>(client: &mut C, token: Option<&str>) -> O
         return Some(stale("grok", "quota response malformed"));
     };
     let Some(used) = value.get("creditUsagePercent").and_then(as_percent) else {
-        return Some(stale("grok", "quota response contained no credit usage"));
+        return Some(stale_with_detail(
+            "grok",
+            "no credit data",
+            Some("quota response contained no credit usage".to_owned()),
+        ));
     };
     Some(QuotaCards {
         client_id: "grok".to_owned(),
-        windows: vec![window("credits", "Credits", used, &value)],
+        windows: vec![window("credits", &resolve_window_label(&value, "Credits"), used, &value)],
         state: QuotaState::Fresh,
         observed_at: None,
         diagnostic: None,
+        diagnostic_detail: None,
         retry_after_seconds: None,
     })
 }
@@ -457,7 +480,9 @@ fn parse_named_windows(value: &Value, names: &[&str]) -> Vec<QuotaWindow> {
                 .get(*name)
                 .and_then(|window| percent(window, "utilization").map(|used| (*name, window, used)))
         })
-        .map(|(name, value, used)| window(name, &label_for(name, value), used, value))
+        .map(|(name, value, used)| {
+            window(name, &resolve_window_label(value, &label_for(name, value)), used, value)
+        })
         .collect()
 }
 
@@ -468,8 +493,75 @@ fn window(id: &str, label: &str, used: f64, value: &Value) -> QuotaWindow {
         label: label.to_owned(),
         used_percent: used,
         remaining_percent: (100.0 - used).max(0.0),
-        resets_at: value.get("resets_at").and_then(reset_value),
+        resets_at: value
+            .get("resets_at")
+            .and_then(reset_value)
+            .map(|raw| normalize_reset_display(&raw)),
     }
+}
+
+// ── Window-label abbreviation: "five hour" -> "5h", never a spelled-out word ──
+//
+// The three quota cards previously showed each provider's own label text
+// verbatim ("five hour", "seven day", "Primary") — never abbreviated, and
+// inconsistent with each other. `resolve_window_label` is the single place
+// that turns a genuine duration-shaped window label into `"Nh"`/`"Nd"` (hours
+// under a day, days at or above it); a label that isn't duration-shaped at
+// all (`"Credits"`, `"Limit"`) is left exactly as it was — abbreviating a
+// non-duration word would just lose meaning, not compact it.
+fn resolve_window_label(value: &Value, raw_label: &str) -> String {
+    if let Some(minutes) = value.get("window_minutes").and_then(Value::as_f64) {
+        if let Some(abbreviated) = abbreviate_duration_minutes(minutes) {
+            return abbreviated;
+        }
+    }
+    abbreviate_duration_text(raw_label).unwrap_or_else(|| raw_label.to_owned())
+}
+
+/// The reliable path: Codex's rate_limits JSON carries the window's exact
+/// length in minutes, so the abbreviation comes straight from that number
+/// instead of parsing whatever English text happens to be attached to it.
+fn abbreviate_duration_minutes(minutes: f64) -> Option<String> {
+    if !minutes.is_finite() || minutes <= 0.0 {
+        return None;
+    }
+    let hours = minutes / 60.0;
+    Some(if hours < 24.0 {
+        format!("{}h", (hours.round().max(1.0)) as i64)
+    } else {
+        format!("{}d", ((hours / 24.0).round().max(1.0)) as i64)
+    })
+}
+
+/// Fallback for providers with no `window_minutes` field (Claude's
+/// `five_hour`/`seven_day` labels arrive as English text only): matches a
+/// number word or digit followed by "hour(s)"/"day(s)" anywhere in the
+/// label and abbreviates it. Returns `None` — leaving the original label
+/// untouched — when the label doesn't read as a duration at all.
+fn abbreviate_duration_text(label: &str) -> Option<String> {
+    let lower = label.to_lowercase();
+    let re = regex::Regex::new(
+        r"(?i)\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)[\s-]*(hour|day)s?\b",
+    )
+    .ok()?;
+    let caps = re.captures(&lower)?;
+    let number = match caps.get(1)?.as_str() {
+        "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        "eleven" => 11,
+        "twelve" => 12,
+        digits => digits.parse().ok()?,
+    };
+    let unit = if caps.get(2)?.as_str() == "hour" { "h" } else { "d" };
+    Some(format!("{number}{unit}"))
 }
 
 fn reset_value(value: &Value) -> Option<String> {
@@ -478,6 +570,130 @@ fn reset_value(value: &Value) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| value.as_u64().map(|seconds| seconds.to_string()))
         .or_else(|| value.as_f64().map(|seconds| (seconds as u64).to_string()))
+}
+
+// ── Per-window display line: the single row TokenBar's agent card shows ────
+//
+// Operator direction (bar/SYNC.md): each quota window renders as one row,
+// `"<abbreviated window>  <NN%>  <date>"` — e.g. `"5h  7%  08/20 11:50"`,
+// `"7d  32%  08/22"` — with the gauge bar for that window drawn alongside.
+// `format_window_line` is the single place that composes it so the C# view
+// stays display-only (no string-building on that side): `label` is expected
+// already abbreviated (`resolve_window_label`) and `resets_display` already
+// normalized (`normalize_reset_display`) — this function only composes the
+// three pieces, it does not itself abbreviate or parse anything.
+pub fn format_window_line(label: &str, used_percent: f64, resets_display: Option<&str>) -> String {
+    let percent = format_percent_compact(used_percent);
+    let date = resets_display
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Reset time unavailable");
+    format!("{label}  {percent}  {date}")
+}
+
+/// Whole percent when it rounds cleanly (`"7%"`), one decimal otherwise
+/// (`"6.3%"`) — the same trimming `{:0.#}` gives on the C# side, done once
+/// here instead of twice.
+fn format_percent_compact(value: f64) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if rounded.fract().abs() < 1e-9 {
+        format!("{}%", rounded as i64)
+    } else {
+        format!("{rounded:.1}%")
+    }
+}
+
+// ── Reset-time normalization: one display format for every provider ────────
+//
+// Codex (epoch seconds, from its rate_limits JSON), Claude (ISO 8601 with a
+// `Z` offset, from the oauth/usage response), and the job-failure override's
+// free-text extraction (`extract_reset_date`'s ISO substrings,
+// `extract_human_reset_date`'s English "Aug 20th, 2026 11:50 AM" shape) each
+// arrive in a different shape. Before this normalizer they were displayed
+// verbatim per shape, so the three quota cards showed visibly inconsistent
+// reset times. `normalize_reset_display` is the single place that parses all
+// of them and renders one local-time string: bare `"MM/DD HH:MM"` (24h,
+// no leading word — the card's own layout already labels this as the reset
+// time), or bare `"MM/DD"` when the source carried no time-of-day. A shape
+// not covered below is returned completely unchanged — never a reformatted
+// guess, matching the "raw and honest" rule the rest of this crate already
+// follows for reset dates (see `extract_reset_date`/`extract_human_reset_date`
+// above).
+//
+// A source with no explicit UTC offset (a bare epoch, a naive
+// "YYYY-MM-DD[T ]HH:MM[:SS]", or an English date/time) is treated as UTC
+// before converting to the display's local time — the epoch case is
+// unambiguous, and the others carry no offset information to do otherwise
+// with; this is a deliberate, documented assumption, not a silent guess.
+pub fn normalize_reset_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return raw.to_owned();
+    }
+    if let Some(instant) = parse_reset_instant(trimmed) {
+        return instant.with_timezone(&Local).format("%m/%d %H:%M").to_string();
+    }
+    if let Some(date) = parse_reset_date_only(trimmed) {
+        return date.format("%m/%d").to_string();
+    }
+    raw.to_owned()
+}
+
+/// Every shape that carries a time-of-day: RFC3339/ISO-8601 (with offset or
+/// `Z`), a bare epoch-seconds numeral, a naive `YYYY-MM-DD[T ]HH:MM[:SS]`
+/// (assumed UTC — see the module comment above), and the English
+/// "Mon D[st|nd|rd|th], YYYY H:MM AM/PM" shape `extract_human_reset_date`
+/// extracts.
+fn parse_reset_instant(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(seconds) = raw.parse::<i64>() {
+        if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, 0) {
+            return Some(dt);
+        }
+    }
+    for format in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(raw, format) {
+            return Some(Utc.from_utc_datetime(&naive));
+        }
+    }
+    let stripped = strip_ordinal_suffix(raw);
+    for format in ["%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(&stripped, format) {
+            return Some(Utc.from_utc_datetime(&naive));
+        }
+    }
+    None
+}
+
+/// Date-only shapes: a bare `YYYY-MM-DD`, or an English date with no time
+/// component ("January 3, 2027"). Deliberately never assumes midnight to
+/// synthesize a hh:mm — a date-only source stays date-only in the display.
+fn parse_reset_date_only(raw: &str) -> Option<NaiveDate> {
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return Some(date);
+    }
+    let stripped = strip_ordinal_suffix(raw);
+    for format in ["%b %d, %Y", "%B %d, %Y"] {
+        if let Ok(date) = NaiveDate::parse_from_str(&stripped, format) {
+            return Some(date);
+        }
+    }
+    None
+}
+
+/// Strips an ordinal suffix ("20th" -> "20") so chrono's `%d` can match the
+/// English shape `extract_human_reset_date` returns verbatim.
+fn strip_ordinal_suffix(raw: &str) -> String {
+    let Ok(re) = regex::Regex::new(r"(?i)(\d+)(st|nd|rd|th)\b") else {
+        return raw.to_owned();
+    };
+    re.replace_all(raw, "$1").into_owned()
 }
 
 fn label_for(id: &str, value: &Value) -> String {
@@ -504,12 +720,26 @@ fn clamp_percent(value: f64) -> f64 {
 }
 
 fn stale(client_id: &str, diagnostic: impl Into<String>) -> QuotaCards {
+    stale_with_detail(client_id, diagnostic, None)
+}
+
+/// Same as `stale`, but the on-card line and its fuller explanation are
+/// given separately: `diagnostic` is the short one-liner (operator
+/// direction, bar/SYNC.md — "status · optional-time" grammar, never a
+/// sentence), `detail` is the full sentence it was condensed from, kept for
+/// a hover tooltip instead of being dropped.
+fn stale_with_detail(
+    client_id: &str,
+    diagnostic: impl Into<String>,
+    detail: Option<String>,
+) -> QuotaCards {
     QuotaCards {
         client_id: client_id.to_owned(),
         windows: Vec::new(),
         state: QuotaState::Stale,
         observed_at: None,
         diagnostic: Some(diagnostic.into()),
+        diagnostic_detail: detail,
         retry_after_seconds: None,
     }
 }
@@ -532,6 +762,7 @@ fn unavailable(client_id: &str, diagnostic: impl Into<String>) -> QuotaCards {
         state: QuotaState::Unavailable,
         observed_at: None,
         diagnostic: Some(diagnostic.into()),
+        diagnostic_detail: None,
         retry_after_seconds: None,
     }
 }
@@ -726,5 +957,122 @@ mod quota_limit_error_tests {
         );
         assert_eq!(extract_reset_date("Provider exited with code 1."), None);
         assert_eq!(extract_reset_date("no date shape at all here"), None);
+    }
+}
+
+#[cfg(test)]
+mod reset_display_tests {
+    use super::*;
+
+    /// Builds the same string the implementation would, for a UTC instant —
+    /// deterministic on any machine (both sides run through the same
+    /// `Local` conversion) without hardcoding a host timezone offset.
+    fn expected(utc: DateTime<Utc>) -> String {
+        utc.with_timezone(&Local).format("%m/%d %H:%M").to_string()
+    }
+
+    #[test]
+    fn normalizes_iso8601_with_and_without_z() {
+        let want = expected(Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
+        assert_eq!(normalize_reset_display("2026-08-20T11:50:00Z"), want);
+        assert_eq!(normalize_reset_display("2026-08-20T11:50:00"), want);
+        assert_eq!(normalize_reset_display("2026-08-20 11:50"), want);
+    }
+
+    #[test]
+    fn normalizes_epoch_seconds() {
+        let want = expected(DateTime::<Utc>::from_timestamp(1787197821, 0).unwrap());
+        assert_eq!(normalize_reset_display("1787197821"), want);
+    }
+
+    #[test]
+    fn normalizes_english_verbatim_dates_with_and_without_a_time() {
+        let with_time = expected(Utc.with_ymd_and_hms(2026, 8, 20, 11, 50, 0).unwrap());
+        assert_eq!(
+            normalize_reset_display("Aug 20th, 2026 11:50 AM"),
+            with_time
+        );
+        assert_eq!(normalize_reset_display("January 3, 2027"), "01/03");
+    }
+
+    #[test]
+    fn normalizes_a_bare_date_to_date_only_never_inventing_a_time() {
+        assert_eq!(normalize_reset_display("2026-08-20"), "08/20");
+    }
+
+    #[test]
+    fn genuinely_unparseable_input_passes_through_verbatim() {
+        assert_eq!(normalize_reset_display("unknown"), "unknown");
+        assert_eq!(
+            normalize_reset_display("no date shape at all here"),
+            "no date shape at all here"
+        );
+        assert_eq!(normalize_reset_display(""), "");
+    }
+}
+
+#[cfg(test)]
+mod window_label_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn abbreviates_from_window_minutes_when_present() {
+        let five_hour = json!({"window_minutes": 300});
+        assert_eq!(resolve_window_label(&five_hour, "whatever text"), "5h");
+        let seven_day = json!({"window_minutes": 10080});
+        assert_eq!(resolve_window_label(&seven_day, "whatever text"), "7d");
+        let one_hour = json!({"window_minutes": 60});
+        assert_eq!(resolve_window_label(&one_hour, "one hour"), "1h");
+    }
+
+    #[test]
+    fn abbreviates_english_duration_text_when_no_window_minutes() {
+        let empty = json!({});
+        assert_eq!(resolve_window_label(&empty, "five hour"), "5h");
+        assert_eq!(resolve_window_label(&empty, "seven day"), "7d");
+        assert_eq!(resolve_window_label(&empty, "seven day oauth apps"), "7d");
+        assert_eq!(resolve_window_label(&empty, "10 hour"), "10h");
+    }
+
+    #[test]
+    fn leaves_non_duration_labels_untouched() {
+        let empty = json!({});
+        assert_eq!(resolve_window_label(&empty, "Credits"), "Credits");
+        assert_eq!(resolve_window_label(&empty, "Limit"), "Limit");
+    }
+}
+
+#[cfg(test)]
+mod window_line_tests {
+    use super::*;
+
+    #[test]
+    fn composes_the_locked_row_order_with_double_spaces() {
+        assert_eq!(
+            format_window_line("5h", 7.0, Some("08/20 11:50")),
+            "5h  7%  08/20 11:50"
+        );
+        assert_eq!(format_window_line("7d", 32.0, Some("08/22")), "7d  32%  08/22");
+    }
+
+    #[test]
+    fn keeps_a_fractional_percent_to_one_decimal() {
+        assert_eq!(
+            format_window_line("5h", 6.3, Some("08/20 11:50")),
+            "5h  6.3%  08/20 11:50"
+        );
+    }
+
+    #[test]
+    fn missing_reset_time_renders_the_honest_placeholder_never_a_blank() {
+        assert_eq!(
+            format_window_line("Credits", 10.0, None),
+            "Credits  10%  Reset time unavailable"
+        );
+        assert_eq!(
+            format_window_line("Credits", 10.0, Some("")),
+            "Credits  10%  Reset time unavailable"
+        );
     }
 }

@@ -4,6 +4,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
 using Windows.Graphics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using IOPath = System.IO.Path;
@@ -36,6 +37,10 @@ public sealed partial class FlyoutWindow : Window
     private FileSystemWatcher? _watcher;
     private int _quotaPollInFlight;
     private bool _closing;
+    /// <summary>Set only by <see cref="Shutdown"/> (App.QuitApp's path): lets
+    /// the real WM_CLOSE through instead of the tray-resident hide-on-close
+    /// the AppWindow.Closing handler otherwise does.</summary>
+    private bool _shuttingDown;
     /// <summary>UI-thread init gate (lessons-learned #4): no refresh path
     /// runs before the constructor finishes wiring the visual tree — the
     /// 0xc000027b crash class came from a background callback racing ahead
@@ -64,11 +69,16 @@ public sealed partial class FlyoutWindow : Window
         AppWindow.IsShownInSwitchers = false;
         AppWindow.Closing += (_, args) =>
         {
+            if (_shuttingDown)
+            {
+                return; // Shutdown() wants the real close, not a hide.
+            }
+
             args.Cancel = true;
             HideFlyout();
         };
 
-        WireResizeGripHover();
+        WireResizeGrip();
 
         // Transient surface → Acrylic, via the manual controller so the
         // backdrop stays translucent while unfocused: the flyout is a
@@ -93,6 +103,10 @@ public sealed partial class FlyoutWindow : Window
             _quotaTimer.Stop();
             _acrylic?.Dispose();
             _acrylic = null;
+            // Safety net: HideFlyout already uninstalls the hook, but Quit
+            // can land while the flyout is visible (hook still installed) —
+            // never leak a WH_MOUSE_LL hook past process shutdown.
+            RemoveWheelHook();
         };
 
         // Deliberately do NOT read the dispatch root here: the constructor
@@ -118,6 +132,23 @@ public sealed partial class FlyoutWindow : Window
         }
     }
 
+    /// <summary>The tray menu's "Refresh now" item — same path the footer's
+    /// own Refresh button and Ctrl+R use, manual so it may bypass the quota
+    /// HTTP TTL (still capped to once per 60s on the Rust side).</summary>
+    public void RefreshNow() => RefreshView(manualQuota: true);
+
+    /// <summary>The single real-close path (App.QuitApp): lets the pending
+    /// AppWindow.Closing cancel-and-hide through instead of intercepting it,
+    /// then closes for real. Safe to call once; App guards against a second
+    /// Quit invocation.</summary>
+    public void Shutdown()
+    {
+        _shuttingDown = true;
+        _closing = true;
+        RemoveWheelHook();
+        Close();
+    }
+
     private bool _hiding;
     private long _slideToken;
     private long _hideGeneration;
@@ -130,6 +161,7 @@ public sealed partial class FlyoutWindow : Window
         }
 
         _hiding = false;
+        InstallWheelHook();
         var (resting, start) = PositionNearTray();
         // Start offset toward the taskbar edge so the WINDOW (backdrop
         // included) slides in as one surface, TokenBar's entrance motion.
@@ -160,6 +192,7 @@ public sealed partial class FlyoutWindow : Window
 
         _hiding = true;
         var generation = ++_hideGeneration;
+        RemoveWheelHook();
         var resting = AppWindow.Position;
         var sink = Toward(resting, TaskbarEdge(), SlideDistance);
         FadeContent(from: 1f, to: 0f, durationMs: 120);
@@ -323,14 +356,17 @@ public sealed partial class FlyoutWindow : Window
         _ => new PointInt32(p.X, p.Y + distance),
     };
 
+    /// <summary>The grip-drag height persistence key, LocalSettings.cs's
+    /// stand-in for TokenBar's "tokenbar.popover.height".</summary>
+    private const string HeightSettingKey = "cccog.popover.height";
+
     /// <summary>Anchor against the taskbar corner of the work area, on
     /// whichever edge the taskbar occupies. Sizes the window and returns the
     /// resting position plus the slide start (offset toward the taskbar).
-    /// Adapted from TokenBar's PositionNearTray: TokenBar clamps a
-    /// user-dragged height read from AppSettings.Store; CCCOG has no
-    /// persisted-settings store, so this always sizes to the fixed
-    /// FlyoutHeight (still clamped into the work area, same as before this
-    /// port).</summary>
+    /// Ported from TokenBar's PositionNearTray: a user-dragged height read
+    /// from the settings store (LocalSettings here, AppSettings.Store
+    /// there) is clamped into the work area; 0/unset falls back to the
+    /// built-in FlyoutHeight.</summary>
     private (PointInt32 Resting, PointInt32 Start) PositionNearTray()
     {
         var display = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary);
@@ -347,9 +383,19 @@ public sealed partial class FlyoutWindow : Window
             scale = 1;
         }
         var width = (int)(FlyoutWidth * scale);
+        // cccog.popover.height (grip-drag persistence, stored in DIPs):
+        // 0/unset = the built-in default; a pick is clamped into the work
+        // area. Bounds are ordered explicitly — on a short work area at
+        // high DPI the 480-DIP floor can exceed the ceiling and
+        // Math.Clamp throws.
+        var picked = double.TryParse(
+            LocalSettings.GetString(HeightSettingKey), NumberStyles.Float,
+            CultureInfo.InvariantCulture, out var storedHeight)
+            ? storedHeight : 0;
         var ceiling = work.Height - (int)(24 * scale);
         var floor = Math.Min((int)(480 * scale), ceiling);
-        var height = (int)Math.Clamp(FlyoutHeight * scale, floor, ceiling);
+        var wanted = picked > 0 ? picked * scale : FlyoutHeight * scale;
+        var height = (int)Math.Clamp(wanted, floor, ceiling);
         AppWindow.Resize(new SizeInt32(width, height));
 
         var edge = TaskbarEdge();
@@ -444,16 +490,95 @@ public sealed partial class FlyoutWindow : Window
         }
     }
 
-    /// <summary>Hover-only: brightens the resize-grip hint on pointer
-    /// enter/exit. TokenBar also wires PointerPressed/Moved/Released to drag
-    /// the top edge and persists the result via AppSettings.Store — CCCOG
-    /// has no settings store, so that drag behavior was not ported (named
-    /// gap; see bar/SYNC.md). The window keeps its fixed FlyoutHeight.</summary>
-    private void WireResizeGripHover()
+    // ── Top-edge resize (the macOS footer drag handle, grown upward) ────
+
+    private bool _resizing;
+    private int _resizeStartCursorY;
+    private int _resizeStartHeight;
+    private int _resizeBottom;
+
+    /// <summary>Drag the flyout's top edge to set its height; the bottom
+    /// stays pinned at the taskbar. Global (physical) cursor coordinates
+    /// keep the drag stable while the window itself moves, and the height
+    /// key persists only on release — mid-drag writes would churn the
+    /// settings file. Ported from TokenBar's WireResizeGrip, swapping
+    /// AppSettings.Store for LocalSettings (bar/SYNC.md).</summary>
+    private void WireResizeGrip()
     {
         ResizeGrip.PointerEntered += (_, _) => ResizeGripHint.Opacity = 1;
-        ResizeGrip.PointerExited += (_, _) => ResizeGripHint.Opacity = 0;
+        ResizeGrip.PointerExited += (_, _) =>
+        {
+            if (!_resizing)
+            {
+                ResizeGripHint.Opacity = 0;
+            }
+        };
+        ResizeGrip.PointerPressed += (_, e) =>
+        {
+            if (!GetCursorPos(out var pt))
+            {
+                return;
+            }
+
+            _resizing = true;
+            _resizeStartCursorY = pt.Y;
+            _resizeStartHeight = AppWindow.Size.Height;
+            _resizeBottom = AppWindow.Position.Y + AppWindow.Size.Height;
+            _ = ResizeGrip.CapturePointer(e.Pointer);
+        };
+        ResizeGrip.PointerMoved += (_, _) =>
+        {
+            if (!_resizing || !GetCursorPos(out var pt))
+            {
+                return;
+            }
+
+            var work = DisplayArea.GetFromWindowId(
+                AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
+            var scale = GetDpiForWindow(
+                WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+            var ceiling = Math.Min(
+                _resizeBottom - work.Y, work.Height - (int)(24 * scale));
+            var floor = Math.Min((int)(480 * scale), ceiling);
+            var height = Math.Clamp(
+                _resizeStartHeight + (_resizeStartCursorY - pt.Y), floor, ceiling);
+            AppWindow.MoveAndResize(new RectInt32(
+                AppWindow.Position.X, _resizeBottom - height,
+                AppWindow.Size.Width, height));
+        };
+        ResizeGrip.PointerReleased += (_, e) =>
+        {
+            ResizeGrip.ReleasePointerCapture(e.Pointer);
+            EndResize();
+        };
+        ResizeGrip.PointerCaptureLost += (_, _) => EndResize();
     }
+
+    private void EndResize()
+    {
+        if (!_resizing)
+        {
+            return;
+        }
+
+        _resizing = false;
+        ResizeGripHint.Opacity = 0;
+        var scale = GetDpiForWindow(
+            WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+        LocalSettings.SetString(
+            HeightSettingKey,
+            (AppWindow.Size.Height / scale).ToString(CultureInfo.InvariantCulture));
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CURSORPOINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out CURSORPOINT pt);
 
     private DesktopAcrylicController? _acrylic;
     private SystemBackdropConfiguration? _acrylicConfig;
@@ -550,6 +675,94 @@ public sealed partial class FlyoutWindow : Window
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForSystem();
+
+    // ── WH_MOUSE_LL wheel-focus workaround ───────────────────────────────
+
+    private delegate nint LowLevelMouseProc(int code, nint wParam, nint lParam);
+
+    private LowLevelMouseProc? _mouseProc; // kept alive while the hook is set
+    private nint _mouseHook;
+
+    /// <summary>Last resort for wheel input: the system never delivers wheel
+    /// messages to this focusless popup, so while the flyout is visible a
+    /// WH_MOUSE_LL hook watches for wheel events inside the flyout rect,
+    /// scrolls the dashboard, and swallows the event so the focused app
+    /// doesn't also scroll. Installed only while visible — ported verbatim
+    /// from TokenBar's FlyoutWindow.xaml.cs (the tray-flyout standard,
+    /// EarTrumpet et al.).</summary>
+    private void InstallWheelHook()
+    {
+        if (_mouseHook != 0)
+        {
+            return;
+        }
+
+        _mouseProc = (code, wParam, lParam) =>
+        {
+            if (code >= 0 && wParam == 0x020A /* WM_MOUSEWHEEL */)
+            {
+                var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                var pos = AppWindow.Position;
+                var size = AppWindow.Size;
+                var inside = AppWindow.IsVisible &&
+                    data.pt.X >= pos.X && data.pt.X < pos.X + size.Width &&
+                    data.pt.Y >= pos.Y && data.pt.Y < pos.Y + size.Height;
+                if (inside)
+                {
+                    var delta = unchecked((short)(data.mouseData >> 16));
+                    var windowX = data.pt.X - pos.X;
+                    var windowY = data.pt.Y - pos.Y;
+                    _ = DispatcherQueue.TryEnqueue(() =>
+                        Dashboard.RouteGlobalWheel(windowX, windowY, delta));
+                    return 1; // consumed: don't let the focused app scroll too
+                }
+            }
+
+            return CallNextHookEx(0, code, wParam, lParam);
+        };
+        _mouseHook = SetWindowsHookExW(
+            14 /* WH_MOUSE_LL */, _mouseProc, GetModuleHandleW(null), 0);
+    }
+
+    private void RemoveWheelHook()
+    {
+        if (_mouseHook != 0)
+        {
+            _ = UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = 0;
+            _mouseProc = null;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public PointL pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public nuint dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PointL
+    {
+        public int X;
+        public int Y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint SetWindowsHookExW(
+        int hookId, LowLevelMouseProc proc, nint module, uint threadId);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(nint hook);
+
+    [DllImport("user32.dll")]
+    private static extern nint CallNextHookEx(nint hook, int code, nint wParam, nint lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint GetModuleHandleW(string? moduleName);
 }
 
 internal static class NativeQuotaClient
@@ -641,6 +854,12 @@ internal static class NativeQuotaClient
                 var diagnostic = card.TryGetProperty("diagnostic", out var diagnosticValue)
                     ? diagnosticValue.GetString()
                     : null;
+                // The fuller sentence `diagnostic` was condensed from
+                // (dispatch-failure time, verbatim provider text) — never
+                // deleted, just moved here for a hover tooltip (bar/SYNC.md).
+                var diagnosticDetail = card.TryGetProperty("diagnosticDetail", out var detailValue)
+                    ? detailValue.GetString()
+                    : null;
                 if (!card.TryGetProperty("windows", out var windows) || windows.GetArrayLength() == 0)
                 {
                     // A failed/empty card still renders — with the concrete
@@ -653,6 +872,7 @@ internal static class NativeQuotaClient
                         UsedPercent = 0,
                         ResetText = "Reset time unavailable",
                         StateText = diagnostic ?? $"{state.ToLowerInvariant()}",
+                        DiagnosticDetail = diagnosticDetail,
                         IsFailure = true,
                         IsWholeProviderFailure = true,
                     });
@@ -666,19 +886,38 @@ internal static class NativeQuotaClient
                     var label = window.TryGetProperty("label", out var labelValue)
                         ? labelValue.GetString() ?? "Quota"
                         : "Quota";
+                    // resetsAt already arrives fully formatted — Rust's
+                    // cccog_bar_quota::normalize_reset_display is the single
+                    // place that parses codex/claude/grok's different reset
+                    // shapes and renders the unified bare "MM/DD HH:MM" (or
+                    // "MM/DD") display text, so it is shown here verbatim
+                    // rather than re-parsed on the C# side (see bar/SYNC.md).
                     var reset = window.TryGetProperty("resetsAt", out var resetValue)
                         ? resetValue.GetString() ?? "Reset time unavailable"
                         : "Reset time unavailable";
+                    var clampedUsed = Math.Clamp(used, 0, 100);
+                    var resetText = string.IsNullOrWhiteSpace(reset) ? "Reset time unavailable" : reset;
+                    // displayLine is the single composed row
+                    // (cccog_bar_quota::format_window_line: "<label>  <NN%>
+                    // <date>") — the fallback composes the identical shape
+                    // locally only if an older FFI build omitted the field.
+                    var displayLine = window.TryGetProperty("displayLine", out var displayLineValue)
+                        ? displayLineValue.GetString()
+                        : null;
                     result.Add(new QuotaCardViewModel
                     {
                         ProviderId = providerId,
                         Label = $"{providerId} - {label}",
                         WindowLabel = label,
-                        UsedPercent = Math.Clamp(used, 0, 100),
-                        ResetText = FormatReset(reset),
+                        UsedPercent = clampedUsed,
+                        ResetText = resetText,
+                        DisplayLine = string.IsNullOrEmpty(displayLine)
+                            ? $"{label}  {clampedUsed:0.#}%  {resetText}"
+                            : displayLine,
                         StateText = state.Equals("fresh", StringComparison.OrdinalIgnoreCase)
                             ? "fresh"
                             : (diagnostic ?? "stale"),
+                        DiagnosticDetail = diagnosticDetail,
                         IsFailure = !state.Equals("fresh", StringComparison.OrdinalIgnoreCase),
                     });
                 }
@@ -689,21 +928,6 @@ internal static class NativeQuotaClient
         {
             return [];
         }
-    }
-
-    private static string FormatReset(string value)
-    {
-        if (long.TryParse(value, out var epoch))
-        {
-            try
-            {
-                return DateTimeOffset.FromUnixTimeSeconds(epoch).ToLocalTime().ToString("g");
-            }
-            catch (ArgumentOutOfRangeException)
-            {
-            }
-        }
-        return string.IsNullOrWhiteSpace(value) ? "Reset time unavailable" : value;
     }
 }
 
