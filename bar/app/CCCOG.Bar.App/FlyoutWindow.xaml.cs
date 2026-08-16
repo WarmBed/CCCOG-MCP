@@ -34,7 +34,9 @@ public sealed partial class FlyoutWindow : Window
 
     private readonly DispatcherQueueTimer _refreshTimer;
     private readonly DispatcherQueueTimer _quotaTimer;
+    private readonly DispatcherQueueTimer _flowTimer;
     private FileSystemWatcher? _watcher;
+    private FileSystemWatcher? _presenceWatcher;
     private int _quotaPollInFlight;
     private bool _closing;
     /// <summary>Set only by <see cref="Shutdown"/> (App.QuitApp's path): lets
@@ -48,6 +50,7 @@ public sealed partial class FlyoutWindow : Window
     private bool _viewReady;
     private bool _everHadQuota;
     private bool _quotaTimerStarted;
+    private bool _flowTimerStarted;
 
     public FlyoutWindow()
     {
@@ -95,12 +98,46 @@ public sealed partial class FlyoutWindow : Window
         _quotaTimer = DispatcherQueue.CreateTimer();
         _quotaTimer.Interval = TimeSpan.FromSeconds(60);
         _quotaTimer.Tick += (_, _) => RefreshQuotaCards();
+        // Flow's primary data sources since 94ca2da (Claude session
+        // transcripts under ~/.claude/projects, and the presence dir) are
+        // NOT under the dispatch-root FileSystemWatcher below, and nothing
+        // else was polling them — a quiet CCCG dispatch registry (zero
+        // events) meant Flow could sit frozen on a stale "refreshed HH:MM"
+        // for hours even while real cross-session activity kept happening
+        // (found live: 2026-08-16, ~2h stall, no crash, process alive).
+        // This periodic tick is the fix: it drives the SAME debounced
+        // RefreshView path the file watchers already use (never calls
+        // RefreshView directly), so there is exactly one refresh
+        // choreography regardless of what triggered it. 60s (operator
+        // direction, performance concern — an earlier 10s pass was
+        // dialed back): this is the BOUNDED FALLBACK for transcript-only
+        // changes (a fresh cross-session dispatch, a session aging past
+        // its alive window) that neither watcher below sees; the presence
+        // and dispatch-root watchers below still give sub-second updates
+        // for what they cover (執行中/閒置 flips, CCCG job changes)
+        // in between ticks — 60s is "how stale can the slow-path parts of
+        // Flow ever get", matched to the quota timer's own cadence, not
+        // "how fast is the scan" (which stays milliseconds either way —
+        // see cccog_bar_core::claude_sessions).
+        _flowTimer = DispatcherQueue.CreateTimer();
+        _flowTimer.Interval = TimeSpan.FromSeconds(60);
+        _flowTimer.Tick += (_, _) =>
+        {
+            if (_closing)
+            {
+                return;
+            }
+            _refreshTimer.Stop();
+            _refreshTimer.Start();
+        };
         Closed += (_, _) =>
         {
             _closing = true;
             _watcher?.Dispose();
+            _presenceWatcher?.Dispose();
             _refreshTimer.Stop();
             _quotaTimer.Stop();
+            _flowTimer.Stop();
             _acrylic?.Dispose();
             _acrylic = null;
             // Safety net: HideFlyout already uninstalls the hook, but Quit
@@ -180,6 +217,11 @@ public sealed partial class FlyoutWindow : Window
         {
             _quotaTimerStarted = true;
             _quotaTimer.Start();
+        }
+        if (!_flowTimerStarted)
+        {
+            _flowTimerStarted = true;
+            _flowTimer.Start();
         }
     }
 
@@ -290,41 +332,65 @@ public sealed partial class FlyoutWindow : Window
         });
     }
 
-    private void StartFileWatcher()
+    /// <summary>Both file watchers below (dispatch root, presence dir) and
+    /// the periodic <see cref="_flowTimer"/> all funnel into this one
+    /// debounce-and-refresh trigger — one refresh choreography regardless
+    /// of which of the three sources fired.</summary>
+    private void RequestDebouncedRefresh()
     {
-        var root = IOPath.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CCCG", "dispatch");
-        if (!Directory.Exists(root))
+        if (_closing)
         {
             return;
         }
-        _watcher = new FileSystemWatcher(root)
+        _refreshTimer.Stop();
+        _refreshTimer.Start();
+    }
+
+    private void StartFileWatcher()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+        var dispatchRoot = IOPath.Combine(localAppData, "CCCG", "dispatch");
+        if (Directory.Exists(dispatchRoot))
         {
-            IncludeSubdirectories = true,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-            EnableRaisingEvents = true,
-        };
-        FileSystemEventHandler changed = (_, _) => DispatcherQueue.TryEnqueue(() =>
-        {
-            if (_closing)
+            _watcher = new FileSystemWatcher(dispatchRoot)
             {
-                return;
-            }
-            _refreshTimer.Stop();
-            _refreshTimer.Start();
-        });
-        RenamedEventHandler renamed = (_, _) => DispatcherQueue.TryEnqueue(() =>
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                EnableRaisingEvents = true,
+            };
+            FileSystemEventHandler changed = (_, _) => DispatcherQueue.TryEnqueue(RequestDebouncedRefresh);
+            RenamedEventHandler renamed = (_, _) => DispatcherQueue.TryEnqueue(RequestDebouncedRefresh);
+            _watcher.Changed += changed;
+            _watcher.Created += changed;
+            _watcher.Deleted += changed;
+            _watcher.Renamed += renamed;
+        }
+
+        // Presence heartbeats (hooks/cccg-presence-hook.js) — cheap,
+        // low-churn events (one small file write per Claude Code hook
+        // invocation), so watching directly makes 執行中/閒置 flips feel
+        // instant instead of waiting up to 60s for the periodic timer.
+        // Deliberately NOT watching ~/.claude/projects itself: transcript
+        // writes are constant during an active turn and would fire this
+        // handler continuously — the 60s timer already covers that source
+        // without the event churn (bar/SYNC.md has the fuller rationale).
+        var presenceRoot = IOPath.Combine(localAppData, "CCCG", "presence");
+        if (Directory.Exists(presenceRoot))
         {
-            if (_closing)
+            _presenceWatcher = new FileSystemWatcher(presenceRoot)
             {
-                return;
-            }
-            _refreshTimer.Stop();
-            _refreshTimer.Start();
-        });
-        _watcher.Changed += changed;
-        _watcher.Created += changed;
-        _watcher.Deleted += changed;
-        _watcher.Renamed += renamed;
+                IncludeSubdirectories = false,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+                EnableRaisingEvents = true,
+            };
+            FileSystemEventHandler changed = (_, _) => DispatcherQueue.TryEnqueue(RequestDebouncedRefresh);
+            RenamedEventHandler renamed = (_, _) => DispatcherQueue.TryEnqueue(RequestDebouncedRefresh);
+            _presenceWatcher.Changed += changed;
+            _presenceWatcher.Created += changed;
+            _presenceWatcher.Deleted += changed;
+            _presenceWatcher.Renamed += renamed;
+        }
     }
 
     // ── Window chrome: ported from TokenBar-Windows FlyoutWindow.xaml.cs ──

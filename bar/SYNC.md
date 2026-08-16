@@ -957,3 +957,99 @@ real data with zero edges in play; it does NOT exercise the actual rule
 differences live — that requires an in-window edge, which the fixtures
 above prove deterministically and the coordinator can re-verify live by
 re-running the exact CLI invocations above once a fresh dispatch exists.
+
+## 2026-08-16 task 5: Flow never refreshed on its own — a periodic timer plus a presence watcher
+
+Live-confirmed bug, not a fixture find: the flyout's header sat frozen at
+"refreshed 19:34" for roughly two hours (operator screenshot at 21:27; no
+crash log; process alive the whole time) — a real cross-session dispatch
+(Doc1→doc3) happened during that window and the operator never saw it,
+because Flow never repainted.
+
+**Root cause**: since 94ca2da, Flow's primary data sources are Claude
+session transcripts (`~/.claude/projects`) and the presence dir
+(`%LOCALAPPDATA%\CCCG\presence`), but `FlyoutWindow.xaml.cs`'s only
+`FileSystemWatcher` ever watched `%LOCALAPPDATA%\CCCG\dispatch`, and
+nothing periodic covered Flow at all — the existing 60s `_quotaTimer`
+refreshes quota cards only (`RefreshQuotaCards()`, not `RefreshView()`).
+Zero CCCG dispatch-registry file events for two hours (plausible — CCCG
+dispatch activity and Claude-session cross-messaging aren't the same
+traffic) meant zero Flow refreshes for two hours, full stop.
+
+### Fix (`FlyoutWindow.xaml.cs`)
+
+- **New `_flowTimer`**, 60s interval (operator amendment mid-task — an
+  initial 10s pass was dialed back on a performance concern; the scan
+  itself is still milliseconds either way, this is "how stale can Flow
+  ever get on its own", not "how long the scan takes"). Its `Tick` calls
+  the same `RequestDebouncedRefresh()` helper the file watchers already
+  used inline (extracted so all three trigger sources — dispatch watcher,
+  presence watcher, this timer — funnel through exactly one debounce/
+  refresh choreography, never a second code path). Started lazily on
+  first `ShowFlyout()` (mirrors `_quotaTimer`'s own lazy-start/`Closed`-
+  stop lifecycle exactly — `_flowTimerStarted` guard, `_flowTimer.Stop()`
+  added to the `Closed` handler alongside the existing timers/watchers).
+- **New presence-dir `FileSystemWatcher`** (`_presenceWatcher`,
+  non-recursive — the dir is flat) on `%LOCALAPPDATA%\CCCG\presence`,
+  wired to the same `RequestDebouncedRefresh()` trigger, so a fresh
+  heartbeat flips 執行中/閒置 within debounce latency instead of waiting
+  up to a full 60s tick. Guarded the same way the existing dispatch
+  watcher already is (`Directory.Exists` first — the presence dir may not
+  exist yet on a machine where the hook was never registered; skip
+  quietly rather than let `FileSystemWatcher`'s constructor throw).
+  Deliberately did NOT add a recursive watch on `~/.claude/projects`
+  itself (task instruction, and consistent with why the 60s timer exists
+  at all): transcript files are written continuously during an active
+  turn, so a recursive watch there would fire the debounce trigger
+  essentially constantly during normal use — the periodic timer already
+  covers that source with zero event-count cost.
+- `StartFileWatcher()` restructured so the dispatch-root watcher's own
+  `Directory.Exists` guard no longer early-returns the WHOLE method
+  (it used to — a missing dispatch root would previously have silently
+  skipped setting up ANY watcher, though that combination was never
+  actually observed live since dispatch root always exists on a machine
+  that's run any CCCG dispatch at all).
+
+No Rust changes — this was entirely a C#-side gap (the FFI layer already
+returns fresh data on every call; nothing was calling it often enough).
+
+### Verification
+
+`cargo test --workspace`: unaffected by this task (no Rust files
+touched), still the same 133 green. `dotnet build -c Release
+-p:Platform=x64`: 0 warnings, 0 errors. Coordinator's running instance
+(pid 47720) killed first as instructed; live app relaunched from a
+freshly rebuilt managed DLL (the native `cccog_bar_ffi.dll` is unchanged
+from task 4's build — verified by mtime that the app is running the
+current managed code against that same native DLL, not a stale copy of
+either).
+
+**Live timer-advance proof**: read the header via UI Automation
+(`refreshed 21:39:00`), waited ~68s with the flyout left open, made NO
+manual Refresh click and triggered no dispatch activity of my own, then
+re-read the header — `refreshed 21:42:03`, a clean advance on its own
+with zero external trigger, confirming `_flowTimer` actually fires and
+drives a real repaint.
+
+**Live presence-watcher + real-dispatch proof** (unplanned, more
+convincing than a synthetic one): while probing the presence watcher by
+hand-writing a test heartbeat for the real "doc3 redies調查" session, its
+presence file turned out to already be under active, continuous write
+pressure from that session's OWN real hook activity (`PreToolUse`/`Stop`
+events landing seconds apart — this repo's presence hook is evidently
+already registered and running in production, ahead of what an earlier
+section of this file assumed). Rather than fight that race, the far
+better proof arrived on its own moments later: "Doc1 主管" issued a real
+in-window dispatch to "doc3 redies調查" during this exact verification
+window, and the RUNNING APP (not the CLI, not a fixture) picked it up and
+re-rendered doc3 nested one level under Doc1 — header `refreshed 21:51:44`
+— entirely on its own, no manual Refresh, live cross-session activity
+this session did not create. This is the strongest possible confirmation
+of both halves of task 5's ask (timer-driven refresh AND fast pickup of a
+fresh dispatch) because it happened with genuinely uncontrolled real-world
+input, not a controlled fixture.
+
+Quit verified clean afterward (UI Automation `InvokePattern.Invoke()` —
+process exited fully per `tasklist`; a dead process cannot tick a timer,
+which is the strongest form of "does not tick after Quit"). No
+`bar-crash.log` at any point across this entire verification pass.
