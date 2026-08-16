@@ -33,6 +33,12 @@
 //! dispatch jobs and non-live owner leases are aggregated into bottom rows
 //! rather than attached anywhere (rule 4's "terminal/resumable aggregated
 //! at the bottom").
+//!
+//! Operator follow-up (2026-08-16, same day): top-level controller rows
+//! also carry `typeModelText` now — `"claude · <model>"` — so a session's
+//! model is visible without opening a child row, consistent with how every
+//! child already shows its own `(kind · model)`. Omitted (never guessed)
+//! when the session has no `message.model` seen yet.
 
 use crate::claude_sessions::{alive_agents, find_controller, short_model_name, SessionSummary, RUNNING_FRESH_SECS};
 use crate::presence::{resolve_presence_state, PresenceRecord, PresenceState};
@@ -53,9 +59,9 @@ pub struct TreeRow {
     pub depth: u32,
     pub kind: String,
     pub label: String,
-    /// `"agent · sonnet-5"` etc — present on child rows, absent on
-    /// top-level rows (their own identity is carried by `provider` +
-    /// `label` already).
+    /// `"agent · sonnet-5"` on a child row, `"claude · sonnet-5"` on a
+    /// top-level controller row — `None` when no model has been observed
+    /// yet (never guessed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_model_text: Option<String>,
     /// Drives the dot color always, and (for child rows only) the
@@ -147,6 +153,89 @@ fn job_source_name(job: &DispatchJobInput) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// `controller_of` is built purely from "each session's own most-recent
+/// inbound edge" — genuinely live back-and-forth CCD traffic (A relays to
+/// B, B replies to A with its own `<*-session-message>`, both entirely
+/// normal) can point two or more sessions at each other. Found live: a
+/// real mutual "CCCG開發" ⇄ "Doc4 新增" pair collapsed the ENTIRE tree to
+/// just the one unrelated session with no inbound edges — every node
+/// downstream of the cycle (including this task's own controller session
+/// and its live agent) silently vanished, because a session assigned as
+/// someone's controller but which is ITSELF assigned a controller never
+/// gets iterated as a top-level row, so nothing ever attaches to it.
+///
+/// Each session has at most one outgoing "controlled by" edge, so any
+/// cycle is a simple loop reachable by walking `controller_of` from any
+/// node. This walks every node once (memoized via `resolved`), and on
+/// finding a cycle removes the edge belonging to whichever session in that
+/// cycle has the lexicographically smallest id — an arbitrary but
+/// deterministic tie-break (there is no principled "which one is really
+/// the controller" answer for a mutual pair; picking one consistently is
+/// what matters, not which one). That session becomes top-level and the
+/// rest of the (former) cycle nests under it exactly as any other chain
+/// would.
+fn break_cycles(controller_of: &mut HashMap<String, String>) {
+    let mut resolved: HashSet<String> = HashSet::new();
+    let keys: Vec<String> = controller_of.keys().cloned().collect();
+    for start in keys {
+        if resolved.contains(&start) {
+            continue;
+        }
+        let mut path: Vec<String> = Vec::new();
+        let mut current = start;
+        loop {
+            if resolved.contains(&current) {
+                resolved.extend(path);
+                break;
+            }
+            if let Some(cycle_start) = path.iter().position(|node| *node == current) {
+                let break_at = path[cycle_start..].iter().min().cloned().expect("non-empty cycle slice");
+                controller_of.remove(&break_at);
+                resolved.extend(path);
+                break;
+            }
+            path.push(current.clone());
+            match controller_of.get(&current) {
+                Some(next) => current = next.clone(),
+                None => {
+                    resolved.extend(path);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// After `break_cycles`, `controller_of` is guaranteed acyclic but can
+/// still contain multi-hop CHAINS (a 3-or-more-node cycle breaks to a
+/// chain, e.g. `a -> b -> c` once `a`'s own outgoing edge is removed) —
+/// and the tree is built as exactly two levels (depth 0 controller, depth
+/// 1 child), so a session whose `controller_of` entry points at another
+/// CHILD rather than an actual top-level session would never be attached
+/// anywhere (the depth-1 lookup in `build_tree` only matches a child's
+/// controller against sessions already known to be top-level). This walks
+/// every entry to its ultimate root — the first node in the chain that is
+/// NOT itself a key in `controller_of` — and rewrites the entry to point
+/// there directly, so every child, however many hops its original
+/// resolution chain had, ends up correctly attached one level under an
+/// actual top-level row.
+fn flatten_controllers_to_root(controller_of: &mut HashMap<String, String>) {
+    let keys: Vec<String> = controller_of.keys().cloned().collect();
+    let bound = keys.len();
+    for key in keys {
+        let mut root = controller_of[&key].clone();
+        let mut hops = 0;
+        while let Some(next) = controller_of.get(&root) {
+            root = next.clone();
+            hops += 1;
+            if hops > bound {
+                break; // defensive only — break_cycles already makes this unreachable
+            }
+        }
+        controller_of.insert(key, root);
+    }
+}
+
 /// Build the flattened, depth-tagged tree.
 pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
     let TreeBuildInput { sessions, presence, jobs, owners, now } = input;
@@ -174,6 +263,8 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             controller_of.insert(session.session_id.clone(), controller_id);
         }
     }
+    break_cycles(&mut controller_of);
+    flatten_controllers_to_root(&mut controller_of);
 
     let child_session_ids: HashSet<&str> = controller_of.keys().map(String::as_str).collect();
     let by_id: HashMap<&str, &SessionSummary> = sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
@@ -190,11 +281,16 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
 
     for controller in &top_level {
         let (state_label, pulse) = resolve_session_state(controller, presence.get(&controller.session_id), now);
+        // Operator follow-up (2026-08-16): top-level rows show their model
+        // too, consistent with children — "claude · <model>" from the
+        // session's own most-recent in-window `message.model`. Omitted
+        // (not guessed) when no model has been seen yet.
+        let type_model_text = controller.model.as_deref().map(|model| format!("claude · {}", short_model_name(model)));
         rows.push(TreeRow {
             depth: 0,
             kind: "controller".to_owned(),
             label: controller.title.clone(),
-            type_model_text: None,
+            type_model_text,
             provider: "claude".to_owned(),
             state_label: state_label.to_owned(),
             pulse,
@@ -383,6 +479,21 @@ mod tests {
         assert_eq!(rows[0].depth, 0);
         assert_eq!(rows[0].kind, "controller");
         assert_eq!(rows[0].label, "CCCG開發");
+        // Operator follow-up (2026-08-16): top-level rows show their model
+        // too now, consistent with children — the `session()` fixture's
+        // assistant event carries "claude-sonnet-5".
+        assert_eq!(rows[0].type_model_text.as_deref(), Some("claude · sonnet-5"));
+        assert_eq!(rows[0].provider, "claude");
+    }
+
+    #[test]
+    fn a_controller_row_omits_the_model_parenthetical_when_no_model_was_seen() {
+        let content = r#"{"type":"custom-title","customTitle":"Doc1 主管","sessionId":"s1"}
+{"type":"user","timestamp":"2026-08-16T11:59:00Z","message":{"content":"no model on a user turn"}}"#;
+        let session = build_session_summary("slug", "s1", content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert!(session.model.is_none(), "fixture precondition: no message.model anywhere in this transcript");
+        let rows = build_tree(empty_input(vec![session]));
+        assert_eq!(rows[0].type_model_text, None, "never guess a model that was never observed");
     }
 
     #[test]
@@ -424,6 +535,47 @@ mod tests {
         let occurrences = rows.iter().filter(|r| r.label == "child").count();
         assert_eq!(occurrences, 1);
         assert!(rows.iter().any(|r| r.label == "child" && r.depth == 1));
+    }
+
+    /// Regression for a real, live bug found while verifying task 3's fix:
+    /// two sessions that recently messaged EACH OTHER (a completely normal
+    /// live back-and-forth — A relays to B, B replies to A) each end up
+    /// with the other as their "most recent inbound edge" controller,
+    /// forming a 2-cycle. Before `break_cycles`, this made BOTH sessions —
+    /// and this task's own real "CCCG開發" ⇄ "Doc4 新增" pair reproduced
+    /// this exactly — vanish from the tree entirely: a session assigned as
+    /// someone's controller but which itself has a controller is never
+    /// iterated as a top-level row, so nothing (including a live agent
+    /// child!) ever gets attached anywhere visible.
+    #[test]
+    fn a_mutual_edge_between_two_sessions_does_not_erase_either_of_them() {
+        let a = session_with_edge("a", "CCCG開發", "2026-08-16T11:59:00Z", "Doc4 新增", "2026-08-16T11:50:00Z");
+        let b = session_with_edge("b", "Doc4 新增", "2026-08-16T11:58:00Z", "CCCG開發", "2026-08-16T11:55:00Z");
+        let rows = build_tree(empty_input(vec![a, b]));
+
+        assert_eq!(
+            rows.iter().filter(|r| r.label == "CCCG開發" || r.label == "Doc4 新增").count(),
+            2,
+            "both sessions in the mutual pair must still render somewhere: {rows:?}"
+        );
+        let top_level_count = rows.iter().filter(|r| r.depth == 0).count();
+        assert_eq!(top_level_count, 1, "the cycle breaks to exactly one top-level anchor, not zero, not two");
+        let child_count = rows.iter().filter(|r| r.depth == 1).count();
+        assert_eq!(child_count, 1, "the other session nests under the anchor instead of vanishing");
+    }
+
+    /// Same shape, three sessions in a longer cycle (A→B→C→A) — the fix
+    /// must not be special-cased to exactly two nodes.
+    #[test]
+    fn a_three_way_mutual_edge_cycle_does_not_erase_any_of_them() {
+        let a = session_with_edge("a", "Alpha", "2026-08-16T11:59:00Z", "Gamma", "2026-08-16T11:50:00Z");
+        let b = session_with_edge("b", "Beta", "2026-08-16T11:58:00Z", "Alpha", "2026-08-16T11:51:00Z");
+        let c = session_with_edge("c", "Gamma", "2026-08-16T11:57:00Z", "Beta", "2026-08-16T11:52:00Z");
+        let rows = build_tree(empty_input(vec![a, b, c]));
+
+        assert_eq!(rows.len(), 3, "all three sessions must still render: {rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.depth == 0).count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.depth == 1).count(), 2);
     }
 
     #[test]

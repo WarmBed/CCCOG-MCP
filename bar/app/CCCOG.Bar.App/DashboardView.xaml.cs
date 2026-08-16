@@ -1,6 +1,5 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
 
@@ -175,17 +174,28 @@ public sealed partial class DashboardView : UserControl
         return root;
     }
 
-    // ── Flow section: TokenBar row primitives (status disc, text,
-    // right-aligned meta) — Ui.Row()/Ui.Text(), fed by the flattened,
-    // depth-tagged Flow tree (FlowTreeRowViewModel — one controller session
-    // per top-level row, its agent/session/codex/grok children indented
-    // beneath). Two-level tree, rendered from a flat list rather than a
-    // real recursive tree control: depth 0 is a controller/resumable row,
-    // depth 1 is always its immediately-preceding depth-0 row's child (the
-    // Rust side already groups children under their controller in order —
-    // see cccog_bar_core::tree::build_tree), so indentation is just "extra
-    // left margin when Depth == 1", no parent/child object graph needed on
-    // this side. See bar/SYNC.md for the fuller derivation record.
+    // ── Flow section: aligned three-column table (operator direction,
+    // 2026-08-16: "doc1 | 模型 | 閒置 這樣 整齊一點 不要在右邊" — a shared
+    // column grid across every row, not "flush everything to the card's
+    // right edge"), fed by the flattened, depth-tagged Flow tree
+    // (FlowTreeRowViewModel — one controller session per top-level row, its
+    // agent/session/codex/grok children indented beneath). Two-level tree,
+    // rendered from a flat list rather than a real recursive tree control:
+    // depth 0 is a controller/resumable row, depth 1 is always its
+    // immediately-preceding depth-0 row's child (the Rust side already
+    // groups children under their controller in order — see
+    // cccog_bar_core::tree::build_tree). See bar/SYNC.md for the fuller
+    // derivation record.
+
+    /// <summary>Fixed widths for the model and state/elapsed columns — the
+    /// same three `ColumnDefinition`s are recreated per row (WinUI has no
+    /// shared-grid-across-siblings primitive short of a real `Grid` with
+    /// `Grid.Row` per entry, which would give up the `StackPanel`'s
+    /// variable row heights for no benefit here) but with identical widths
+    /// every time, so columns still line up visually down the whole
+    /// list.</summary>
+    private const double FlowModelColumnWidth = 125;
+    private const double FlowStateColumnWidth = 95;
 
     private static FrameworkElement BuildFlowContent(IReadOnlyList<FlowTreeRowViewModel> rows)
     {
@@ -197,52 +207,85 @@ public sealed partial class DashboardView : UserControl
         var panel = new StackPanel { Spacing = 6 };
         foreach (var row in rows)
         {
-            var left = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                Margin = row.Depth > 0 ? new Thickness(18, 0, 0, 0) : new Thickness(0),
-            };
-            left.Children.Add(new Ellipse
-            {
-                Width = row.Depth > 0 ? 6 : 8,
-                Height = row.Depth > 0 ? 6 : 8,
-                Fill = row.DotBrush,
-                Opacity = row.DotOpacity,
-                VerticalAlignment = VerticalAlignment.Center,
-            });
-            left.Children.Add(FlowLabelText(row));
-
-            var stateElapsed = string.IsNullOrEmpty(row.ElapsedText)
-                ? row.StateLabel
-                : $"{row.StateLabel} · {row.ElapsedText}";
-            var rowGrid = Ui.Row(left, Ui.Text(stateElapsed, 10, 0.62));
-            panel.Children.Add(rowGrid);
+            panel.Children.Add(BuildFlowRow(row));
         }
 
         return panel;
     }
 
-    /// <summary>A child row's label carries its own "(type · model)"
-    /// parenthetical, colored with that child's own provider color
-    /// (operator rule 2: "same palette as the dots") — everything else in
-    /// the line stays the default label color. Built as two
-    /// <see cref="Run"/>s inside one TextBlock rather than two separate
-    /// TextBlocks so the colored segment visually reads as part of the same
-    /// name, not a second column.</summary>
-    private static TextBlock FlowLabelText(FlowTreeRowViewModel row)
+    /// <summary>One row = title | model | state·elapsed, at consistent
+    /// column positions for every row regardless of depth or kind
+    /// (Claude-session controller/agent/session rows and CCCG
+    /// codex/grok/terminal/resumable rows all go through this same
+    /// builder). Only the title column's LEADING content (dot size +
+    /// indent margin) varies by <see cref="FlowTreeRowViewModel.Depth"/> —
+    /// the model and state columns are separate, fixed-width `Grid`
+    /// columns, so a child's indent never shifts them out of alignment
+    /// with its parent's.</summary>
+    private static Microsoft.UI.Xaml.Controls.Grid BuildFlowRow(FlowTreeRowViewModel row)
     {
-        var text = new TextBlock { FontSize = 11, TextTrimming = TextTrimming.CharacterEllipsis };
-        text.Inlines.Add(new Run { Text = row.Label });
+        var grid = new Microsoft.UI.Xaml.Controls.Grid { ColumnSpacing = 8 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(FlowModelColumnWidth) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(FlowStateColumnWidth) });
+
+        var titleCell = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            Margin = row.Depth > 0 ? new Thickness(18, 0, 0, 0) : new Thickness(0),
+        };
+        titleCell.Children.Add(new Ellipse
+        {
+            Width = row.Depth > 0 ? 6 : 8,
+            Height = row.Depth > 0 ? 6 : 8,
+            Fill = row.DotBrush,
+            Opacity = row.DotOpacity,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        titleCell.Children.Add(FlowTitleText(row));
+        Microsoft.UI.Xaml.Controls.Grid.SetColumn(titleCell, 0);
+        grid.Children.Add(titleCell);
+
+        var modelText = Ui.Text(
+            string.IsNullOrEmpty(row.TypeModelText) ? "" : $"({row.TypeModelText})", 10);
+        modelText.VerticalAlignment = VerticalAlignment.Center;
         if (!string.IsNullOrEmpty(row.TypeModelText))
         {
-            text.Inlines.Add(new Run { Text = "  " });
-            text.Inlines.Add(new Run
-            {
-                Text = $"({row.TypeModelText})",
-                Foreground = new SolidColorBrush(ProviderPalette.Color(row.Provider)),
-            });
+            modelText.Foreground = new SolidColorBrush(ProviderPalette.Color(row.Provider));
         }
+        Microsoft.UI.Xaml.Controls.Grid.SetColumn(modelText, 1);
+        grid.Children.Add(modelText);
+
+        var stateElapsed = string.IsNullOrEmpty(row.ElapsedText)
+            ? row.StateLabel
+            : $"{row.StateLabel} · {row.ElapsedText}";
+        var stateText = Ui.Text(stateElapsed, 10, 0.62);
+        stateText.VerticalAlignment = VerticalAlignment.Center;
+        Microsoft.UI.Xaml.Controls.Grid.SetColumn(stateText, 2);
+        grid.Children.Add(stateText);
+
+        return grid;
+    }
+
+    /// <summary>The title column's text only — the "(type · model)"
+    /// parenthetical moved into its own column (operator's aligned-columns
+    /// direction) so this is plain text again, no colored inline run.
+    ///
+    /// A hover tooltip carries the FULL label plus model, as a plain,
+    /// unclipped string (operator follow-up, 2026-08-16: a long
+    /// agent/session label ellipsized under
+    /// <see cref="TextTrimming.CharacterEllipsis"/> — e.g. "Add Claude
+    /// session li…" — had no way to recover the rest). Set unconditionally
+    /// rather than only when the text is actually long enough to clip:
+    /// WinUI has no cheap pre-layout way to know whether a given string
+    /// clips at a given TextBlock's eventual rendered width, and a tooltip
+    /// on already-short, unclipped text costs nothing.</summary>
+    private static TextBlock FlowTitleText(FlowTreeRowViewModel row)
+    {
+        var text = Ui.Text(row.Label, 11);
+        var fullText = string.IsNullOrEmpty(row.TypeModelText) ? row.Label : $"{row.Label} ({row.TypeModelText})";
+        ToolTipService.SetToolTip(text, fullText);
         return text;
     }
 }

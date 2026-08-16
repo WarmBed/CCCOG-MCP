@@ -45,14 +45,28 @@
 //!   `*.sqlite*`, `history.jsonl` only has prompt text keyed by session id,
 //!   `sessions/*.json` are PID-lock files). The title lives inline in the
 //!   transcript itself, so no second file needs to be read.
-//! - `message.content` (String, for a `user` line): the raw text of a
-//!   cross-session message the operator's `send_message` mechanism injects
-//!   looks like `<cross-session-message from="local_<uuid>" name="<title>">
-//!   ...</cross-session-message>` — `name` is the SENDING session's own
-//!   title text (confirmed against real transcripts: `from`'s `local_<uuid>`
-//!   does NOT match any session-uuid `.jsonl` filename on this machine, it's
-//!   a separate peer-id namespace: matching has to go through `name`
-//!   against another session's resolved title, not `from`'s id).
+//! - `message.content` (String, for a `user` line): the raw text of an
+//!   inbound cross-session message looks like `<cross-session-message
+//!   from="local_<uuid>" name="<title>" encoded="1">...</cross-session-message>`
+//!   — `name` is the SENDING session's own title text (confirmed against
+//!   real transcripts: `from`'s `local_<uuid>` does NOT match any
+//!   session-uuid `.jsonl` filename on this machine, it's a separate
+//!   peer-id namespace: matching has to go through `name` against another
+//!   session's resolved title, not `from`'s id). **A second, structurally
+//!   identical tag name also exists in the wild**:
+//!   `<desktop-session-message from="..." name="..." ...>` — used when the
+//!   sender is a Claude Desktop session (`entrypoint":"claude-desktop"`)
+//!   rather than a CCD-managed one; found the hard way (2026-08-16
+//!   live-run task 3: "Doc1 主管" → "doc5 Api文件檢查" rendered nowhere in
+//!   the tree because the extractor only recognized the first tag name).
+//!   `extract_cross_session_name` therefore matches on the shared
+//!   `session-message` substring and walks back to its enclosing tag,
+//!   rather than hardcoding one literal name — the JSON string's `\"`
+//!   escapes are already fully decoded by the time that function sees the
+//!   text (`serde_json` parses the whole line first; `message.content`
+//!   arrives as a plain `Value::String` with real `"` characters, not
+//!   escaped ones — there is no raw/undecoded text path here to regress
+//!   into).
 //!
 //! Subagents: `<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl`,
 //! each with a sibling `agent-<id>.meta.json` (`{"agentType":...,
@@ -180,11 +194,26 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 /// `content` shaped as a plain string carries this (every real occurrence
 /// found on this machine was a bare `user` message string, never inside a
 /// content-block array), so array-shaped `content` is not scanned.
+/// Recognizes `<cross-session-message from="..." name="..." ...>`
+/// (session-to-session `send_message` delivery) AND
+/// `<desktop-session-message from="..." name="..." ...>` (a Claude
+/// Desktop coordinator's delivery into a CCD-managed session — a real,
+/// live example: "Doc1 主管" (`entrypoint":"claude-desktop"`) dispatching
+/// to "doc3 redies調查"/"doc5 Api文件檢查" on 2026-08-16 used this exact
+/// tag, not `cross-session-message` — confirmed by grepping the real
+/// recipient transcripts after the tree silently failed to nest them).
+/// Both tags carry the identical `from`/`name` attribute shape for the
+/// identical purpose (an inbound message naming its sender's own title),
+/// so this matches on the shared `session-message` marker and walks back
+/// to its enclosing `<...>` open tag rather than hardcoding one exact tag
+/// name — forward-compatible with any future `<*session-message>` variant
+/// without another silent-miss bug like this one.
 fn extract_cross_session_name(content: &Value) -> Option<String> {
     let text = content.as_str()?;
-    let start = text.find("<cross-session-message")?;
-    let tag_end = text[start..].find('>')? + start;
-    let tag = &text[start..=tag_end];
+    let marker_pos = text.find("session-message")?;
+    let tag_start = text[..marker_pos].rfind('<')?;
+    let tag_end = text[tag_start..].find('>')? + tag_start;
+    let tag = &text[tag_start..=tag_end];
     extract_attr(tag, "name")
 }
 
@@ -257,7 +286,15 @@ struct AgentMeta {
     description: Option<String>,
 }
 
-const AGENT_LABEL_MAX_BYTES: usize = 24;
+/// Operator follow-up (2026-08-16): the row's own text must stay the
+/// SINGLE source of truth for both the compact on-row display AND its
+/// hover-tooltip full text — a Rust-side hard truncation short enough to
+/// visibly bite (the original 24-byte cap did) would mean the tooltip
+/// could only ever show the same already-cut string. Widened generously;
+/// this is now a wire-size safety net, not the thing that actually decides
+/// what's visible — the shell's own `TextTrimming.CharacterEllipsis`
+/// handles the VISUAL clipping per available width, off this full string.
+const AGENT_LABEL_MAX_BYTES: usize = 200;
 
 /// Build one session's summary from already-read transcript text. Returns
 /// `None` when the session isn't alive by EITHER measure below.
@@ -709,11 +746,33 @@ mod tests {
 
     #[test]
     fn parse_line_extracts_cross_session_message_name() {
+        // The `\"` here IS the real on-disk shape (the outer line is one
+        // JSON object; `content` is itself a JSON string, so its embedded
+        // `"` characters must be escaped) — by the time `serde_json` hands
+        // this back as a `Value::String`, those escapes are already fully
+        // decoded to plain `"` characters, same as any other JSON string
+        // field. There is no raw/undecoded text path in this parser to
+        // regress into.
         let event = parse_line(&line(
             r#"{"type":"user","timestamp":"2026-08-16T07:00:00Z","message":{"role":"user","content":"<cross-session-message from=\"local_95c9c014-1694-4e27-97de-392ddee6a50c\" name=\"doc1主管\" encoded=\"1\">\nhello\n</cross-session-message>"}}"#,
         ))
         .unwrap();
         assert_eq!(event.cross_session_from_name.as_deref(), Some("doc1主管"));
+    }
+
+    /// Regression for the real 2026-08-16 live-run failure (task 3): a
+    /// Claude Desktop coordinator's delivery uses `<desktop-session-message>`,
+    /// not `<cross-session-message>` — confirmed against the real recipient
+    /// transcripts ("doc5 Api文件檢查" received `<desktop-session-message
+    /// from="local_ae65a2fa-..." name="Doc1 主管" ...>`). Both tag names
+    /// must resolve to an edge.
+    #[test]
+    fn parse_line_extracts_name_from_the_desktop_session_message_tag_too() {
+        let event = parse_line(&line(
+            r#"{"type":"user","timestamp":"2026-08-16T10:03:28.278Z","message":{"role":"user","content":"<desktop-session-message from=\"local_ae65a2fa-329e-42af-84de-7b22b8bcd8ac\" name=\"Doc1 主管\" encoded=\"1\">\ndoc1 → doc5: hi\n</desktop-session-message>"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(event.cross_session_from_name.as_deref(), Some("Doc1 主管"));
     }
 
     #[test]
@@ -943,6 +1002,59 @@ mod tests {
         assert_eq!(session.title, "CCCG開發");
         assert_eq!(session.agents.len(), 1);
         assert_eq!(session.agents[0].label, "Do the thing");
+    }
+
+    /// Regression for the real 2026-08-16 shape behind task 3's live-run
+    /// failure: a recipient session living in a WORKTREE gets its own,
+    /// differently-named project-slug directory (a worktree's `.claude`
+    /// project dir is keyed off ITS OWN cwd, e.g.
+    /// `D--code-openruterati--claude-worktrees-goofy-wescoff-28c933`, not
+    /// the main repo's `d--code-openruterati`) — session identity here is
+    /// always the transcript's own filename (`session_id =
+    /// path.file_stem()`), never any externally-supplied id, and the scan
+    /// walks every entry under the projects root uninfluenced by slug
+    /// naming, so a worktree slug is read exactly like any other. This
+    /// test pins that: two sessions in two DIFFERENTLY NAMED slug dirs,
+    /// with a `<desktop-session-message>` cross-slug edge between them,
+    /// both scanned and the edge resolvable by title (never by slug).
+    #[test]
+    fn sessions_in_different_worktree_slug_directories_are_both_scanned() {
+        let now = real_now();
+        let root = tempfile::tempdir().unwrap();
+
+        let main_project = root.path().join("d--code-openruterati");
+        std::fs::create_dir_all(&main_project).unwrap();
+        std::fs::write(
+            main_project.join("controller.jsonl"),
+            transcript(&[
+                r#"{"type":"custom-title","customTitle":"Doc1 主管","sessionId":"controller"}"#,
+                &format!(r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-5"}}}}"#, rfc3339_offset(now, -60)),
+            ]),
+        )
+        .unwrap();
+
+        let worktree_project = root
+            .path()
+            .join("D--code-openruterati--claude-worktrees-goofy-wescoff-28c933");
+        std::fs::create_dir_all(&worktree_project).unwrap();
+        std::fs::write(
+            worktree_project.join("recipient.jsonl"),
+            transcript(&[
+                r#"{"type":"custom-title","customTitle":"doc3 redies調查","sessionId":"recipient"}"#,
+                &format!(
+                    r#"{{"type":"user","timestamp":"{}","message":{{"content":"<desktop-session-message from=\"local_x\" name=\"Doc1 主管\" encoded=\"1\">hi</desktop-session-message>"}}}}"#,
+                    rfc3339_offset(now, -30)
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let sessions = collect_claude_sessions(root.path(), now);
+        assert_eq!(sessions.len(), 2, "both slug dirs must be scanned: {sessions:?}");
+        let recipient = sessions.iter().find(|s| s.title == "doc3 redies調查").unwrap();
+        assert_eq!(recipient.inbound_edges.len(), 1);
+        assert_eq!(recipient.inbound_edges[0].from_name, "Doc1 主管");
+        assert!(find_controller(&sessions, "Doc1 主管").is_some());
     }
 
     /// Regression for the real bug this task's own live-run verification

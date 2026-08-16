@@ -596,3 +596,186 @@ split-line date styling; the footer/Quit button worked (UI Automation
 `bar-crash.log` did not exist before, during, or after this entire
 verification pass (checked at every stage, not just "no growth") — zero
 exceptions anywhere in the new code paths under real conditions.
+
+## 2026-08-16 same-day follow-up: tooltips, parent model, aligned columns, and a real cycle-collapse bug
+
+Three operator-driven follow-ups on the tree above, landed in the same
+session as one more commit.
+
+### 1. Full-text tooltips + parent-row model
+
+`AGENT_LABEL_MAX_BYTES` (`claude_sessions.rs`) widened from 24 to 200 —
+the original cap was short enough to visibly bite ("Add Claude session
+li…"), and since the label field is the SAME string used for both the
+compact on-row text and its hover tooltip, a Rust-side truncation that
+short meant the tooltip could only ever repeat the same already-cut
+string. It's now a wire-size safety net, not the thing deciding what's
+visible; `TextTrimming.CharacterEllipsis` (already set on the label
+`TextBlock`) does the actual visual clipping per available width, and
+`ToolTipService.SetToolTip` is set unconditionally to the full
+label(+model) text — WinUI has no cheap pre-layout way to know whether a
+given string will actually clip, and a tooltip on already-short text costs
+nothing.
+
+Top-level controller rows gained `typeModelText` too (`tree.rs`) —
+`"claude · <model>"` from the session's own most-recent in-window
+`message.model`, omitted (never guessed) when none has been seen —
+reversing this same day's earlier "controllers don't repeat the provider
+word, the dot already shows it" simplification, per direct operator
+request for parity with child rows.
+
+### 2. A real cycle-collapse bug, found via a live re-verification, not a fixture
+
+Re-running the live app after task 3's fix (below) landed showed the WHOLE
+Flow tree collapse to a single, unrelated session — every other session,
+including this task's own controller session and its live agent,
+vanished. Root cause, found with a throwaway debug binary against the real
+transcripts (since deleted): `controller_of` (child session → controller
+session) is built purely from "each session's own most-recent inbound
+edge". Real, live, completely normal CCD traffic — A relays to B, B
+replies to A with its own `<*-session-message>` — makes A and B each
+other's most-recent controller, a 2-cycle; a real "CCCG開發" ⇄ "Doc4 新增"
+pair (a routine back-and-forth) reproduced this exactly. A session that is
+itself assigned a controller is never iterated as a top-level row in
+`build_tree`'s per-controller loop, so nothing downstream of a cycle member
+— any of its own children — ever gets attached to anything visible either.
+This is separate from (and not fixed by) the tag-name bug below; it was
+masked by it, since almost no edges resolved before that fix, so the cycle
+case never came up until edges started resolving correctly.
+
+Fixed with two passes over `controller_of`, run right after it's built,
+before anything reads it:
+
+- **`break_cycles`**: walks each node's outgoing chain (memoized so no node
+  is walked twice); on finding a cycle, removes the edge belonging to
+  whichever member has the lexicographically smallest session id — an
+  arbitrary but deterministic tie-break (there is no principled "who's
+  really the controller" answer for a mutual pair). That member becomes
+  top-level; the rest of the former cycle nests under it.
+- **`flatten_controllers_to_root`**: breaking a 3-or-more-node cycle can
+  leave a multi-hop CHAIN (`a -> b -> c`), and the tree is exactly two
+  levels by construction — a child whose `controller_of` entry points at
+  another child (not an actual top-level session) would never be attached
+  anywhere, since the depth-1 lookup only matches against known top-level
+  rows. This walks every entry to its ultimate root (the first node in the
+  chain that isn't itself a `controller_of` key) and rewrites the entry to
+  point there directly, so a session reached via ANY number of hops still
+  ends up exactly one level under an actual top-level row.
+
+Two new fixtures cover this directly: a 2-node mutual pair and a 3-node
+cycle (`A→B→C→A`), asserting every member still renders exactly once and
+the tree stays exactly two levels deep either way.
+
+### 3. Task 3: the `<desktop-session-message>` tag name
+
+The live symptom behind task 3 ("Doc1 主管 → doc3/doc5, rendered
+nowhere") was investigated against the real recipient transcripts, not
+fixtures, per the operator's instruction — and turned up a genuine
+discrepancy with the operator's own first relayed set of "facts", which
+this repo's own direct byte-level investigation superseded (documented
+here so the correction is traceable, not just asserted):
+
+- The coordinator's first message supplied CCD session ids (`339948fe...`,
+  `fb4b150d...`, `ae65a2fa...`) as if they were transcript filenames; none
+  of the three exist anywhere under `~/.claude/projects`. Content search
+  (grepping every transcript for the real `customTitle` strings) found the
+  actual filenames: "doc3 redies調查" = `.../D--code-openruterati--claude-worktrees-goofy-wescoff-28c933/0a104564-887e-4613-a4a1-251c5eff9de8.jsonl`,
+  "doc5 Api文件檢查" = `.../d--code-openruterati/08881788-7b84-4185-8a36-60b9465be8fe.jsonl`,
+  "Doc1 主管" = `.../d--code-openruterati/8d8e52b3-e0b5-483b-9fa1-a33e6277e75e.jsonl`.
+  Session identity in this module was never derived from any externally
+  supplied id in the first place — `session_id` is always
+  `path.file_stem()`, the transcript's own filename — so this particular
+  point turned out not to be a real risk to the code, only to the
+  debugging narrative; worth recording so a future investigation doesn't
+  re-litigate it.
+- The coordinator's SECOND message additionally proposed "the extractor
+  regex-matches the raw (still-`\"`-escaped) line instead of the decoded
+  `message.content`" as the likely cause, citing a bare-quote grep
+  returning zero hits. That diagnosis doesn't match this module's actual
+  parse path: `parse_line` calls `serde_json::from_str` on the WHOLE line
+  first, and `extract_cross_session_name` only ever runs on the resulting
+  `Value::String`'s already-fully-decoded text (a `\"` in the JSON source
+  is just an ordinary `"` by the time any Rust code here sees it) — there
+  is no raw/undecoded text path in this parser to have regressed into.
+  Confirmed directly: this repo's own fixtures already construct their
+  JSON test input with literal `\"` escapes (that's simply what valid JSON
+  containing a quote character inside a string looks like) and were
+  passing throughout.
+- **The real cause**, found by walking the actual bytes with `grep -o` and
+  widening context until the true tag name appeared: this delivery used
+  `<desktop-session-message from="..." name="..." ...>`, not
+  `<cross-session-message ...>` — a second, structurally identical tag
+  name used when the sender is a Claude Desktop session
+  (`entrypoint":"claude-desktop"`) rather than a CCD-managed one. Both tag
+  names are confirmed present in the wild across different real
+  transcripts. `extract_cross_session_name` (`claude_sessions.rs`) now
+  matches on the shared `session-message` substring and walks back to the
+  enclosing `<...>` tag, rather than hardcoding one literal name — handles
+  both today and any future `<*session-message>` variant without another
+  silent-miss bug of this exact shape.
+
+New fixtures: the `desktop-session-message` tag variant (string-level),
+and an FS-level test with two sessions in DIFFERENTLY NAMED project-slug
+directories (the real worktree-slug shape from "doc3 redies調查") proving
+the scan and the edge-matching are slug-name-agnostic — matching is always
+by resolved session TITLE, never by directory name or any external id.
+
+### 4. Aligned three-column Flow rows
+
+Operator: 「doc1 | 模型 | 閒置 這樣 整齊一點 不要在右邊」— replaced the
+previous two-slot `Ui.Row(left, right)` (title cluster on the left,
+state+elapsed flushed to the card's far right edge) with a proper
+three-column `Grid` per row (`DashboardView.BuildFlowRow`): title (Star,
+variable width) | model (fixed 125px, colored) | state·elapsed (fixed
+95px). The SAME two fixed-width `ColumnDefinition`s are used for every row
+regardless of depth or kind (Claude-session controller/agent/session rows,
+CCCG codex/grok children, the terminal/resumable bottom aggregate) — a
+child's indent (extra left `Margin` on the title cell only) never shifts
+the model/state columns out of alignment with its parent's, since those
+are separate grid columns with widths independent of what the title cell
+contains. Verified via UI Automation's own `BoundingRectangle.X` on the
+live running app: every row's model text started at the identical x=2228,
+every state text at x=2394, parent and child rows alike (screen coords —
+absolute across the flyout, not client-relative, but the point is they're
+IDENTICAL across every row).
+
+### Verification
+
+`cargo test --workspace`: 125 tests green (9 net new this pass: 2 for the
+`desktop-session-message` tag + worktree-slug scanning, 2 for the
+mutual/chain cycle fix, 1 for the parent-model omission case, plus the
+earlier session's 116 unchanged). `dotnet build -c Release -p:Platform=x64`:
+0 warnings, 0 errors throughout every rebuild in this pass. Coordinator's
+running instance (pid 41804) killed first as instructed; every rebuild
+after that was verified via fresh DLL mtimes before launching.
+
+Live UI Automation read-back after the aligned-columns + tooltip + parent-model
+changes, x-coordinates included to show real column alignment:
+
+```
+Doc4 新增                x=1976   (claude · sonnet-5)  x=2228   執行中 · 0s   x=2394
+doc2 api-gateway上線     x=1976   (claude · sonnet-5)  x=2228   執行中 · 21s  x=2394
+CCCG開發                 x=1976   (claude · fable-5)   x=2228   執行中 · 24s  x=2394
+  Add Claude session liveness to Flow  x=1996   (agent · sonnet-5)  x=2228   執行中 · 24s  x=2394
+Doc1 主管                x=1976   (claude · fable-5)   x=2228   閒置 · 7m     x=2394
+codex ×58                x=1976                                   terminal  x=2394
+grok ×34                 x=1976                                   terminal  x=2394
+```
+
+The specific in-window cross-session edges the coordinator asked to see
+nested (Doc1→doc5, CCCG開發⇄Doc4) had aged past the 10-minute alive window
+by the time of this FINAL live capture — the debugging/rebuild/re-verify
+cycle for the cycle-collapse bug above took long enough that real
+wall-clock time moved past them; this is expected staleness, not a
+regression (per the coordinator's own stated fallback: re-trigger if
+needed, don't chase it). The fix was instead verified against the EXACT
+same real transcript files with a debug binary pinning `now` back to
+`2026-08-16T10:08:00Z` (shortly after the real messages, since deleted
+along with the tool): with that clock, "CCCG開發", "Doc1 主管", "doc5
+Api文件檢查", and "doc3 redies調查" all correctly stopped being top-level
+and nested one level under "Doc4 新增" (the chain's ultimate root once
+flattened) — proof against the real bug's real data, not a synthetic
+fixture, even though the live app's own real-time capture above no longer
+shows it. A fresh cross-session message, if the operator wants to see it
+in a live real-time capture too, would need to be re-sent — this session
+did not send one itself, per instruction.
