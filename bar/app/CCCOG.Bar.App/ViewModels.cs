@@ -97,6 +97,27 @@ public sealed class FlowTreeRowViewModel
     /// when the model's window is unknown) — the hover tooltip on
     /// <see cref="ContextText"/>, never truncated.</summary>
     public string? ContextTooltip { get; init; }
+    /// <summary>Task 15 (2026-08-18): true exactly when the row's own
+    /// underlying `contextDetail` was present on the wire — the same "has
+    /// usage data at all" condition <see cref="ContextText"/> is gated on.
+    /// Drives whether the row responds to a click at all (rows without
+    /// usage data don't expand, per the operator's own instruction).</summary>
+    public bool CanExpand { get; init; }
+    /// <summary>Pre-formatted "cached 340k · fresh 15k · output 6k" — the
+    /// inline-expand detail's first line. `null` iff <see cref="CanExpand"/>
+    /// is false.</summary>
+    public string? DecompositionText { get; init; }
+    /// <summary>Pre-formatted "N turns · session age Xh" — the
+    /// inline-expand detail's second line. `null` iff
+    /// <see cref="CanExpand"/> is false, OR the transcript never carried a
+    /// timestamp at all (session age unknowable — not observed in
+    /// practice, but never fabricated).</summary>
+    public string? TurnsAgeText { get; init; }
+    /// <summary>Per-turn total-context series (cached+fresh), chronological,
+    /// already bounded to the last 50 points by the Rust side — the
+    /// inline-expand detail's third line (a sparkline). `null`/empty when
+    /// there's nothing to plot (fewer than 2 points draws no useful line).</summary>
+    public IReadOnlyList<long>? ContextSeries { get; init; }
 }
 
 public sealed class QuotaCardViewModel

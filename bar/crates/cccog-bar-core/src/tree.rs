@@ -40,7 +40,7 @@
 //! child already shows its own `(kind · model)`. Omitted (never guessed)
 //! when the session has no `message.model` seen yet.
 
-use crate::claude_sessions::{alive_agents, find_controller, short_model_name, SessionSummary, RUNNING_FRESH_SECS};
+use crate::claude_sessions::{alive_agents, find_controller, short_model_name, ContextDetail, SessionSummary, RUNNING_FRESH_SECS};
 use crate::presence::{resolve_presence_state, PresenceRecord, PresenceState};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -86,6 +86,48 @@ pub struct TreeRow {
     /// unrecognized (never a guessed window size).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_percent: Option<f64>,
+    /// Task 15 (2026-08-18): everything the inline-expand UI needs beyond
+    /// the roll-up above — one nested object (rather than six more flat
+    /// `Option` fields) since these numbers only ever travel together,
+    /// gated by the identical "has usage data at all" condition
+    /// `context_tokens` already gates on. `None` on the wire = "this row
+    /// can't expand" (task 15's own rule: rows without usage data don't
+    /// expand).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_detail: Option<TreeContextDetail>,
+}
+
+/// Wire shape of [`ContextDetail`] — identical fields, except
+/// `session_started_at` (an absolute instant, meaningless to a JSON
+/// consumer with no shared clock reference) becomes `session_age_seconds`
+/// (an elapsed duration, computed against the same `now` every other
+/// `elapsedSeconds` field on this row uses).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeContextDetail {
+    pub cached_tokens: u64,
+    pub fresh_tokens: u64,
+    pub output_tokens: u64,
+    pub turn_count: u32,
+    /// `None` only in the (unobserved in practice) case where no event in
+    /// the transcript ever carried a timestamp at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_age_seconds: Option<u64>,
+    /// Per-turn total context (cached+fresh), chronological, bounded to
+    /// the most recent 50 points — the sparkline's raw data.
+    pub series: Vec<u64>,
+}
+
+fn context_detail_row(detail: &Option<ContextDetail>, now: DateTime<Utc>) -> Option<TreeContextDetail> {
+    let detail = detail.as_ref()?;
+    Some(TreeContextDetail {
+        cached_tokens: detail.cached_tokens,
+        fresh_tokens: detail.fresh_tokens,
+        output_tokens: detail.output_tokens,
+        turn_count: detail.turn_count,
+        session_age_seconds: detail.session_started_at.map(|started_at| elapsed_seconds(started_at, now)),
+        series: detail.series.clone(),
+    })
 }
 
 /// A dispatch job, already reduced to what the tree needs — callers (the
@@ -459,6 +501,7 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             elapsed_seconds: Some(elapsed_seconds(controller.last_event_at, now)),
             context_tokens: controller.context_tokens,
             context_percent: controller.context_percent,
+            context_detail: context_detail_row(&controller.context_detail, now),
         });
 
         // Children: this session's own alive agents, then any live session
@@ -484,6 +527,7 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
                 elapsed_seconds: Some(elapsed_seconds(agent.last_event_at, now)),
                 context_tokens: agent.context_tokens,
                 context_percent: agent.context_percent,
+                context_detail: context_detail_row(&agent.context_detail, now),
             });
         }
 
@@ -507,6 +551,7 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
                 elapsed_seconds: Some(elapsed_seconds(child.last_event_at, now)),
                 context_tokens: child.context_tokens,
                 context_percent: child.context_percent,
+                context_detail: context_detail_row(&child.context_detail, now),
             });
         }
 
@@ -546,9 +591,10 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
                 pulse,
                 elapsed_seconds: job.time.map(|time| elapsed_seconds(time, now)),
                 // Dispatch jobs (codex/grok) carry no message.usage shape —
-                // task 14 is Claude-session/agent-only.
+                // tasks 14/15 are Claude-session/agent-only.
                 context_tokens: None,
                 context_percent: None,
+                context_detail: None,
             });
         }
         children.extend(job_children);
@@ -579,6 +625,7 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             elapsed_seconds: None,
             context_tokens: None,
             context_percent: None,
+            context_detail: None,
         });
     }
 
@@ -604,6 +651,7 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             elapsed_seconds: None,
             context_tokens: None,
             context_percent: None,
+            context_detail: None,
         });
     }
 

@@ -2109,3 +2109,132 @@ showing all-time counts); untouched by this task.
 quota 30 and ffi 34 unchanged). `dotnet build -c Release -p:Platform=x64`:
 0 warnings, 0 errors (after the release-DLL rebuild above). No
 `bar-crash.log` growth across the whole task. Commit + push authorized.
+
+## 2026-08-18 task 15: inline row expansion (context decomposition, turn count/age, sparkline)
+
+Operator approved option 1 (inline expand, over a separate detail panel):
+clicking a session/agent row expands 2-3 detail lines beneath it, click
+again collapses. Explicit constraint carried over from task 14's own
+framing: ONLY honestly transcript-derivable fields — the CC-internal
+System-tools/Skills category breakdown is not on disk anywhere and is
+never fabricated here.
+
+### `cccog-bar-core`
+
+`UsageTokens` gained `output_tokens` (task 14 deliberately left it out
+since `total()`/context occupancy doesn't need it; task 15's own
+decomposition line does). New `ContextDetail` struct
+(`claude_sessions.rs`): `cached_tokens` (= `cache_read_tokens` of the
+LATEST usage-carrying event, same "last one wins" convention as
+`context_tokens`), `fresh_tokens` (= `input_tokens + cache_creation_tokens`
+— a cache WRITE is still freshly-processed input, just newly cached for
+next time), `output_tokens`, `turn_count` (count of usage-carrying events
+— NOT bounded, unlike the series below), `session_started_at` (the
+EARLIEST event of ANY kind, not just usage-carrying ones — a session
+starts at its first message, typically a usage-less user line),
+`series: Vec<u64>` (per-turn totals, chronological, bounded to the most
+recent `CONTEXT_SERIES_MAX_POINTS = 50` — a RECENT-trend indicator, never
+a full archive). Built by `build_context_detail`, wired into both
+`SessionSummary` and `AgentSummary` alongside task 14's existing
+`context_tokens`/`context_percent`, gated by the identical condition
+(`None` under the exact same "no usage-carrying event at all" case).
+
+`tree::TreeRow` gained one new field, `context_detail:
+Option<TreeContextDetail>` — a NESTED object (`cachedTokens`,
+`freshTokens`, `outputTokens`, `turnCount`, `sessionAgeSeconds`, `series`)
+rather than six more flat `Option` fields, since these numbers only ever
+travel together. `session_started_at` (an absolute instant, meaningless
+without a shared clock) becomes `session_age_seconds` at this layer,
+computed the same way every other `elapsedSeconds` on the row already is.
+5 new fixtures in `claude_sessions.rs`: the decomposition uses only the
+LATEST turn (an earlier turn's huge synthetic numbers must not leak in),
+turn_count/session_age span the WHOLE transcript (not just the
+usage-carrying tail), the series is bounded to the last 50 of 61 real
+turns kept in chronological order (verified the OLDEST kept point is
+turn #11, not #0 — proving it's truncating from the front, not the
+back), absent-usage renders no detail (mirrors task 14's own fixture),
+and an agent's detail is fully independent of its parent's.
+
+### C# — click-to-expand, chevron, sparkline
+
+`FlowTreeRowViewModel` gained `CanExpand`, `DecompositionText`,
+`TurnsAgeText`, `ContextSeries` — pre-formatted at fetch time in
+`FlyoutWindow.ParseContextDetail`, same "compute once, UI is pure
+render" discipline every other row field already follows.
+
+Expand/collapse is per-row UI state, explicitly "not persisted"
+(operator instruction) — meaning it doesn't survive an app restart, but
+it DOES need to survive the periodic re-render every 5s-rate-limited
+refresh already does, or expanding a row would immediately collapse
+itself on the next tick. Since the row DTOs are rebuilt fresh from JSON
+on every fetch (no stable object identity), `DashboardView` now tracks
+expand state itself, keyed by `depth:kind:label`
+(`_expandedFlowRowKeys`, a `HashSet<string>` field on the `UserControl`
+instance) and keeps the last-fetched rows (`_lastFlowRows`) so a click
+can re-render from cache — task 15's own instruction, "expanding must
+not trigger a data refetch." `RenderFlow` (the real fetch path) and
+`ToggleFlowRowExpanded` (the click path) both end in the identical
+`FlowHost.Content = Ui.Card("Flow", BuildFlowContent(...))` call; only
+which list feeds it differs.
+
+A clickable row needs `Background = Transparent` (not left `null`) —
+WinUI's `Grid` is hit-test invisible outside its own children when its
+background is unset, so without this, only clicks landing exactly on a
+text run (not the row's surrounding whitespace) would have registered.
+Only rows with `CanExpand` get a `Tapped` handler and the "▸"/"▾"
+chevron at all; a row with no usage data renders byte-identical to
+before this task, un-clickable. Detail lines (`Ui.Dim`, same styling as
+every other secondary text on the row) render in a `StackPanel` appended
+BELOW the row's own `Grid`, inside a shared wrapper `BuildFlowRowGroup`
+returns — the three-column `Grid` itself is completely untouched either
+way, so alignment holds with or without expansion.
+
+New `Ui.Sparkline` (`Ui.cs`): a small inline `Polyline`, normalized to
+its own series' min/max, reusing `GaugeBar`'s own muted gray and `Dim`'s
+0.6-opacity convention rather than a new palette or chart library (both
+explicit operator constraints). A flat series still draws a flat
+centered line (no divide-by-zero); fewer than 2 points draws nothing.
+
+Light-dismiss (task 13) needed NO code change — the `WH_MOUSE_LL` hook's
+dismiss check already excludes ANY point inside the flyout's own
+bounding rect wholesale, so a click on a row (always inside that rect)
+was never at risk; live-verified below by clicking a row repeatedly
+without the flyout ever closing.
+
+### Live verification
+
+Real `SendInput` clicks (not synthetic UIA `InvokePattern.Invoke` —
+same lesson task 13 already learned about coordinate reliability),
+located via a fresh `AutomationElement` rect lookup taken in the SAME
+call as the click (row order re-sorts by `last_event_at` every refresh,
+so a stale rect from an earlier dump can silently target the wrong
+row).
+
+Clicking "CCCG開發" (this coordinator session) once: chevron flipped
+"▸"→"▾" and produced, verified via `AutomationElement` text dump:
+
+```
+cached 385.7k · fresh 18 · output 222
+33 turns · session age 2h09m
+```
+
+The sparkline itself carries no accessible `Name` (a bare `Polyline`
+gets no WinUI automation peer), so it doesn't show in a UIA text dump —
+confirmed instead via a real `CopyFromScreen` screenshot of just that
+region, showing a genuinely non-flat line trending upward across the
+turn history, not a placeholder or flat artifact. Clicking the same row
+again: chevron back to "▸", detail lines gone (collapse confirmed).
+Expanded a row, waited 7s (past the 5s refresh floor, confirmed at
+least one background auto-refresh fired via the changed timestamp/row
+order), re-checked: still expanded — confirming state survives the
+periodic re-render, not just a manual poll. Flyout stayed open and
+responsive through every one of these clicks (light-dismiss unaffected).
+
+### Gates
+
+`cargo test --workspace`: 156 tests green (core crate 74 lib + 5 graph +
+4 parsers + 4 refresh + 5 usage = 92, +5 net from this task's fixtures;
+quota 30 and ffi 34 unchanged). `dotnet build -c Release -p:Platform=x64`
+(after `cargo build --release --workspace` first, per task 14's own
+re-learned lesson): 0 warnings, 0 errors. No `bar-crash.log` growth.
+Commit + push authorized.

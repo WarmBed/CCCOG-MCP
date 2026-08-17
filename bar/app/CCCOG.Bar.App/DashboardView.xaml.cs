@@ -20,6 +20,18 @@ public sealed partial class DashboardView : UserControl
 {
     public event Action? RefreshRequested;
 
+    /// <summary>Task 15 (2026-08-18): inline row expansion is per-row UI
+    /// state, explicitly "not persisted" (operator instruction) — meaning
+    /// it doesn't survive an app restart, but it MUST survive the periodic
+    /// re-render every fetch already does (else expanding a row would
+    /// collapse itself again on the very next 5s-rate-limited refresh,
+    /// which would make the feature useless). Both fields live on this
+    /// `UserControl` instance, not on the row DTOs themselves (those are
+    /// rebuilt fresh from JSON every fetch and have no stable identity to
+    /// hang state off of on their own).</summary>
+    private readonly HashSet<string> _expandedFlowRowKeys = new();
+    private IReadOnlyList<FlowTreeRowViewModel> _lastFlowRows = Array.Empty<FlowTreeRowViewModel>();
+
     public DashboardView()
     {
         InitializeComponent();
@@ -61,8 +73,22 @@ public sealed partial class DashboardView : UserControl
 
     public void RenderFlow(IReadOnlyList<FlowTreeRowViewModel> rows, int visibleRows)
     {
+        _lastFlowRows = rows;
         FlowHost.Content = Ui.Card("Flow", BuildFlowContent(rows));
         FooterText.Text = $"{visibleRows} flow row(s) - tokens only";
+    }
+
+    /// <summary>Toggles one row's expand state and re-renders the Flow
+    /// section from the LAST FETCHED rows — task 15's own instruction:
+    /// "expanding must not trigger a data refetch." Only `FlowHost` is
+    /// touched; `FooterText`/quota sections are untouched.</summary>
+    private void ToggleFlowRowExpanded(string rowKey)
+    {
+        if (!_expandedFlowRowKeys.Remove(rowKey))
+        {
+            _expandedFlowRowKeys.Add(rowKey);
+        }
+        FlowHost.Content = Ui.Card("Flow", BuildFlowContent(_lastFlowRows));
     }
 
     /// <summary>Route the flyout's WH_MOUSE_LL wheel event onto the Flow
@@ -212,7 +238,7 @@ public sealed partial class DashboardView : UserControl
     private const double FlowModelColumnWidth = 125;
     private const double FlowStateColumnWidth = 95;
 
-    private static FrameworkElement BuildFlowContent(IReadOnlyList<FlowTreeRowViewModel> rows)
+    private FrameworkElement BuildFlowContent(IReadOnlyList<FlowTreeRowViewModel> rows)
     {
         if (rows.Count == 0)
         {
@@ -222,10 +248,73 @@ public sealed partial class DashboardView : UserControl
         var panel = new StackPanel { Spacing = 6 };
         foreach (var row in rows)
         {
-            panel.Children.Add(BuildFlowRow(row));
+            panel.Children.Add(BuildFlowRowGroup(row));
         }
 
         return panel;
+    }
+
+    /// <summary>Task 15: a row's stable identity across refreshes — the row
+    /// DTOs themselves are rebuilt fresh from JSON on every fetch (no
+    /// object identity survives), so expand state (tracked on THIS
+    /// `UserControl` instance, not the row) is keyed by depth+kind+label,
+    /// the same triple the operator's own Flow tree design already treats
+    /// as "this is the same session/agent/job" (e.g. `tree::build_tree`'s
+    /// own dedup). Collisions are only theoretically possible (two
+    /// identically-titled live sessions at the same depth) and would at
+    /// worst share expand state, never crash or misrender.</summary>
+    private static string FlowRowKey(FlowTreeRowViewModel row) => $"{row.Depth}:{row.Kind}:{row.Label}";
+
+    /// <summary>One row PLUS its optional expanded detail beneath it — the
+    /// row itself becomes clickable (task 15: "clicking a session row
+    /// expands... click again collapses") only when
+    /// <see cref="FlowTreeRowViewModel.CanExpand"/> is true; a row with no
+    /// usage data renders exactly as before, un-clickable.</summary>
+    private FrameworkElement BuildFlowRowGroup(FlowTreeRowViewModel row)
+    {
+        var key = FlowRowKey(row);
+        var expanded = row.CanExpand && _expandedFlowRowKeys.Contains(key);
+
+        var group = new StackPanel { Spacing = 4 };
+        var rowGrid = BuildFlowRow(row, expanded);
+        if (row.CanExpand)
+        {
+            // A Grid with no Background is hit-test invisible outside its
+            // children in WinUI — Transparent (not null) is required for
+            // clicks anywhere in the row's whitespace to register, not just
+            // directly on the text runs.
+            rowGrid.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            rowGrid.Tapped += (_, _) => ToggleFlowRowExpanded(key);
+        }
+        group.Children.Add(rowGrid);
+        if (expanded)
+        {
+            group.Children.Add(BuildFlowRowDetail(row));
+        }
+        return group;
+    }
+
+    /// <summary>The 2-3 detail lines task 15 asks for, ONLY from honestly
+    /// transcript-derived fields (never the CC-internal System-tools/Skills
+    /// category breakdown — that's not on disk anywhere, so it's never
+    /// fabricated here). Indented to align under the title column's own
+    /// text start, one level deeper than the row's own indent.</summary>
+    private static FrameworkElement BuildFlowRowDetail(FlowTreeRowViewModel row)
+    {
+        var detail = new StackPanel { Spacing = 3, Margin = new Thickness(row.Depth > 0 ? 32 : 14, 0, 0, 4) };
+        if (!string.IsNullOrEmpty(row.DecompositionText))
+        {
+            detail.Children.Add(Ui.Dim(row.DecompositionText, 10));
+        }
+        if (!string.IsNullOrEmpty(row.TurnsAgeText))
+        {
+            detail.Children.Add(Ui.Dim(row.TurnsAgeText, 10));
+        }
+        if (row.ContextSeries is { Count: > 1 } series)
+        {
+            detail.Children.Add(Ui.Sparkline(series));
+        }
+        return detail;
     }
 
     /// <summary>One row = title | model | state·elapsed, at consistent
@@ -236,8 +325,10 @@ public sealed partial class DashboardView : UserControl
     /// indent margin) varies by <see cref="FlowTreeRowViewModel.Depth"/> —
     /// the model and state columns are separate, fixed-width `Grid`
     /// columns, so a child's indent never shifts them out of alignment
-    /// with its parent's.</summary>
-    private static Microsoft.UI.Xaml.Controls.Grid BuildFlowRow(FlowTreeRowViewModel row)
+    /// with its parent's. <paramref name="expanded"/> only changes the
+    /// disclosure chevron appended after the title (task 15) — the three
+    /// columns themselves are completely untouched either way.</summary>
+    private static Microsoft.UI.Xaml.Controls.Grid BuildFlowRow(FlowTreeRowViewModel row, bool expanded = false)
     {
         var grid = new Microsoft.UI.Xaml.Controls.Grid { ColumnSpacing = 8 };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -264,6 +355,15 @@ public sealed partial class DashboardView : UserControl
             VerticalAlignment = VerticalAlignment.Center,
         });
         titleCell.Children.Add(FlowTitleText(row));
+        if (row.CanExpand)
+        {
+            // Task 15: the only visual affordance that a row is clickable —
+            // deliberately reuses Dim's existing muted styling rather than
+            // introducing a new icon/accent color for this one glyph.
+            var chevron = Ui.Dim(expanded ? "▾" : "▸", 9);
+            chevron.VerticalAlignment = VerticalAlignment.Center;
+            titleCell.Children.Add(chevron);
+        }
         Microsoft.UI.Xaml.Controls.Grid.SetColumn(titleCell, 0);
         grid.Children.Add(titleCell);
 

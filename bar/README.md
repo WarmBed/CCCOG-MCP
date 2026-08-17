@@ -65,7 +65,7 @@ bar/
                              #   control, dispatch, graph, owners, refresh,
                              #     privacy, inbox — the CCCG dispatch-root
                              #     scanner/reducer this all grew from
-                             # (87 tests: lib + graph/parsers/refresh/usage
+                             # (92 tests: lib + graph/parsers/refresh/usage
                              # integration suites)
   crates/cccog-bar-quota    # provider quota agents behind an injected HTTP
                              # client: Codex local rollout rate_limits
@@ -201,7 +201,7 @@ full message content is never parsed, stored, or displayed.
 
 ```powershell
 cd bar
-cargo test --workspace                 # 151 tests across core/quota/ffi
+cargo test --workspace                 # 156 tests across core/quota/ffi
 cargo build --release --workspace      # produces target/release/cccog_bar_ffi.dll
 
 cd ..

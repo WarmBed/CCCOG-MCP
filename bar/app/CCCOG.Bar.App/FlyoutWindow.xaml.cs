@@ -1383,6 +1383,7 @@ internal static class NativeControlClient
                 ? contextPercentValue.GetDouble()
                 : null;
         var (contextText, contextTooltip) = FormatContextUsage(contextTokens, contextPercent);
+        var (canExpand, decompositionText, turnsAgeText, contextSeries) = ParseContextDetail(row);
 
         return new FlowTreeRowViewModel
         {
@@ -1397,7 +1398,56 @@ internal static class NativeControlClient
             DotOpacity = StatusVisual.Opacity(stateLabel),
             ContextText = contextText,
             ContextTooltip = contextTooltip,
+            CanExpand = canExpand,
+            DecompositionText = decompositionText,
+            TurnsAgeText = turnsAgeText,
+            ContextSeries = contextSeries,
         };
+    }
+
+    /// <summary>Task 15 (2026-08-18): the inline-expand detail — present
+    /// exactly when the wire's `contextDetail` object is (the row's
+    /// `CanExpand` gate). Parsed once here, at fetch time, same as every
+    /// other pre-formatted display string on this row — expanding a row is
+    /// then pure UI state with nothing left to compute.</summary>
+    private static (bool CanExpand, string? DecompositionText, string? TurnsAgeText, IReadOnlyList<long>? Series) ParseContextDetail(JsonElement row)
+    {
+        if (!row.TryGetProperty("contextDetail", out var detail) || detail.ValueKind != JsonValueKind.Object)
+        {
+            return (false, null, null, null);
+        }
+
+        long LongProp(string name) =>
+            detail.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetInt64() : 0;
+
+        var cached = LongProp("cachedTokens");
+        var fresh = LongProp("freshTokens");
+        var output = LongProp("outputTokens");
+        var turnCount = (int)LongProp("turnCount");
+        long? sessionAgeSeconds = detail.TryGetProperty("sessionAgeSeconds", out var ageValue) && ageValue.ValueKind == JsonValueKind.Number
+            ? ageValue.GetInt64()
+            : null;
+
+        var decompositionText = $"cached {FormatTokenCount(cached)} · fresh {FormatTokenCount(fresh)} · output {FormatTokenCount(output)}";
+        var turnLabel = turnCount == 1 ? "1 turn" : $"{turnCount} turns";
+        var turnsAgeText = sessionAgeSeconds is { } age
+            ? $"{turnLabel} · session age {FormatTreeElapsed(age)}"
+            : turnLabel;
+
+        List<long>? series = null;
+        if (detail.TryGetProperty("series", out var seriesValue) && seriesValue.ValueKind == JsonValueKind.Array)
+        {
+            series = new List<long>();
+            foreach (var point in seriesValue.EnumerateArray())
+            {
+                if (point.ValueKind == JsonValueKind.Number)
+                {
+                    series.Add(point.GetInt64());
+                }
+            }
+        }
+
+        return (true, decompositionText, turnsAgeText, series);
     }
 
     private static string? String(JsonElement row, string name) =>

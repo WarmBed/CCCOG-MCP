@@ -156,4 +156,42 @@ public static class Ui
         });
         return track;
     }
+
+    /// <summary>Task 15 (2026-08-18): a small inline polyline for the
+    /// context-growth sparkline — "reuse the gauge/Ui.cs visual language, no
+    /// new chart library" (operator instruction), so this reuses
+    /// <see cref="GaugeBar"/>'s own muted-track gray and <see cref="Dim"/>'s
+    /// 0.6-opacity convention rather than a new palette. Points are
+    /// normalized to the series' own min/max — a flat series (min == max)
+    /// still draws a flat centered line rather than dividing by zero.
+    /// Fewer than 2 points draws nothing (a single point has no trend to
+    /// show).</summary>
+    public static FrameworkElement Sparkline(IReadOnlyList<long> values, double width = 160, double height = 20)
+    {
+        var canvas = new Microsoft.UI.Xaml.Controls.Grid { Width = width, Height = height };
+        if (values.Count < 2)
+        {
+            return canvas;
+        }
+        var min = values.Min();
+        var max = values.Max();
+        var range = max - min;
+        var points = new Microsoft.UI.Xaml.Media.PointCollection();
+        for (var i = 0; i < values.Count; i++)
+        {
+            var x = width * i / (values.Count - 1);
+            var normalized = range == 0 ? 0.5 : (double)(values[i] - min) / range;
+            var y = height - normalized * height;
+            points.Add(new Windows.Foundation.Point(x, y));
+        }
+        var polyline = new Polyline
+        {
+            Points = points,
+            Stroke = new SolidColorBrush(Color.FromArgb(153, 128, 128, 128)), // ~0.6 opacity gray, matching Dim's convention
+            StrokeThickness = 1.5,
+            StrokeLineJoin = Microsoft.UI.Xaml.Media.PenLineJoin.Round,
+        };
+        canvas.Children.Add(polyline);
+        return canvas;
+    }
 }

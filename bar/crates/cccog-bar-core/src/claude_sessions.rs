@@ -136,24 +136,28 @@ pub struct ParsedEvent {
     pub usage: Option<UsageTokens>,
 }
 
-/// The three prompt-side token counts a Claude Code `message.usage` object
+/// The prompt-side token counts a Claude Code `message.usage` object
 /// carries — `input_tokens` (the genuinely new tokens this turn) plus both
 /// cache buckets (`cache_read_input_tokens`: served from Anthropic's
-/// prompt cache; `cache_creation_input_tokens`: newly written into it).
-/// `output_tokens` is deliberately NOT part of this struct — task 14 asks
-/// specifically for prompt/CONTEXT size (what's currently occupying the
-/// model's context window), not the turn's own reply length, which is a
-/// separate, much smaller number that doesn't accumulate the same way.
+/// prompt cache; `cache_creation_input_tokens`: newly written into it) —
+/// plus, since task 15's inline-expand decomposition needs it,
+/// `output_tokens` (the turn's own reply length). `output_tokens` is
+/// still deliberately excluded from [`total`](Self::total) — task 14's own
+/// reasoning stands: it's not part of what's currently occupying the
+/// model's context window, a separate, much smaller number that doesn't
+/// accumulate the same way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageTokens {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl UsageTokens {
     /// The single number Claude Code's own context panel shows: everything
-    /// currently occupying the context window for this turn.
+    /// currently occupying the context window for this turn. Deliberately
+    /// excludes `output_tokens` — see the struct's own doc comment.
     pub fn total(&self) -> u64 {
         self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
     }
@@ -198,6 +202,8 @@ struct RawUsage {
     cache_read_tokens: u64,
     #[serde(default, rename = "cache_creation_input_tokens")]
     cache_creation_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 /// Parse one JSONL line. `None` for a blank line or invalid JSON — the
@@ -216,6 +222,7 @@ pub fn parse_line(line: &str) -> Option<ParsedEvent> {
         input_tokens: usage.input_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
+        output_tokens: usage.output_tokens,
     });
     let cross_session_tag = raw
         .message
@@ -404,6 +411,10 @@ pub struct AgentSummary {
     /// the same treatment as the parent session.
     pub context_tokens: Option<u64>,
     pub context_percent: Option<f64>,
+    /// Task 15: this agent's own inline-expand detail — see
+    /// [`ContextDetail`]. `None` under the exact same condition as
+    /// `context_tokens` being `None` (no usage-carrying event at all).
+    pub context_detail: Option<ContextDetail>,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +449,74 @@ pub struct SessionSummary {
     /// `context_tokens` is `None` OR the model is unrecognized; never a
     /// guessed/estimated window.
     pub context_percent: Option<f64>,
+    /// Task 15 (2026-08-18): everything the inline-expand UI needs beyond
+    /// the `context_tokens`/`context_percent` roll-up above — see
+    /// [`ContextDetail`]. `None` under the exact same condition as
+    /// `context_tokens` being `None`, so "no usage data, this row can't
+    /// expand" is a single check on the caller's side.
+    pub context_detail: Option<ContextDetail>,
+}
+
+/// Task 15: the inline-expand detail for one session/agent row — a
+/// three-way token split of the LATEST usage-carrying event (matching
+/// Claude Code's own context-panel language: "cached" = served from the
+/// prompt cache, `cache_read_tokens`; "fresh" = newly processed this turn,
+/// `input_tokens + cache_creation_tokens` — a cache WRITE is still
+/// freshly-processed input, just newly cached for next time; "output" =
+/// the turn's own reply length, `output_tokens`, genuinely separate from
+/// context occupancy and never summed into cached+fresh), a turn count,
+/// the session's own age, and a bounded per-turn context-total series for
+/// the sparkline. Every field here is honestly derived straight from
+/// transcript `message.usage` objects — never the CC-internal
+/// System-tools/Skills category breakdown, which isn't on disk anywhere.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContextDetail {
+    pub cached_tokens: u64,
+    pub fresh_tokens: u64,
+    pub output_tokens: u64,
+    /// Count of usage-carrying (assistant) events — "N turns" counts turns
+    /// that actually produced a reply with usage, not every line in the
+    /// file.
+    pub turn_count: u32,
+    /// The EARLIEST event's own timestamp anywhere in the transcript (any
+    /// event type, not just usage-carrying ones — a session starts at its
+    /// first message, before any assistant reply exists). `None` only if
+    /// no event anywhere in the transcript carried a timestamp at all (not
+    /// observed in practice on real transcripts).
+    pub session_started_at: Option<DateTime<Utc>>,
+    /// Per-turn TOTAL context (cached+fresh, i.e. each usage-carrying
+    /// event's own `UsageTokens::total()`) in chronological order, bounded
+    /// to the most recent [`CONTEXT_SERIES_MAX_POINTS`] — the sparkline's
+    /// raw data, never fabricated or interpolated between real turns.
+    pub series: Vec<u64>,
+}
+
+/// Task 15: the sparkline is explicitly a RECENT-trend indicator, not a
+/// full-session archive — bounding it keeps both the wire payload and the
+/// rendered polyline's point count small regardless of how long a session
+/// has been running.
+const CONTEXT_SERIES_MAX_POINTS: usize = 50;
+
+/// Builds one row's [`ContextDetail`] from its own (already
+/// alive-window-filtered) events. `None` under the identical condition
+/// [`latest_context_usage`] returns `(None, None)` for — no usage-carrying
+/// event anywhere in `events`.
+fn build_context_detail(events: &[ParsedEvent]) -> Option<ContextDetail> {
+    let usage_events: Vec<&ParsedEvent> = events.iter().filter(|event| event.usage.is_some()).collect();
+    let usage = usage_events.last()?.usage?;
+    let session_started_at = events.iter().filter_map(|event| event.timestamp).min();
+    let mut series: Vec<u64> = usage_events.iter().filter_map(|event| event.usage).map(|usage| usage.total()).collect();
+    if series.len() > CONTEXT_SERIES_MAX_POINTS {
+        series = series.split_off(series.len() - CONTEXT_SERIES_MAX_POINTS);
+    }
+    Some(ContextDetail {
+        cached_tokens: usage.cache_read_tokens,
+        fresh_tokens: usage.input_tokens + usage.cache_creation_tokens,
+        output_tokens: usage.output_tokens,
+        turn_count: usage_events.len() as u32,
+        session_started_at,
+        series,
+    })
 }
 
 /// One subagent transcript, ready to summarize — `meta_json` is the sidecar
@@ -567,6 +646,7 @@ fn build_session_summary_impl(
 
     let model = events.iter().rev().find_map(|event| event.model.clone());
     let (context_tokens, context_percent) = latest_context_usage(&events);
+    let context_detail = build_context_detail(&events);
 
     let inbound_edges = events
         .iter()
@@ -590,6 +670,7 @@ fn build_session_summary_impl(
         }
         let agent_model = agent.events.iter().rev().find_map(|event| event.model.clone());
         let (agent_context_tokens, agent_context_percent) = latest_context_usage(&agent.events);
+        let agent_context_detail = build_context_detail(&agent.events);
         let label = agent
             .meta_json
             .as_deref()
@@ -605,6 +686,7 @@ fn build_session_summary_impl(
             label,
             context_tokens: agent_context_tokens,
             context_percent: agent_context_percent,
+            context_detail: agent_context_detail,
         });
     }
 
@@ -620,6 +702,7 @@ fn build_session_summary_impl(
         inbound_edges,
         context_tokens,
         context_percent,
+        context_detail,
     })
 }
 
@@ -1518,6 +1601,109 @@ mod tests {
         assert_eq!(summary.agents[0].context_tokens, Some(50_000));
         let percent = summary.agents[0].context_percent.expect("claude-opus-4 has a known 200k window");
         assert!((percent - 25.0).abs() < 1e-9, "50_000 / 200_000 * 100 == 25.0, got {percent}");
+    }
+
+    /// Task 15: the inline-expand decomposition — "cached" is exactly
+    /// `cache_read_tokens`, "fresh" is `input_tokens + cache_creation_tokens`
+    /// (a cache WRITE is still freshly-processed input), "output" is the
+    /// separate `output_tokens` figure. All three come from the LATEST
+    /// usage-carrying event only, same as `context_tokens` itself — an
+    /// earlier turn's numbers must not leak in.
+    #[test]
+    fn context_detail_decomposes_cached_fresh_output_from_the_latest_turn_only() {
+        let content = transcript(&[
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:50:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":999,"cache_read_input_tokens":999,"cache_creation_input_tokens":999,"output_tokens":999}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":10000,"cache_read_input_tokens":340000,"cache_creation_input_tokens":5000,"output_tokens":6000}}}"#,
+        ]);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        let detail = summary.context_detail.expect("two usage-carrying events must produce a detail");
+        assert_eq!(detail.cached_tokens, 340_000, "cached == cache_read_tokens of the LATEST event");
+        assert_eq!(detail.fresh_tokens, 15_000, "fresh == input_tokens(10000) + cache_creation_tokens(5000) of the LATEST event");
+        assert_eq!(detail.output_tokens, 6_000);
+    }
+
+    /// "N turns" counts usage-carrying (assistant) events only, never every
+    /// line in the transcript; "session age" is measured from the
+    /// EARLIEST event of ANY kind (a session starts at its first message,
+    /// which is typically a user line with no usage at all) — not from the
+    /// first usage-carrying event.
+    #[test]
+    fn context_detail_turn_count_and_session_age_span_the_whole_transcript() {
+        let content = transcript(&[
+            // Session actually started 2 hours before NOW, with a plain
+            // user line (no usage) — session age must reflect THIS, not
+            // the first assistant turn below.
+            r#"{"type":"user","timestamp":"2026-08-16T10:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:50:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:55:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+        ]);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        let detail = summary.context_detail.unwrap();
+        assert_eq!(detail.turn_count, 3, "only the 3 usage-carrying assistant lines count as turns");
+        assert_eq!(detail.session_started_at, Some(at("2026-08-16T10:00:00Z")), "session age is measured from the first event of ANY kind, including the usage-less user line");
+    }
+
+    /// The sparkline series is a RECENT-trend indicator, never a full
+    /// archive — bounded to the last `CONTEXT_SERIES_MAX_POINTS` (50)
+    /// points, and must keep the MOST RECENT ones (not the first 50) in
+    /// chronological order.
+    #[test]
+    fn context_detail_series_is_bounded_to_the_most_recent_50_points_in_order() {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..60u64 {
+            let minute = i; // 0..60, all within the same hour, strictly increasing
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-08-16T10:{minute:02}:00Z","message":{{"model":"claude-sonnet-5","usage":{{"input_tokens":{i},"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}}}}"#
+            ));
+        }
+        // The final, alive-within-window turn, so the session itself
+        // qualifies as alive against `NOW`.
+        lines.push(r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":9999,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}"#.to_owned());
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let content = transcript(&refs);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        let detail = summary.context_detail.unwrap();
+        assert_eq!(detail.turn_count, 61, "turn_count is NOT bounded — every real usage-carrying event counts");
+        assert_eq!(detail.series.len(), 50, "the SERIES is bounded to 50 points even though there were 61 turns");
+        // The kept points must be the most recent 50: minutes 11..59 (49
+        // points, values 11..59) plus the final 9999 turn — never the
+        // oldest 50 (which would start at value 0).
+        assert_eq!(detail.series.first(), Some(&11), "the OLDEST retained point must be turn #11 (0-indexed), not turn #0");
+        assert_eq!(detail.series.last(), Some(&9999), "the newest point must be the final turn");
+    }
+
+    /// Mirrors task 14's `context_usage_is_absent_when_no_event_ever_carried_usage`
+    /// — a row with no usage data at all must not expose a detail either
+    /// (this is what "rows without usage data don't expand" is built on,
+    /// on the C# side).
+    #[test]
+    fn context_detail_is_none_when_no_event_ever_carried_usage() {
+        let content = transcript(&[
+            r#"{"type":"user","timestamp":"2026-08-16T11:59:00Z","message":{"role":"user","content":"hi"}}"#,
+        ]);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert_eq!(summary.context_detail, None);
+    }
+
+    /// A subagent's own detail is derived purely from its own transcript,
+    /// independent of the parent's (here the parent has none at all).
+    #[test]
+    fn agent_context_detail_is_independent_of_the_parent_session() {
+        let content = transcript(&[
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5"}}"#,
+        ]);
+        let agent = transcript(&[
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-08-16T11:58:00Z","message":{"model":"claude-opus-4","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":0,"output_tokens":50}}}"#,
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-08-16T11:58:30Z","message":{"model":"claude-opus-4","usage":{"input_tokens":150,"cache_read_input_tokens":250,"cache_creation_input_tokens":0,"output_tokens":60}}}"#,
+        ]);
+        let subagents = vec![SubagentInput { agent_id: "a1", content: &agent, meta_json: None }];
+        let summary = build_session_summary("slug", "s1", &content, &subagents, at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert_eq!(summary.context_detail, None, "the parent's own transcript never carried usage");
+        let agent_detail = summary.agents[0].context_detail.clone().expect("the agent's own transcript did carry usage");
+        assert_eq!(agent_detail.turn_count, 2);
+        assert_eq!(agent_detail.cached_tokens, 250, "the LATEST agent turn's cache_read_tokens");
+        assert_eq!(agent_detail.series, vec![300, 400], "chronological per-turn totals: 100+200, 150+250");
     }
 
     #[test]
