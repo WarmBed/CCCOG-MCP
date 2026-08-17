@@ -129,6 +129,34 @@ pub struct ParsedEvent {
     /// when `cross_session_from_name` is `None`; always `false` in that
     /// case.
     pub cross_session_is_dispatch_marker: bool,
+    /// Task 14 (2026-08-18): `message.usage` on an assistant line — the
+    /// prompt-side token counts (`input_tokens` + both cache buckets) that
+    /// make up that turn's total CONTEXT occupancy. `None` on every other
+    /// line shape (user/tool/bookkeeping lines never carry `usage`).
+    pub usage: Option<UsageTokens>,
+}
+
+/// The three prompt-side token counts a Claude Code `message.usage` object
+/// carries — `input_tokens` (the genuinely new tokens this turn) plus both
+/// cache buckets (`cache_read_input_tokens`: served from Anthropic's
+/// prompt cache; `cache_creation_input_tokens`: newly written into it).
+/// `output_tokens` is deliberately NOT part of this struct — task 14 asks
+/// specifically for prompt/CONTEXT size (what's currently occupying the
+/// model's context window), not the turn's own reply length, which is a
+/// separate, much smaller number that doesn't accumulate the same way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTokens {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+impl UsageTokens {
+    /// The single number Claude Code's own context panel shows: everything
+    /// currently occupying the context window for this turn.
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -151,6 +179,25 @@ struct RawMessage {
     model: Option<String>,
     #[serde(default)]
     content: Option<Value>,
+    #[serde(default)]
+    usage: Option<RawUsage>,
+}
+
+/// Field names confirmed against real transcript lines on this machine
+/// (`grep '"usage":{"input_tokens' *.jsonl`): `{"input_tokens":2,
+/// "cache_creation_input_tokens":42444,"cache_read_input_tokens":43926,
+/// "output_tokens":346,...}` — no separate "max"/"window"/"context_limit"
+/// field anywhere near `usage` or `model` in any real event inspected, so
+/// the per-model context-window size (task 14) is a hardcoded lookup
+/// table, not read from the transcript.
+#[derive(Debug, Deserialize, Default)]
+struct RawUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default, rename = "cache_read_input_tokens")]
+    cache_read_tokens: u64,
+    #[serde(default, rename = "cache_creation_input_tokens")]
+    cache_creation_tokens: u64,
 }
 
 /// Parse one JSONL line. `None` for a blank line or invalid JSON — the
@@ -165,6 +212,11 @@ pub fn parse_line(line: &str) -> Option<ParsedEvent> {
     let raw: RawLine = serde_json::from_str(trimmed).ok()?;
     let timestamp = raw.timestamp.as_deref().and_then(parse_rfc3339);
     let model = raw.message.as_ref().and_then(|message| message.model.clone());
+    let usage = raw.message.as_ref().and_then(|message| message.usage.as_ref()).map(|usage| UsageTokens {
+        input_tokens: usage.input_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+    });
     let cross_session_tag = raw
         .message
         .as_ref()
@@ -186,6 +238,7 @@ pub fn parse_line(line: &str) -> Option<ParsedEvent> {
         custom_title,
         cross_session_from_name,
         cross_session_is_dispatch_marker,
+        usage,
     })
 }
 
@@ -346,6 +399,11 @@ pub struct AgentSummary {
     /// `description` field when present, else `agent-{index}` (1-based,
     /// caller-assigned so it is stable/deterministic per scan).
     pub label: String,
+    /// Task 14: this agent's own latest-turn context occupancy — subagent
+    /// transcripts carry the identical `message.usage` shape, so they get
+    /// the same treatment as the parent session.
+    pub context_tokens: Option<u64>,
+    pub context_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +426,18 @@ pub struct SessionSummary {
     pub last_event_at: DateTime<Utc>,
     pub agents: Vec<AgentSummary>,
     pub inbound_edges: Vec<InboundEdge>,
+    /// Task 14 (2026-08-18): this session's latest-turn context occupancy
+    /// — the sum of the newest `message.usage`-carrying event's
+    /// `input_tokens` + both cache buckets, i.e. exactly what Claude
+    /// Code's own context panel shows as "used" right now. `None` when no
+    /// event in the (possibly windowed/tailed) transcript ever carried
+    /// usage at all.
+    pub context_tokens: Option<u64>,
+    /// `context_tokens` as a percent of that event's own model's known
+    /// context window (see `context_window_for_model`) — `None` whenever
+    /// `context_tokens` is `None` OR the model is unrecognized; never a
+    /// guessed/estimated window.
+    pub context_percent: Option<f64>,
 }
 
 /// One subagent transcript, ready to summarize — `meta_json` is the sidecar
@@ -496,6 +566,7 @@ fn build_session_summary_impl(
     let title_key = leading_key(&title);
 
     let model = events.iter().rev().find_map(|event| event.model.clone());
+    let (context_tokens, context_percent) = latest_context_usage(&events);
 
     let inbound_edges = events
         .iter()
@@ -518,6 +589,7 @@ fn build_session_summary_impl(
             continue; // this particular agent isn't alive — invisible, even though the session itself is
         }
         let agent_model = agent.events.iter().rev().find_map(|event| event.model.clone());
+        let (agent_context_tokens, agent_context_percent) = latest_context_usage(&agent.events);
         let label = agent
             .meta_json
             .as_deref()
@@ -531,6 +603,8 @@ fn build_session_summary_impl(
             model: agent_model,
             last_event_at: agent_last_event,
             label,
+            context_tokens: agent_context_tokens,
+            context_percent: agent_context_percent,
         });
     }
 
@@ -544,7 +618,43 @@ fn build_session_summary_impl(
         last_event_at,
         agents,
         inbound_edges,
+        context_tokens,
+        context_percent,
     })
+}
+
+/// Task 14: per-model context-window size, hardcoded (see `RawUsage`'s doc
+/// comment for why — no transcript-carried max was found on this machine).
+/// Matched by substring against the lowercased model string since the exact
+/// form varies ("claude-sonnet-5", "sonnet-5", "claude-fable-5", ...).
+/// Unknown/unmatched models return `None` — task 14's own instruction: "if
+/// unknown model, emit tokens only, no percent," never a guessed window.
+fn context_window_for_model(model: &str) -> Option<u64> {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("opus") {
+        Some(200_000)
+    } else if lower.contains("fable") || lower.contains("sonnet") {
+        Some(1_000_000)
+    } else {
+        None
+    }
+}
+
+/// The latest event carrying `usage` (scanning from the end — same "last
+/// one wins" convention as title/model resolution above) — its token
+/// total, and, only when that SAME event's own model resolves to a known
+/// context window, the resulting percent. `(None, None)` when nothing in
+/// this slice ever carried usage (no assistant turns yet, or all outside
+/// the tail window read).
+fn latest_context_usage(events: &[ParsedEvent]) -> (Option<u64>, Option<f64>) {
+    let Some(event) = events.iter().rev().find(|event| event.usage.is_some()) else {
+        return (None, None);
+    };
+    let tokens = event.usage.map(|usage| usage.total());
+    let percent = tokens
+        .zip(event.model.as_deref().and_then(context_window_for_model))
+        .and_then(|(tokens, window)| if window == 0 { None } else { Some((tokens as f64 / window as f64) * 100.0) });
+    (tokens, percent)
 }
 
 /// Lowercased leading run of ASCII alphanumerics — `"Doc1 主管"` → `"doc1"`,
@@ -1348,6 +1458,66 @@ mod tests {
         let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
         assert_eq!(summary.inbound_edges.len(), 1);
         assert_eq!(summary.inbound_edges[0].from_name, "doc1主管");
+    }
+
+    /// Task 14: the newest usage-carrying event wins, matching the same
+    /// "last one wins" convention as title/model resolution — an earlier
+    /// assistant turn's usage must not leak through once a later one exists.
+    #[test]
+    fn context_usage_reflects_the_newest_usage_carrying_event() {
+        let content = transcript(&[
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:50:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":9,"cache_read_input_tokens":1,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50}}}"#,
+        ]);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert_eq!(summary.context_tokens, Some(350), "must be the LATEST event's total (100+200+50), not the earlier one's 10");
+        let percent = summary.context_percent.expect("claude-sonnet-5 has a known 1M window");
+        assert!((percent - 0.035).abs() < 1e-9, "350 / 1_000_000 * 100 == 0.035, got {percent}");
+    }
+
+    /// Task 14's own instruction: an unrecognized model must never guess a
+    /// window — tokens are still reported (a real number, honestly derived),
+    /// but the percent is `None`, not an invented one.
+    #[test]
+    fn context_usage_on_an_unknown_model_reports_tokens_only_no_percent() {
+        let content = transcript(&[
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"some-future-model-9","usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":0}}}"#,
+        ]);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert_eq!(summary.context_tokens, Some(15));
+        assert_eq!(summary.context_percent, None, "unrecognized model must never guess a window");
+    }
+
+    /// A session that never had an assistant `usage` object at all (pure
+    /// user/bookkeeping lines, or a subagent that hasn't produced its first
+    /// assistant turn yet) must render nothing, not a fabricated 0.
+    #[test]
+    fn context_usage_is_absent_when_no_event_ever_carried_usage() {
+        let content = transcript(&[
+            r#"{"type":"user","timestamp":"2026-08-16T11:59:00Z","message":{"role":"user","content":"hi"}}"#,
+        ]);
+        let summary = build_session_summary("slug", "s1", &content, &[], at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert_eq!(summary.context_tokens, None);
+        assert_eq!(summary.context_percent, None);
+    }
+
+    /// Task 14: subagent transcripts carry the identical `message.usage`
+    /// shape and must resolve to the SAME per-agent fields, independent of
+    /// the parent session's own (here, entirely absent) usage.
+    #[test]
+    fn agent_row_carries_its_own_context_usage() {
+        let content = transcript(&[
+            r#"{"type":"assistant","timestamp":"2026-08-16T11:59:00Z","message":{"model":"claude-sonnet-5"}}"#,
+        ]);
+        let agent = transcript(&[
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-08-16T11:58:30Z","message":{"model":"claude-opus-4","usage":{"input_tokens":40000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":0}}}"#,
+        ]);
+        let subagents = vec![SubagentInput { agent_id: "a1", content: &agent, meta_json: None }];
+        let summary = build_session_summary("slug", "s1", &content, &subagents, at(NOW), CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        assert_eq!(summary.context_tokens, None, "the parent's own transcript never carried usage");
+        assert_eq!(summary.agents[0].context_tokens, Some(50_000));
+        let percent = summary.agents[0].context_percent.expect("claude-opus-4 has a known 200k window");
+        assert!((percent - 25.0).abs() < 1e-9, "50_000 / 200_000 * 100 == 25.0, got {percent}");
     }
 
     #[test]

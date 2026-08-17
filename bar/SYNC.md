@@ -1985,3 +1985,127 @@ hook's callback can no longer be delayed by it. The measured 18%→11% CPU
 reduction plus this structural fix together represent the actual
 deliverable; "well under 5%" specifically was not reached, disclosed here
 rather than rounded away.
+
+## 2026-08-18 task 14: per-session context-usage display ("ctx 36%")
+
+Operator wants Flow rows to show current context-window occupancy, the way
+Claude Code's own context panel does (`355.4k/1M = 36%`). Source: each
+assistant transcript line carries `message.usage` — confirmed against this
+coordinator session's own transcript
+(`70d73719-....jsonl`, `grep '"usage":{"input_tokens'`):
+`{"input_tokens":2,"cache_creation_input_tokens":42444,
+"cache_read_input_tokens":43926,"output_tokens":346,...}`. A follow-up grep
+for a "context"/max-window field anywhere near `model`/`usage` in the same
+file found nothing — no on-disk source for the model's own window size, so
+per-model window is a hardcoded lookup table (task 14's own instruction:
+"if unknown model, emit tokens only, no percent" rather than guess).
+
+### `cccog-bar-core::claude_sessions`
+
+`parse_line` now also extracts `message.usage` into a new `UsageTokens
+{ input_tokens, cache_read_tokens, cache_creation_tokens }` on
+`ParsedEvent` — deliberately NOT `output_tokens` (task 14 asks for
+prompt/CONTEXT occupancy, not the turn's own reply length, a much smaller,
+non-accumulating number). `SessionSummary`/`AgentSummary` each gained
+`context_tokens: Option<u64>` / `context_percent: Option<f64>`, filled by
+`latest_context_usage`: the NEWEST usage-carrying event wins (same
+"last one wins" convention title/model resolution already used), its
+token total is `context_tokens`, and — only when that SAME event's own
+`model` resolves via `context_window_for_model` (substring match:
+`opus`→200_000, `fable`/`sonnet`→1_000_000, else `None`) — the resulting
+percent. Both `build_session_summary` (raw-content path) and
+`build_session_summary_from_events` (task 12's incremental-cache path)
+go through the same `build_session_summary_impl`, so the per-file cache
+never has to re-derive this differently depending on which entry point
+fed it.
+
+`cccog-bar-core::tree::TreeRow` carries the same two fields through
+(`#[serde(rename_all = "camelCase")]` → wire names `contextTokens`/
+`contextPercent`, automatic — no FFI-layer change needed since
+`cccog-bar-ffi` serializes `TreeRow` directly). Dropped `Eq` from
+`TreeRow`'s derive (kept `PartialEq`) since `f64` doesn't implement it —
+confirmed via grep that nothing relied on `TreeRow: Eq`. Only the
+controller/agent/session construction sites carry real values; the
+dispatch-job/terminal/owner-lease rows get `None`/`None` (a dispatch job
+has no `message.usage` shape at all).
+
+4 new fixtures in `claude_sessions.rs`:
+`context_usage_reflects_the_newest_usage_carrying_event` (an earlier
+lower-usage event must not leak through once a later one exists),
+`context_usage_on_an_unknown_model_reports_tokens_only_no_percent`,
+`context_usage_is_absent_when_no_event_ever_carried_usage` (renders
+nothing, never a fabricated `ctx 0%`), `agent_row_carries_its_own_context_usage`
+(a subagent's own usage is independent of the parent's — here the parent
+has none at all while the agent does).
+
+### C# — `ctx 36%` / `ctx 355k` in the state column
+
+`FlyoutWindow.ToRow` reads `contextTokens`/`contextPercent` off the wire
+and pre-formats them (`FormatContextUsage`) into `ContextText` +
+`ContextTooltip` on `FlowTreeRowViewModel` — same "compute the display
+string once, at parse time" pattern `FormatTreeElapsed` already used for
+`ElapsedText`. `ctx {percent:0}%` when the model's window is known, else
+`ctx {tokens}` (`FormatTokenCount`: `355.4k`/`1M`/plain integer under
+1,000). The tooltip (`355.4k tokens (36% of 1M)`) reverse-derives the
+window from `tokens / (percent/100)` — the wire only carries the two
+numbers, and since percent always comes from one of the two fixed lookup
+values, the reversed window rounds back to a clean `1M`/`200k`. `(null,
+null)` when the row never carried usage — dispatch-job/terminal/owner
+rows, or a session/agent transcript with no assistant turn yet — so the
+caller renders nothing.
+
+`DashboardView.BuildFlowRow`: the state column (Grid column 2) changed
+from a single `TextBlock` to a small horizontal `StackPanel` holding the
+existing state/elapsed text plus, only when `ContextText` is non-empty, a
+second equally-dim (`Ui.Text(..., 10, 0.62)`) run carrying the tooltip —
+task 14's own instruction ("tooltip on it") meant the tooltip belongs on
+the ctx run specifically, not the whole cell, which is why this couldn't
+stay a single concatenated string. Column count/widths — the thing "do
+not disturb the three-column alignment" was actually protecting —
+untouched; this only changes what's inside column 2's own cell.
+
+### A footgun re-confirmed the hard way: `dotnet build -c Release` does NOT rebuild the Rust release DLL
+
+First live-verification pass showed the flyout with NO `ctx` text at all
+despite the debug CLI (`cccog-bar --control`, rebuilt via `cargo build
+--workspace`) proving `contextTokens`/`contextPercent` were correctly
+populated in the live data. Root cause: `target/release/cccog_bar_ffi.dll`
+was still the PRE-task-14 build (timestamp from earlier in the session) —
+`dotnet build -c Release -p:Platform=x64` only COPIES whatever's already
+in `target/release` (README.md's own build section already documents this
+two-step sequence; this task just re-learned it by hitting the stale-DLL
+symptom directly instead of reading the doc first). Fix: `cargo build
+--release --workspace` (51s) before the C# rebuild — which then hit the
+DLL file lock from the still-running old process (`MSB3021`/copy retry
+storm against PID 41504); killed it, rebuilt clean.
+
+### Live verification
+
+Fresh launch, UI Automation dump of the flyout's real rendered text (via
+`AutomationElement.FromHandle` + `TreeWalker.ContentViewWalker`, not a
+screenshot — this environment's screenshot path is known-unreliable):
+
+```
+CCCG開發        (claude · fable-5)   執行中 · 0s   ctx 39%
+Add Claude session liveness to Flow (agent · sonnet-5) 執行中 · 0s ctx 16%
+doc5 Api文件檢查 (claude · sonnet-5)  閒置 · 3m    ctx 92%
+Doc1 主管       (claude · fable-5)   閒置 · 6m    ctx 90%
+doc2 api-gateway上線 (claude · sonnet-5) 閒置 · 6m ctx 73%
+codex ×60       terminal
+grok ×34        terminal
+```
+
+Also confirms the FYI from the task-14 dispatch itself: with
+`flow.coordinators=["Doc1 主管"]` now set, "Doc1 主管" renders at
+top-level (depth 0, same indentation as the other three controller rows)
+— the earlier doc2-nesting inversion is gone, no further action needed.
+`codex ×60`/`grok ×34` are task 16's known, not-yet-fixed bug (still
+showing all-time counts); untouched by this task.
+
+### Gates
+
+`cargo test --workspace`: 151 tests green (core crate 69 lib + 5 graph +
+4 parsers + 4 refresh + 5 usage = 87, +4 net from this task's fixtures;
+quota 30 and ffi 34 unchanged). `dotnet build -c Release -p:Platform=x64`:
+0 warnings, 0 errors (after the release-DLL rebuild above). No
+`bar-crash.log` growth across the whole task. Commit + push authorized.

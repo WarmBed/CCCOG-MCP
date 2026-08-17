@@ -1374,6 +1374,15 @@ internal static class NativeControlClient
             && elapsedValue.ValueKind == JsonValueKind.Number
                 ? elapsedValue.GetInt64()
                 : null;
+        long? contextTokens = row.TryGetProperty("contextTokens", out var contextTokensValue)
+            && contextTokensValue.ValueKind == JsonValueKind.Number
+                ? contextTokensValue.GetInt64()
+                : null;
+        double? contextPercent = row.TryGetProperty("contextPercent", out var contextPercentValue)
+            && contextPercentValue.ValueKind == JsonValueKind.Number
+                ? contextPercentValue.GetDouble()
+                : null;
+        var (contextText, contextTooltip) = FormatContextUsage(contextTokens, contextPercent);
 
         return new FlowTreeRowViewModel
         {
@@ -1386,6 +1395,8 @@ internal static class NativeControlClient
             Pulse = pulse,
             ElapsedText = FormatTreeElapsed(elapsedSeconds),
             DotOpacity = StatusVisual.Opacity(stateLabel),
+            ContextText = contextText,
+            ContextTooltip = contextTooltip,
         };
     }
 
@@ -1412,5 +1423,47 @@ internal static class NativeControlClient
         return span < TimeSpan.FromHours(1)
             ? $"{(int)span.TotalMinutes}m"
             : $"{(int)span.TotalHours}h{(int)span.TotalMinutes % 60:00}m";
+    }
+
+    /// <summary>Task 14 (2026-08-18): "ctx 36%" when the session/agent's
+    /// latest-turn model resolves to a known context window, else
+    /// "ctx 355k" (tokens only — never a guessed window, matching
+    /// `cccog-bar-core::claude_sessions::context_window_for_model`'s own
+    /// "unknown model, emit tokens only" rule). `(null, null)` when the row
+    /// never carried usage at all — dispatch-job/terminal/owner rows, or a
+    /// session/agent whose transcript has no assistant turn yet — so the
+    /// caller renders nothing rather than a fabricated "ctx 0%".
+    /// <para>The tooltip is reverse-derived from tokens+percent (the wire
+    /// only carries those two numbers): `window = tokens / (percent/100)`,
+    /// which — since percent always comes from one of the fixed lookup
+    /// values (200k/1M) — rounds back to a clean number.</para></summary>
+    private static (string? Text, string? Tooltip) FormatContextUsage(long? tokens, double? percent)
+    {
+        if (tokens is not { } tokenCount || tokenCount < 0)
+        {
+            return (null, null);
+        }
+        var tokensLabel = FormatTokenCount(tokenCount);
+        if (percent is not { } pct || pct <= 0)
+        {
+            return ($"ctx {tokensLabel}", $"{tokensLabel} tokens");
+        }
+        var windowLabel = FormatTokenCount((long)Math.Round(tokenCount / (pct / 100.0)));
+        return ($"ctx {pct:0}%", $"{tokensLabel} tokens ({pct:0}% of {windowLabel})");
+    }
+
+    /// <summary>"355.4k" / "1M" / "820" — one decimal place, trimmed when
+    /// it's a whole number ("1M" not "1.0M").</summary>
+    private static string FormatTokenCount(long tokens)
+    {
+        if (tokens >= 1_000_000)
+        {
+            return $"{tokens / 1_000_000.0:0.#}M";
+        }
+        if (tokens >= 1_000)
+        {
+            return $"{tokens / 1_000.0:0.#}k";
+        }
+        return tokens.ToString();
     }
 }

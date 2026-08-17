@@ -51,7 +51,7 @@ pub const IDLE_STATE: &str = "閒置";
 pub const RESUMABLE_STATE: &str = "resumable";
 pub const TERMINAL_STATE: &str = "terminal";
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeRow {
     /// 0 = top-level (controller session or a bottom resumable/terminal
@@ -72,6 +72,20 @@ pub struct TreeRow {
     pub pulse: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<u64>,
+    /// Task 14 (2026-08-18): this row's latest-turn context occupancy, in
+    /// raw tokens — `None` when the row has no usage data at all
+    /// (codex/grok/terminal aggregate rows; a Claude session/agent row
+    /// with no assistant turns yet). Dropped `Eq` from this struct's own
+    /// derive to add this field (`f64` below isn't `Eq`-safe); nothing in
+    /// this crate relied on `TreeRow: Eq` — `PartialEq` alone still covers
+    /// every existing `assert_eq!` use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// `context_tokens` as a percent of the model's known context window —
+    /// `None` whenever `context_tokens` is `None` OR the model is
+    /// unrecognized (never a guessed window size).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_percent: Option<f64>,
 }
 
 /// A dispatch job, already reduced to what the tree needs — callers (the
@@ -443,6 +457,8 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             state_label: state_label.to_owned(),
             pulse,
             elapsed_seconds: Some(elapsed_seconds(controller.last_event_at, now)),
+            context_tokens: controller.context_tokens,
+            context_percent: controller.context_percent,
         });
 
         // Children: this session's own alive agents, then any live session
@@ -466,6 +482,8 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
                 state_label: state_label.to_owned(),
                 pulse,
                 elapsed_seconds: Some(elapsed_seconds(agent.last_event_at, now)),
+                context_tokens: agent.context_tokens,
+                context_percent: agent.context_percent,
             });
         }
 
@@ -487,6 +505,8 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
                 state_label: state_label.to_owned(),
                 pulse,
                 elapsed_seconds: Some(elapsed_seconds(child.last_event_at, now)),
+                context_tokens: child.context_tokens,
+                context_percent: child.context_percent,
             });
         }
 
@@ -525,6 +545,10 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
                 state_label: state_label.to_owned(),
                 pulse,
                 elapsed_seconds: job.time.map(|time| elapsed_seconds(time, now)),
+                // Dispatch jobs (codex/grok) carry no message.usage shape —
+                // task 14 is Claude-session/agent-only.
+                context_tokens: None,
+                context_percent: None,
             });
         }
         children.extend(job_children);
@@ -553,6 +577,8 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             state_label: TERMINAL_STATE.to_owned(),
             pulse: false,
             elapsed_seconds: None,
+            context_tokens: None,
+            context_percent: None,
         });
     }
 
@@ -576,6 +602,8 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
             state_label: if *live { IDLE_STATE.to_owned() } else { RESUMABLE_STATE.to_owned() },
             pulse: false,
             elapsed_seconds: None,
+            context_tokens: None,
+            context_percent: None,
         });
     }
 

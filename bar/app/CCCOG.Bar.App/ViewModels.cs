@@ -87,6 +87,16 @@ public sealed class FlowTreeRowViewModel
     public bool Pulse { get; init; }
     public required string ElapsedText { get; init; }
     public double DotOpacity { get; init; } = 1.0;
+    /// <summary>Task 14 (2026-08-18): "ctx 36%" (a known context window) or
+    /// "ctx 355k" (tokens only, unrecognized model) — pre-formatted, same
+    /// pattern as <see cref="ElapsedText"/>/<see cref="FlyoutWindow.FormatTreeElapsed"/>.
+    /// `null` when the row carried no usage at all (agent/session rows only
+    /// — dispatch-job/terminal/owner rows never have this).</summary>
+    public string? ContextText { get; init; }
+    /// <summary>Full "355.4k tokens (36% of 1M)" (or just "355.4k tokens"
+    /// when the model's window is unknown) — the hover tooltip on
+    /// <see cref="ContextText"/>, never truncated.</summary>
+    public string? ContextTooltip { get; init; }
 }
 
 public sealed class QuotaCardViewModel

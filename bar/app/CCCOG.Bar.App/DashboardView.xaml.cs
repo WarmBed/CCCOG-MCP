@@ -282,8 +282,28 @@ public sealed partial class DashboardView : UserControl
             : $"{row.StateLabel} · {row.ElapsedText}";
         var stateText = Ui.Text(stateElapsed, 10, 0.62);
         stateText.VerticalAlignment = VerticalAlignment.Center;
-        Microsoft.UI.Xaml.Controls.Grid.SetColumn(stateText, 2);
-        grid.Children.Add(stateText);
+
+        // Task 14: "ctx 36%"/"ctx 355k" as a second, equally-dim run in the
+        // same state cell (a StackPanel, not a second Grid column — the
+        // column count/widths this comment block above already documents
+        // as "consistent... for every row" stay untouched). Only added when
+        // the row actually carried usage; the tooltip lives on this run
+        // alone, not the whole cell, since it's specifically what it
+        // describes.
+        var stateCell = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        stateCell.Children.Add(stateText);
+        if (!string.IsNullOrEmpty(row.ContextText))
+        {
+            var contextText = Ui.Text(row.ContextText, 10, 0.62);
+            contextText.VerticalAlignment = VerticalAlignment.Center;
+            if (!string.IsNullOrEmpty(row.ContextTooltip))
+            {
+                ToolTipService.SetToolTip(contextText, row.ContextTooltip);
+            }
+            stateCell.Children.Add(contextText);
+        }
+        Microsoft.UI.Xaml.Controls.Grid.SetColumn(stateCell, 2);
+        grid.Children.Add(stateCell);
 
         return grid;
     }
