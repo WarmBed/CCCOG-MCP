@@ -214,9 +214,9 @@ cd ..
 dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
 ```
 
-執行編譯出來的 `CCCOG.Bar.App.exe`,系統匣圖示(一個深色圓角方塊徽章,裡面
-三個 provider 色的圓點,由 `bar/tools/generate_tray_icon.py` 產生)立刻出
-現。左鍵開關 flyout、右鍵是 Open/Refresh now/Quit、滑鼠滾輪捲動 flyout 內容、
+執行編譯出來的 `CCCOG.Bar.App.exe`,系統匣圖示(claude 橘色圓角方塊徽章,
+中間一個粗體白色「C」,由 `bar/tools/generate_tray_icon.py` 產生——暫定
+品牌)立刻出現。左鍵開關 flyout、右鍵是 Open/Refresh now/Quit、滑鼠滾輪捲動 flyout 內容、
 拖曳它的下緣可調整高度(重開機後仍保留)、點 flyout 以外的地方會把它收起
 來。完整規格、三個純本機資料來源、以及怎麼調整哪些 session 視為常駐總指揮
 (`bar-settings.json` 裡的 `flow.edgeRules` / `flow.coordinators`)見

@@ -1447,3 +1447,50 @@ every WinUI interaction surface a real mouse would. The tooltip code path
 solely relied on for this one detail. No `bar-crash.log` growth at any
 point; GUI interaction for this task's verification was scoped entirely to
 CCCOG.Bar.App's own window, per the operator's standing instruction.
+
+## 2026-08-17 task 10: tray icon swapped to a plain "C" (temporary branding)
+
+Operator direction: replace the three-dot provider-palette icon from task 7
+with a claude-orange rounded-square badge holding a single bold white "C",
+explicitly called out as temporary branding. `bar/tools/generate_tray_icon.py`
+rewritten (not extended) — the three-dot `build_master()` is fully replaced,
+not layered alongside the new design.
+
+The "C" itself is drawn as a vector `ImageDraw.arc()` (a thick ring swept
+40°→320°, leaving the gap on the right where a capital C opens) rather than
+rendered from a system font file. Deliberate: a font-based glyph would tie
+this "reproducible from source" script's output to whichever font happens to
+be installed on the machine running it (Arial Bold / Segoe UI Bold are
+common on Windows but not guaranteed elsewhere) — an arc has no such
+dependency, only Pillow's own primitives, so the script stays genuinely
+self-contained. Same multi-size ICO output (16/20/24/32/48), same wiring
+(`TaskbarIcon.Icon` in `App.xaml.cs`, `ApplicationIcon` in the csproj) —
+no C# changes needed, since regenerating `tray-icon.ico` in place under the
+same filename is all this swap required.
+
+Both root READMEs' "CCCOG Bar" sections (added in task 7) described the old
+three-dot design — updated to the new badge description so the docs don't
+go stale the moment this lands (`README.md`, `README.zh-TW.md`).
+
+### Verification
+
+`dotnet build -c Release -p:Platform=x64`: 0 warnings, 0 errors (icon-only
+content swap; `cargo test --workspace` not re-run since no Rust/C# source
+changed — the previous task-9 run already covers current source). Operator's
+running instance (pid 4184) killed by PID first; rebuilt output confirmed
+the regenerated `tray-icon.ico` was recopied to
+`bin/x64/Release/.../win-x64/Assets/` (mtime matches this build). Fresh
+launch verified via UI Automation (`IsOffscreen: False`) and no
+`bar-crash.log` at any point.
+
+Live tray-icon confirmation stayed within the "GUI interaction with
+CCCOG.Bar.App's own window and tray icon only" constraint: the exact tray
+icon coordinates were located via UI Automation (searching the desktop root
+for the element whose Name matches the app's own tooltip text,
+`"CCCOG-Bar - quota and flow"` — not by opening Explorer or any other
+application), then a small, targeted screen-region capture (Win32
+`GetWindowRect` on `Shell_TrayWnd` + `CopyFromScreen` cropped to just that
+icon's bounding rect, DPI-corrected via `SetProcessDPIAware()`) confirmed
+the real running taskbar shows the new claude-orange badge with a legible
+white "C", not the old three-dot design or a stale/blank icon. Quit
+verified clean via the app's own footer button.

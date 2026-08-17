@@ -226,9 +226,10 @@ cd ..
 dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
 ```
 
-Run the built `CCCOG.Bar.App.exe` — the tray icon (a small dark badge with
-three provider-colored dots, generated from `bar/tools/generate_tray_icon.py`)
-appears immediately. Left-click toggles the flyout, right-click opens
+Run the built `CCCOG.Bar.App.exe` — the tray icon (a claude-orange
+rounded-square badge with a bold white "C", generated from
+`bar/tools/generate_tray_icon.py` — temporary branding) appears immediately.
+Left-click toggles the flyout, right-click opens
 Open/Refresh now/Quit, the mouse wheel scrolls the flyout's content, dragging
 its bottom edge resizes it (persisted across launches), and clicking anywhere
 outside the flyout hides it. See [bar/README.md](bar/README.md) for the full
