@@ -78,7 +78,7 @@ bar/
                              # background quota poller with a hard 60s floor,
                              # the persisted quota-limit cache, flow.edgeRules
                              # / flow.coordinators settings loading.
-                             # (34 tests)
+                             # (36 tests)
   crates/cccog-bar-cli      # debug CLI: prints the envelope for a dispatch
                              # root, optionally polling quotas; --edge-rules
                              # / --coordinators override the Flow tree's
@@ -201,7 +201,7 @@ full message content is never parsed, stored, or displayed.
 
 ```powershell
 cd bar
-cargo test --workspace                 # 159 tests across core/quota/ffi
+cargo test --workspace                 # 161 tests across core/quota/ffi
 cargo build --release --workspace      # produces target/release/cccog_bar_ffi.dll
 
 cd ..

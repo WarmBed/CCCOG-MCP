@@ -735,3 +735,57 @@ fn precheck_never_attempted_always_goes_to_the_network() {
     assert!(precheck_http_provider("claude", false, &cache, 1786795200).is_none());
     assert!(precheck_http_provider("claude", true, &cache, 1786795200).is_none());
 }
+
+/// Task 17 (2026-08-18): the exact live-confirmed bug, reduced to a
+/// two-round sequence. Round 1: a real attempt fails (e.g. Claude's OAuth
+/// refresh_token itself was rejected — live-confirmed cause) and
+/// `postprocess_http_provider` correctly computes a `stale · <reason> ·
+/// <time>` render — but that computed result was NEVER what got persisted;
+/// only `last_attempt_at`/`last_failure_reason` survive between rounds.
+/// Round 2 (a quiet TTL hit, well inside the window, no new network call):
+/// before this fix, `precheck_http_provider` unconditionally returned
+/// `last_success` UNCHANGED — still labeled `Fresh`, silently hiding that
+/// the one real attempt this window made had just failed. The operator's
+/// real Claude card stayed "Fresh"-looking for 29+ hours this way: the ONE
+/// round where the failure was correctly computed was a transient return
+/// value nothing ever rendered long enough to notice, and every round after
+/// it reverted to looking healthy.
+#[test]
+fn precheck_after_a_failed_attempt_keeps_relabeling_stale_on_every_quiet_ttl_hit() {
+    let mut cache = QuotaResilienceCache::empty().with_success("claude", fresh_claude_card(), 1786790000);
+
+    // Round 1: a real attempt, and it fails.
+    let round1 = postprocess_http_provider("claude", failed_429_card(None), &mut cache, 1786795200);
+    assert_eq!(round1.state, QuotaState::Stale, "round 1 itself must render stale");
+
+    // Round 2: well inside the 300s TTL, so this is a quiet cache hit with
+    // NO new network attempt — precheck alone decides what renders.
+    let round2 = precheck_http_provider("claude", false, &cache, 1786795200 + 60)
+        .expect("within the TTL window, no fresh fetch is attempted");
+    assert_eq!(round2.state, QuotaState::Stale, "a TTL-hit round must not silently revert to Fresh after the last real attempt failed");
+    assert!(
+        round2.diagnostic.as_deref().is_some_and(|text| text.starts_with("stale ·") && text.contains("HTTP 429")),
+        "must carry the SAME honest reason the failed attempt itself computed, got {:?}",
+        round2.diagnostic
+    );
+    // The cached bars must still be shown (task 14/17's own shared rule:
+    // a failure never wipes the bars, it only relabels them) — proves this
+    // reused the success snapshot's windows, not an empty stale-unavailable shell.
+    assert_eq!(round2.windows.len(), 1);
+}
+
+/// A subsequent SUCCESS must clear the recorded failure — the next quiet
+/// TTL hit after recovery goes back to plain unlabeled reuse, not stuck
+/// forever relabeling a now-healthy provider as stale.
+#[test]
+fn precheck_reverts_to_plain_reuse_once_a_later_attempt_succeeds() {
+    let mut cache = QuotaResilienceCache::empty().with_success("claude", fresh_claude_card(), 1786790000);
+    postprocess_http_provider("claude", failed_429_card(None), &mut cache, 1786795200);
+    // A later real attempt succeeds.
+    postprocess_http_provider("claude", fresh_claude_card(), &mut cache, 1786795300);
+
+    let after_recovery = precheck_http_provider("claude", false, &cache, 1786795300 + 60)
+        .expect("within the TTL window, no fresh fetch is attempted");
+    assert_eq!(after_recovery.state, QuotaState::Fresh, "recovery must clear the stale relabeling");
+    assert_eq!(after_recovery.diagnostic, None);
+}

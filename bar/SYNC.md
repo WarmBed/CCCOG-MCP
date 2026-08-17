@@ -2315,3 +2315,126 @@ changes are Rust-only (display-only filtering on data the C# side
 already just renders whatever rows arrive), so the C# rebuild here is
 solely to pick up the fresh FFI DLL, no source changes on that side.
 Commit + push authorized.
+
+## 2026-08-18 task 17: the Claude quota card served day-old data with no stale badge
+
+Operator's real Claude Code panel showed 5h 23% (reset ~2h out); our card
+showed `5h 7% · 08/17 00:09` — a reset time that was itself impossible
+for a live 5h window (>24h in the past), and no visible "stale" marker at
+all. Diagnosed with a REAL authenticated call against the same
+`~/.claude/.credentials.json` the app reads (read-only; the token value
+was never logged — only structural facts: presence, expiry, and the HTTP
+response's own status/diagnostic).
+
+### Root-caused: the credential really is expired, but that's not the shipped bug
+
+`expiresAt` in the real credential file was 2026-08-16T14:11:49Z, ~29.5h
+in the past at diagnosis time. `fetch_claude_quota`'s own refresh-token
+flow (`POST platform.claude.com/v1/oauth/token`) correctly detects this
+and attempts a refresh — which itself comes back rejected (the
+refresh_token in that same file is also no longer valid; Claude Code's
+own interactive auth clearly lives somewhere this on-disk snapshot
+doesn't track). **This external credential problem is out of this task's
+control to fix** — what IS this task's bug is what happens to that
+honestly-failed attempt afterward.
+
+### The actual bug: found via `cccog-bar-cli`'s own `now: 0` bug, then fixed at its root
+
+First attempt to reproduce via `cccog-bar-cli --poll-quotas` came back
+misleadingly as a bare `HTTP 401` (no refresh attempted at all) — traced
+to the CLI itself hardcoding `now: 0` when calling
+`poll_remote_quotas_with_codex`, so `expires_at <= now` could almost
+never be true. Fixed (now `chrono::Utc::now()`) so the debug tool
+actually exercises the same expiry check the real app does — a
+legitimate fix on its own, kept.
+
+Even with real `now`, that direct function bypasses the ENTIRE
+`QuotaResilienceCache` layer the live app actually goes through. Added a
+second, permanent CLI flag, `--poll-quotas-app` (`--manual` to bypass the
+TTL), that calls `poll_remote_quotas_json` — the exact same entry point
+`cccog_bar_poll_quotas`/`NativeQuotaClient.TryPoll` use — and THAT
+correctly produced `state: "stale", diagnostic: "stale · token refresh
+rejected · 14:13"` with the cached bars intact. So the wire JSON, tested
+in isolation, was already right — yet the live, long-running app process
+showed no badge at all, on both automatic ticks AND a forced manual
+refresh. The bug had to be in something that only shows up across
+MULTIPLE poll rounds in the SAME process, which a one-shot CLI call can
+never reproduce by construction.
+
+Temporary file-based debug logging (`%TEMP%\cccog-bar-task17-debug.log`,
+removed before this shipped) traced the live process's own
+`precheck_http_provider`/`postprocess_http_provider` calls across several
+real poll cycles and found it: on the FIRST real attempt after launch,
+`postprocess_http_provider` correctly computes the `stale · token refresh
+rejected · ...` render — but that computed QuotaCards is a TRANSIENT
+return value, never persisted anywhere. Only `last_attempt_at` and
+`last_success` survive between rounds, and `last_success` is only ever
+UPDATED on an actual success (correctly — a failure shouldn't overwrite
+good cached data). So on literally the VERY NEXT poll, `precheck_http_provider`'s
+TTL quiet-cache-hit branch fired (now well within the 300s window) and
+returned `cache.last_success.get(client_id)` **completely unchanged** —
+still carrying its ORIGINAL `state: Fresh` from whenever it last actually
+succeeded (2026-08-16T14:13:26Z), with no diagnostic at all. Every single
+poll after the first was a quiet TTL hit, so the ONE correctly-labeled
+round was never on screen long enough to see, and every round after it
+silently reverted to looking healthy — for 29+ hours straight.
+
+### Fix
+
+New `QuotaResilienceCache.last_failure_reason: HashMap<String, String>` —
+the reason the MOST RECENT real attempt failed, if it did. Set by
+`postprocess_http_provider` on every non-Fresh outcome (right next to the
+existing `last_attempt_at` write it already does unconditionally),
+cleared on the next success. In-memory only, same lifetime as
+`last_attempt_at` itself (a fresh app launch always retries once
+regardless of prior state — this fix doesn't change that). Given
+`limit_evidence`/`last_success` alone weren't enough to answer "is the
+provider CURRENTLY healthy", this field is what closes that gap.
+
+`precheck_http_provider`'s TTL quiet-hit branch now checks it FIRST: if
+the last real attempt is on record as failed, it re-applies the exact
+same `render_with_cache_fallback` relabeling the failed attempt itself
+would have produced — same reason, same cached bars, same honest `stale
+·` prefix — on EVERY quiet-hit round, not just the one where the failure
+happened to be freshly computed. Only when there's no failure on record
+does it fall through to the original silent reuse (the correct behavior
+for a genuinely healthy provider being polled faster than its own TTL —
+Claude/Grok's existing tests for that exact case, `precheck_auto_tick_...`,
+still pass unchanged). 2 new fixtures: the regression itself (a failed
+attempt followed by a quiet TTL hit must still render stale, with the
+same reason and the cached bars intact) and its mirror (a LATER success
+must clear the failure record, reverting the next quiet hit back to
+plain unlabeled reuse).
+
+### Live verification
+
+Rebuilt the release FFI DLL and CLI, relaunched fresh. First poll cycle
+(`refreshed 04:31:41`): Claude card correctly showed all three lines —
+
+```
+5h  7%   08/17 00:09
+7d  7%   08/23 13:59
+stale · token refresh rejected · 14:13
+```
+
+Waited past several more automatic poll ticks (`refreshed 04:32:55`,
+confirmed advancing) and re-checked: the stale badge was STILL there,
+unchanged — this is the actual regression check, since the bug was never
+"the first round is wrong," it was "every round after the first silently
+reverts." No `bar-crash.log` growth throughout.
+
+The underlying credential problem (why the refresh itself is rejected)
+remains open — genuinely out of this app's control; the operator's own
+Claude Code session presumably manages its live auth through a path this
+static file snapshot doesn't track. What this task fixes is that the
+card now HONESTLY says so, on every refresh, instead of quietly showing
+stale numbers as if they were current.
+
+### Gates
+
+`cargo test --workspace`: 161 tests green (core 95 unchanged; quota 30
+unchanged; ffi 36, +2 from this task's fixtures). `dotnet build -c
+Release -p:Platform=x64`: 0 warnings, 0 errors — Rust-only fix, no C#
+changes were needed (the existing rendering pipeline was already correct
+once fed the right wire JSON). No `bar-crash.log` growth. Commit + push
+authorized.

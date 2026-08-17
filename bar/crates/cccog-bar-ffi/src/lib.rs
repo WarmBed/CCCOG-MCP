@@ -790,6 +790,20 @@ pub struct QuotaResilienceCache {
     /// or failure) — what the TTL/manual-interval gate measures from. Never
     /// updated by a cache-hit (skipped) round.
     last_attempt_at: HashMap<String, u64>,
+    /// Task 17 (2026-08-18): the reason the MOST RECENT real attempt
+    /// failed, if it did — set on every non-Fresh `postprocess_http_provider`
+    /// outcome, cleared on the next success. In-memory only (like
+    /// `last_attempt_at`, not persisted — a fresh app launch always retries
+    /// once regardless of what happened before it). This is what
+    /// `precheck_http_provider`'s TTL quiet-hit branch was missing entirely:
+    /// without it, a provider whose ONE real attempt per TTL window fails
+    /// would show the raw `last_success` snapshot — unmodified, still
+    /// labeled `Fresh` — for every poll UNTIL the next real attempt, silently
+    /// hiding a real, ongoing failure (live-confirmed: Claude's card stayed
+    /// "Fresh"-looking for 29+ hours with an expired, never-refreshing
+    /// OAuth token, because the TTL-hit path never re-applied the stale
+    /// label the ONE real attempt per cycle correctly computed).
+    last_failure_reason: HashMap<String, String>,
     limit_evidence: HashMap<String, PersistedLimitEvidence>,
 }
 
@@ -819,6 +833,11 @@ impl QuotaResilienceCache {
 
     pub fn with_last_attempt(mut self, client_id: &str, at: u64) -> Self {
         self.last_attempt_at.insert(client_id.to_owned(), at);
+        self
+    }
+
+    pub fn with_last_failure(mut self, client_id: &str, reason: &str) -> Self {
+        self.last_failure_reason.insert(client_id.to_owned(), reason.to_owned());
         self
     }
 
@@ -932,10 +951,14 @@ pub fn render_with_cache_fallback(
 }
 
 /// Before attempting a live fetch: `Some(card)` means skip the network this
-/// round and render `card` instead (an active 429 backoff, or a quiet TTL
-/// cache hit reusing the last successful card unchanged); `None` means go
-/// ahead and fetch. Public so tests can exercise the TTL/manual-interval/
-/// backoff gate directly, without a real HTTP client.
+/// round and render `card` instead (an active 429 backoff; a quiet TTL cache
+/// hit reusing the last successful card unchanged when the last real attempt
+/// actually succeeded; or — task 17, 2026-08-18 — an honestly-relabeled
+/// stale render when the last real attempt FAILED, so a provider whose
+/// single attempt-per-TTL-window keeps failing shows that on every poll, not
+/// just the one round where the failure happened to be computed); `None`
+/// means go ahead and fetch. Public so tests can exercise the
+/// TTL/manual-interval/backoff gate directly, without a real HTTP client.
 pub fn precheck_http_provider(
     client_id: &str,
     manual: bool,
@@ -956,12 +979,28 @@ pub fn precheck_http_provider(
         .last_attempt_at
         .get(client_id)
         .is_some_and(|&last| now.saturating_sub(last) < min_interval);
-    if within_ttl {
-        // Quiet cache hit — no attempt was made and nothing failed, so this
-        // is NOT a "stale" render, just TokenBar-style TTL reuse.
-        return cache.last_success.get(client_id).map(|cached| cached.card.clone());
+    if !within_ttl {
+        return None;
     }
-    None
+    // Task 17 (2026-08-18): live-confirmed bug — this branch used to always
+    // return `cache.last_success` UNCHANGED (still labeled `Fresh`, its
+    // original state from whenever it last actually succeeded), regardless
+    // of whether the ONE real attempt this TTL window made had just failed.
+    // A provider whose every real attempt fails (e.g. an OAuth token that
+    // can no longer refresh) would show the day-old `Fresh` snapshot
+    // forever: the single round where the failure was correctly computed
+    // and labeled `stale · <reason> · <time>` (in `postprocess_http_provider`,
+    // right after the real attempt) was never PERSISTED anywhere — only
+    // `last_success`/`last_attempt_at` survive between rounds — so every
+    // subsequent quiet TTL hit silently reverted back to looking healthy.
+    // Now: if the last real attempt is on record as having failed, every
+    // quiet TTL-hit round re-applies the SAME honest stale relabeling
+    // `postprocess_http_provider` itself would have produced, instead of
+    // serving the raw unmodified success snapshot.
+    if let Some(reason) = cache.last_failure_reason.get(client_id) {
+        return Some(render_with_cache_fallback(client_id, reason, cache, now));
+    }
+    cache.last_success.get(client_id).map(|cached| cached.card.clone())
 }
 
 /// After a live fetch attempt: update the cache (success clears backoff and
@@ -985,6 +1024,10 @@ pub fn postprocess_http_provider(
             },
         );
         cache.backoff.remove(client_id);
+        // Task 17: a fresh success clears any failure on record — the next
+        // quiet TTL hit should go back to the plain "reuse unchanged"
+        // behavior, not keep relabeling a now-healthy provider as stale.
+        cache.last_failure_reason.remove(client_id);
         return card;
     }
     if is_http_429(&card) {
@@ -1001,6 +1044,12 @@ pub fn postprocess_http_provider(
         );
     }
     let reason = card.diagnostic.clone().unwrap_or_else(|| "unavailable".to_owned());
+    // Task 17: record WHY this attempt failed so the next quiet TTL-hit
+    // round (which never calls this function at all — that's the whole
+    // point of the TTL) can still honestly re-apply the stale label
+    // instead of silently reverting to whatever `last_success` looked like
+    // before this failure.
+    cache.last_failure_reason.insert(client_id.to_owned(), reason.clone());
     render_with_cache_fallback(client_id, &reason, cache, now)
 }
 

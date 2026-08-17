@@ -1,5 +1,5 @@
 use cccog_bar_core::refresh::snapshot_dispatch_root;
-use cccog_bar_ffi::{control_snapshot_json, envelope_from_parts, poll_remote_quotas_with_codex};
+use cccog_bar_ffi::{control_snapshot_json, envelope_from_parts, poll_remote_quotas_json, poll_remote_quotas_with_codex};
 use std::path::PathBuf;
 
 fn dispatch_root() -> PathBuf {
@@ -87,6 +87,28 @@ fn main() {
         return;
     }
 
+    // --poll-quotas-app (task 17, 2026-08-18): unlike --poll-quotas below
+    // (a direct, un-cached `poll_remote_quotas_with_codex` call), this goes
+    // through `poll_remote_quotas_json` — the EXACT same entry point
+    // `cccog_bar_poll_quotas`/`NativeQuotaClient.TryPoll` calls in the real
+    // app, TTL/backoff resilience cache and all. Needed because the two
+    // paths can genuinely disagree: diagnosing why the live app's Claude
+    // card stayed frozen required seeing the wire JSON the resilience layer
+    // actually produces, not just the raw fetch result.
+    if std::env::args_os().any(|arg| arg == "--poll-quotas-app") {
+        let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let manual = std::env::args_os().any(|arg| arg == "--manual");
+        let input = serde_json::json!({
+            "codexSessionsPath": user_profile.as_ref().map(|home| home.join(".codex").join("sessions").to_string_lossy().into_owned()),
+            "claudeCredentialPath": user_profile.as_ref().map(|home| home.join(".claude").join(".credentials.json").to_string_lossy().into_owned()),
+            "grokAuthPath": user_profile.as_ref().map(|home| home.join(".grok").join("auth.json").to_string_lossy().into_owned()),
+            "manual": manual,
+            "now": chrono::Utc::now().timestamp(),
+        });
+        println!("{}", poll_remote_quotas_json(&input.to_string()));
+        return;
+    }
+
     let snapshot = snapshot_dispatch_root(&root);
     let diagnostics = snapshot.diagnostics.clone();
     let poll = std::env::args_os().any(|arg| arg == "--poll-quotas");
@@ -99,7 +121,16 @@ fn main() {
             .as_ref()
             .map(|home| home.join(".claude").join(".credentials.json"));
         let grok = user_profile.map(|home| home.join(".grok").join("auth.json"));
-        poll_remote_quotas_with_codex(codex.as_deref(), claude.as_deref(), grok.as_deref(), 0)
+        // Task 17 (2026-08-18): this used to hardcode `now: 0`, which meant
+        // `fetch_claude_quota`'s own `expires_at <= now` expiry check could
+        // (almost) never be true — a genuinely expired credential would
+        // silently skip the refresh-token flow and go straight to a bare
+        // 401 against the wrong (stale) access token, testing a DIFFERENT
+        // code path than the real app's own `now`-aware call ever hits.
+        // Found while diagnosing the real app's own stale Claude card: this
+        // debug tool couldn't even exercise the refresh path to compare.
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        poll_remote_quotas_with_codex(codex.as_deref(), claude.as_deref(), grok.as_deref(), now)
     } else {
         Vec::new()
     };
