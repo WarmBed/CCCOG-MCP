@@ -88,6 +88,22 @@ public sealed partial class FlyoutWindow : Window
         // glanceable dashboard, not a focused editor.
         SetupAlwaysOnAcrylic();
 
+        // Task 8 (2026-08-17): clicking anywhere outside the flyout was
+        // supposed to hide it (that's the whole point of a tray flyout) but
+        // this port never carried the mechanism over — ported verbatim from
+        // TokenBar-Windows FlyoutWindow.xaml.cs. --keep-open: verification
+        // hook — screen-capture/UI-Automation helpers steal focus, which
+        // would correctly dismiss the flyout right before the shot, so
+        // live-check tooling (including this repo's own) needs an opt-out.
+        var keepOpen = Environment.GetCommandLineArgs().Contains("--keep-open");
+        Activated += (_, e) =>
+        {
+            if (e.WindowActivationState == WindowActivationState.Deactivated && !keepOpen)
+            {
+                HideFlyout();
+            }
+        };
+
         _refreshTimer = DispatcherQueue.CreateTimer();
         _refreshTimer.Interval = TimeSpan.FromMilliseconds(250);
         _refreshTimer.Tick += (_, _) =>

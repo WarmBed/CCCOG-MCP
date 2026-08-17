@@ -5,6 +5,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using System.Runtime.InteropServices;
 using System.Windows.Input;
+using IOPath = System.IO.Path;
 
 namespace CCCOG.Bar.App;
 
@@ -28,9 +29,34 @@ public partial class App : Application
         // Show as early as possible — the performance contract is window
         // visible < 1s cold; tray icon registration happens after.
         _flyout.ShowFlyout();
+        var trayIconPath = IOPath.Combine(AppContext.BaseDirectory, "Assets", "tray-icon.ico");
         _tray = new TaskbarIcon
         {
             ToolTipText = "CCCOG-Bar - quota and flow",
+            // Task 7 (2026-08-17): the tray previously showed WinUI's
+            // generic default icon — no icon was ever set. First attempt
+            // used TaskbarIcon.IconSource (a WinUI ImageSource/BitmapImage)
+            // per the literal request, but BitmapImage's Uri constructor
+            // decodes ASYNCHRONOUSLY — H.NotifyIcon's own docs say
+            // "IconSource resolves an image source and updates the Icon
+            // property accordingly", and that resolution ran before the
+            // async decode finished, so the tray showed a blank/loading
+            // placeholder glyph instead of the real icon (confirmed live
+            // via UI Automation + PrintWindow on the notification overflow
+            // popup — this is exactly the class of bug the "verify the tray
+            // actually shows the new icon" gate exists to catch). Using
+            // System.Drawing.Icon directly instead — synchronous, no async
+            // race — is the SAME underlying property IconSource itself
+            // ultimately updates, and is the exact pattern TokenBar's own
+            // TrayService.cs already uses successfully
+            // (`_icon.Icon = System.Drawing.Icon.FromHandle(hicon)`).
+            // Requesting the 16x16 frame explicitly: Shell_NotifyIcon wants
+            // a small icon, and `new Icon(path)` without a size defaults to
+            // SystemInformation.IconSize (historically 32x32), not the
+            // tray's own preferred size — this ensures the correctly-sized
+            // frame from the multi-resolution .ico is the one used, not
+            // whichever default the OS/library would otherwise pick.
+            Icon = new System.Drawing.Icon(trayIconPath, 16, 16),
             LeftClickCommand = new DelegateCommand(_ => ToggleFlyout()),
             // NOT SecondWindow: that mode parks a transparent helper window
             // over the desktop, which would swallow hover/wheel input meant

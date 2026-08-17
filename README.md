@@ -205,6 +205,37 @@ supported path for dispatch work.)
   [Desktop Luna experiment](docs/desktop-luna-experiment.md) and
   [provider adapters](docs/provider-adapters.md).
 
+## CCCOG Bar
+
+A slim Windows tray companion — not part of the MCP server, a separate app
+that watches the same `%LOCALAPPDATA%\CCCG\dispatch` state plus local Claude
+Code session transcripts. Left-click the tray icon to toggle a small Acrylic
+flyout showing two things: **provider quota** (Claude / Codex / Grok — how
+full each plan is) and **flow** (a live tree of who is dispatching whom right
+now — local Claude Code sessions and their subagents, plus active/recent
+CCCG dispatch jobs). Both sections refresh on their own (a 60s timer plus
+file watchers) so the flyout never sits frozen while open; a quota-limit hit
+persists on its card until the provider's own reset time passes, independent
+of whether the failed job is still around to re-scan.
+
+```powershell
+cd bar
+cargo build --release --workspace
+
+cd ..
+dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+```
+
+Run the built `CCCOG.Bar.App.exe` — the tray icon (a small dark badge with
+three provider-colored dots, generated from `bar/tools/generate_tray_icon.py`)
+appears immediately. Left-click toggles the flyout, right-click opens
+Open/Refresh now/Quit, the mouse wheel scrolls the flyout's content, dragging
+its bottom edge resizes it (persisted across launches), and clicking anywhere
+outside the flyout hides it. See [bar/README.md](bar/README.md) for the full
+spec, the three local-only data sources, and how to tune which sessions are
+treated as standing coordinators (`flow.edgeRules` / `flow.coordinators` in
+`bar-settings.json`).
+
 ## Docs
 
 [dispatch](docs/dispatch.md) ·

@@ -563,13 +563,6 @@ pub fn enrich_quota_cards(
         .collect()
 }
 
-/// The window past which an EVIDENCE's own age gets a small dim "as of X
-/// ago" marker appended to the limit diagnostic — reused from
-/// [`SNAPSHOT_STALE_AFTER_SECS`] (1h) so "how old is this data" reads the
-/// same everywhere in this file, not a second threshold with its own
-/// meaning.
-const LIMIT_EVIDENCE_AGE_MARKER_SECS: i64 = SNAPSHOT_STALE_AFTER_SECS;
-
 /// Task 6's persist-until-T variant of [`enrich_quota_cards`]: same
 /// stale-annotation pass, but the codex/grok limit override is backed by
 /// `limit_evidence` (mutated in place) instead of always requiring a fresh
@@ -661,22 +654,30 @@ pub fn enrich_quota_cards_persistent(
         .collect()
 }
 
-/// Same rendering as [`apply_quota_limit_override`] — one condensed
-/// diagnostic line, the unified `resetsAt` — but backed by (possibly
+/// Same rendering as [`apply_quota_limit_override`] — the unified
+/// `resetsAt` on the window row itself — but backed by (possibly
 /// several-hours-old, still-in-force) persisted evidence instead of an
-/// always-this-round scan hit, and with a small dim "as of X ago" marker
-/// appended whenever the EVIDENCE itself (not this render) is older than
-/// [`LIMIT_EVIDENCE_AGE_MARKER_SECS`] — exactly the case where the operator
-/// is looking at a limit state the app remembers rather than one it just
-/// re-confirmed.
-fn apply_persistent_limit_override(card: QuotaCards, evidence: &PersistedLimitEvidence, now_seconds: u64) -> QuotaCards {
+/// always-this-round scan hit.
+///
+/// Task 9 (2026-08-17, operator feedback on the live card): a persisted
+/// limit is not a failure the app is currently experiencing — it is a known,
+/// locked state ("100% used until T"), fully expressed by the window row
+/// (`Limit 100% <reset>`) and its red gauge alone. The previous render added
+/// a second status line underneath repeating the same `limit · <reset>` text
+/// verbatim, plus (once the evidence aged past an hour) a dim "as of X ago"
+/// marker that read as data staleness even though the lock's own validity
+/// has nothing to do with how recently the app re-observed it — it holds
+/// until `reset_at`, scan hit or not. Both are dropped here: `diagnostic` is
+/// `None` (suppresses that second line entirely — see DashboardView's
+/// `IsFailure = !state.Equals("fresh")` gate) and `state` is `Fresh` rather
+/// than `Stale`, since this row is exactly as current as the app's own
+/// belief about the lock, not a fallback to old data. The full evidence
+/// detail (when the failure was observed, the exact reset instant) still
+/// lives in `diagnostic_detail` for the hover tooltip — nothing is deleted,
+/// just moved off the always-visible line.
+fn apply_persistent_limit_override(card: QuotaCards, evidence: &PersistedLimitEvidence, _now_seconds: u64) -> QuotaCards {
     let time_text = evidence.observed_at.format("%H:%M").to_string();
     let reset_display = evidence.reset_at.with_timezone(&Local).format("%m/%d %H:%M").to_string();
-    let evidence_age_seconds = now_seconds.saturating_sub(evidence.observed_at.timestamp().max(0) as u64);
-    let mut diagnostic = format!("limit · {reset_display}");
-    if evidence_age_seconds as i64 > LIMIT_EVIDENCE_AGE_MARKER_SECS {
-        diagnostic = format!("{diagnostic} · as of {} ago", format_age(evidence_age_seconds));
-    }
     let diagnostic_detail = format!("limit reached (dispatch failure {time_text}) · {reset_display}");
     QuotaCards {
         client_id: card.client_id,
@@ -687,9 +688,9 @@ fn apply_persistent_limit_override(card: QuotaCards, evidence: &PersistedLimitEv
             remaining_percent: 0.0,
             resets_at: Some(reset_display),
         }],
-        state: QuotaState::Stale,
+        state: QuotaState::Fresh,
         observed_at: card.observed_at,
-        diagnostic: Some(diagnostic),
+        diagnostic: None,
         diagnostic_detail: Some(diagnostic_detail),
         retry_after_seconds: None,
     }

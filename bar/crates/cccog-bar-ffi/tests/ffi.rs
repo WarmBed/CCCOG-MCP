@@ -449,15 +449,24 @@ fn evidence_ages_out_of_the_scan_window_but_t_is_still_future_so_the_limit_persi
     let root = tempfile::tempdir().unwrap();
     let mut limit_evidence = HashMap::new();
     // NOW_SECONDS is 2026-08-15T12:00:00Z; reset_at is nearly a week later
-    // and observed_at is well over an hour before NOW -- both conditions
-    // for "still in force" AND "old enough to carry the as-of marker".
+    // and observed_at is well over an hour before NOW -- old evidence is
+    // exactly the case this test exists to cover.
     limit_evidence.insert("codex".to_owned(), persistent_codex_evidence("Aug 20th, 2026 11:50 AM", "2026-08-15T08:00:00Z"));
 
     let cards = enrich_quota_cards_persistent(vec![codex_card(Some((NOW_SECONDS - 22 * 3600) * 1000))], Some(root.path()), NOW_SECONDS, &mut limit_evidence);
 
     let card = &cards[0];
     assert_eq!(card.windows[0].used_percent, 100.0, "the persisted evidence must still override, not the 22h-old rollout snapshot");
-    assert_eq!(card.diagnostic.as_deref(), Some("limit · 08/20 11:50 · as of 4h ago"));
+    assert_eq!(card.windows[0].resets_at.as_deref(), Some("08/20 11:50"));
+    // Task 9 (operator feedback): the persisted-limit card shows ONLY the
+    // window row + gauge -- no second status line, regardless of how old
+    // the evidence is. No "as of X ago" marker; the lock's own validity has
+    // nothing to do with how recently the app re-observed it.
+    assert!(card.diagnostic.is_none(), "no second status line on a persisted-limit card, however old the evidence");
+    assert_eq!(card.state, QuotaState::Fresh, "a persisted lock is the app's own current belief, not stale fallback data");
+    // The full detail (when the failure was observed, exact reset) survives
+    // for the hover tooltip.
+    assert_eq!(card.diagnostic_detail.as_deref(), Some("limit reached (dispatch failure 08:00) · 08/20 11:50"));
     assert!(limit_evidence.contains_key("codex"), "evidence must remain persisted -- T hasn't passed");
 }
 
@@ -498,12 +507,10 @@ fn a_newer_non_limit_snapshot_supersedes_and_clears_the_persisted_limit() {
 }
 
 #[test]
-fn a_fresh_scan_hit_refreshes_the_persisted_evidence_with_no_as_of_marker() {
+fn a_fresh_scan_hit_refreshes_the_persisted_evidence_with_no_status_line() {
     // The evidence's own observed_at (the failed job's finished_at) is
-    // recent -- this round's scan finds it directly, so the render must
-    // look exactly like the pre-task-6 ephemeral override (no "as of"
-    // marker): the app just re-confirmed this itself, it isn't relying on
-    // memory.
+    // recent -- this round's scan finds it directly. Same one-row rendering
+    // as the aged-out case above (task 8): no second status line either way.
     let root = tempfile::tempdir().unwrap();
     write_failed_job(
         root.path(),
@@ -518,7 +525,9 @@ fn a_fresh_scan_hit_refreshes_the_persisted_evidence_with_no_as_of_marker() {
 
     let card = &cards[0];
     assert_eq!(card.windows[0].used_percent, 100.0);
-    assert_eq!(card.diagnostic.as_deref(), Some("limit · 08/20 11:50"), "no as-of marker on a freshly-reconfirmed round");
+    assert_eq!(card.windows[0].resets_at.as_deref(), Some("08/20 11:50"));
+    assert!(card.diagnostic.is_none(), "no second status line on a freshly-reconfirmed round either");
+    assert_eq!(card.state, QuotaState::Fresh);
     let stored = limit_evidence.get("codex").expect("a fresh hit with a parseable reset must be persisted");
     assert_eq!(stored.evidence_job_id, "fresh1");
 }

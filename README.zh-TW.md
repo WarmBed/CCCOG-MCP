@@ -194,6 +194,34 @@ dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release   # 135 個
   [Desktop Luna experiment](docs/desktop-luna-experiment.md) 與
   [provider adapters](docs/provider-adapters.md)。
 
+## CCCOG Bar
+
+一個精簡的 Windows 系統匣夥伴程式——不是 MCP server 的一部分,是獨立的
+app,讀同一份 `%LOCALAPPDATA%\CCCG\dispatch` 狀態,加上本機 Claude Code
+session transcript。左鍵點系統匣圖示開關一個小型 Acrylic flyout,顯示兩件
+事:**provider 額度**(Claude / Codex / Grok——每個方案還剩多少)與
+**flow**(現在誰在派工誰的即時樹狀圖——本機 Claude Code session 與它們的
+subagent,加上進行中/近期的 CCCG dispatch job)。兩區塊都會自己刷新(60
+秒計時器加檔案監看),flyout 開著不會卡在舊資料上;額度撞限的卡片會一直
+鎖到 provider 自己回報的重置時間過了為止,不管當初那個失敗 job 還在不在
+掃描範圍內。
+
+```powershell
+cd bar
+cargo build --release --workspace
+
+cd ..
+dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+```
+
+執行編譯出來的 `CCCOG.Bar.App.exe`,系統匣圖示(一個深色圓角方塊徽章,裡面
+三個 provider 色的圓點,由 `bar/tools/generate_tray_icon.py` 產生)立刻出
+現。左鍵開關 flyout、右鍵是 Open/Refresh now/Quit、滑鼠滾輪捲動 flyout 內容、
+拖曳它的下緣可調整高度(重開機後仍保留)、點 flyout 以外的地方會把它收起
+來。完整規格、三個純本機資料來源、以及怎麼調整哪些 session 視為常駐總指揮
+(`bar-settings.json` 裡的 `flow.edgeRules` / `flow.coordinators`)見
+[bar/README.md](bar/README.md)。
+
 ## 文件
 
 [dispatch](docs/dispatch.md) ·

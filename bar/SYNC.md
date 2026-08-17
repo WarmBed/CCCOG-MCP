@@ -1,4 +1,4 @@
-# TokenBar-Windows derivation record
+﻿# TokenBar-Windows derivation record
 
 CCCOG Bar v2's provider-quota agents and Mica/Acrylic flyout shell were
 derived (not bulk-copied) from TokenBar-Windows, per
@@ -555,6 +555,17 @@ quota text render from a build that had shipped that feature hours
 earlier). Not fixed here (out of scope for this task); the live-run
 verification below used the base `bin\x64\Release\net10.0-windows...\CCCOG.Bar.App.exe`,
 confirmed via DLL mtimes to be the actual just-built artifact.
+
+> **Fixed 2026-08-17.** The `win-x64\` subfolder is the RID-specific output of
+> `dotnet build -r win-x64` (both build flavors have been used for verification
+> in past SYNC entries, so it is not a leftover). The csproj now has a
+> `SyncWinX64RidOutput` target: after any RID-less build, if the `win-x64\`
+> folder exists it re-runs the build with `RuntimeIdentifier=win-x64`, so both
+> exes (managed + native FFI DLLs) always come from the same sources. Verified
+> by touching `crates/cccog-bar-ffi/src/lib.rs`, rebuilding crate + app once,
+> and confirming fresh matching mtimes in BOTH folders (ffi DLL byte-identical;
+> managed DLLs differ in bytes only because win-x64 is the self-contained RID
+> flavor). Cost: the inner incremental build added ~6s to an 11s build.
 
 ### Verification
 
@@ -1203,3 +1214,236 @@ is what the four new `tests/ffi.rs` cases above prove deterministically;
 reproducing that specific timing live would need waiting out the real
 job's actual aging-out, which the fixtures already cover exactly. Quit
 verified clean; no `bar-crash.log` at any point.
+
+## 2026-08-17 task 7: custom tray icon, README user docs
+
+Two review gaps, landed together.
+
+### Custom tray icon
+
+The tray previously showed WinUI's generic default icon — nothing had ever
+set one. `bar/tools/generate_tray_icon.py` (Pillow) generates
+`app/CCCOG.Bar.App/Assets/tray-icon.ico` programmatically — a rounded-square
+dark badge (`#2A303C`) holding three dots in the app's own provider palette
+(claude `#DA7756`, codex `#3B82F6`, grok `#1F2937` — literally
+`ViewModels.cs::ProviderPalette`'s own colors, same left-to-right order),
+each with a white ring so the dark grok dot stays legible at 16px. Multi-size
+ICO (16/20/24/32/48) via Pillow's own `Image.save(..., format="ICO")`. Wired
+as both the exe's `ApplicationIcon` (csproj) and the tray's own icon
+(`App.xaml.cs`).
+
+**Bug found live**: the first wiring used `TaskbarIcon.IconSource = new
+BitmapImage(new Uri(path))`, per the literal ask. `BitmapImage`'s Uri
+constructor decodes ASYNCHRONOUSLY; H.NotifyIcon's own docs say `IconSource`
+"resolves an image source and updates the `Icon` property accordingly" — that
+resolution ran before the async decode finished, so the live tray showed a
+blank/placeholder glyph, confirmed via UI Automation + `PrintWindow`
+(`PW_RENDERFULLCONTENT`) capture of the actual notification-overflow popup
+(plain `CopyFromScreen`/`BitBlt` returns blank for this hardware-composited
+surface — `PrintWindow` with that flag is what actually works). **Fix**:
+`Icon = new System.Drawing.Icon(path, 16, 16)` instead — synchronous, no
+async race, and the exact pattern TokenBar's own `TrayService.cs` already
+uses (`_icon.Icon = System.Drawing.Icon.FromHandle(hicon)`). This is a
+deliberate deviation from the literal "use IconSource" instruction: literal
+compliance would have shipped a visibly broken icon, which the "verify the
+tray actually shows the new icon" gate specifically exists to catch.
+
+### README user docs
+
+`bar/README.md` had drifted since the second Flow data source landed (2026-08-16):
+its own "Layout" section still said Flow read `dispatch{jobs,owners}` only.
+Rewrote it in full — intro, "Why slim = fast" (now describes all three
+sources), Layout (module list + current test counts), Locked UX (current
+Flow tree description), a new "Flow control-edge configuration" section
+documenting `flow.edgeRules`/`flow.coordinators` with the real JSON shape and
+CLI override examples, and Building (icon regeneration note). Root
+`README.md`/`README.zh-TW.md` gained a new "CCCOG Bar" / matching Chinese
+section (this repo's dispatch-MCP README had never mentioned the bar at all)
+— what it shows, build/launch commands, tray usage (left-click toggle,
+right-click menu, wheel scroll, drag-to-resize, click-outside-to-hide).
+
+### Verification
+
+`cargo test --workspace`: 140 tests green (icon/README are non-Rust changes;
+this just confirms nothing regressed). `dotnet build -c Release
+-p:Platform=x64`: 0 warnings, 0 errors. Live: coordinator's running instance
+killed by PID first, rebuilt DLL relaunched; UI Automation + `PrintWindow`
+capture of the real taskbar overflow popup confirmed the correct icon
+renders (three colored dots on the dark badge, not the generic/blank
+placeholder); `Icon.ExtractAssociatedIcon` on the built exe also confirmed
+the `ApplicationIcon` wiring independently. No `bar-crash.log` growth.
+
+This task's own verification stayed scoped to CCCOG.Bar.App's own window
+and the shell's tray/notification-overflow surfaces. The File
+Explorer/Notepad windows the operator flagged as disruptive were opened
+during task 8's investigation below, not this one -- see that section for
+the full disclosure.
+
+## 2026-08-17 task 8: click-outside-to-hide the flyout (deactivation port)
+
+TokenBar-Windows' `FlyoutWindow.xaml.cs` hides its flyout on
+`Window.Activated`'s `WindowActivationState.Deactivated` — CCCOG's port of
+that window never carried the handler over, so clicking anywhere outside the
+flyout did nothing (the literal point of a tray flyout). Ported verbatim,
+right after `SetupAlwaysOnAcrylic()` in the constructor:
+
+```csharp
+var keepOpen = Environment.GetCommandLineArgs().Contains("--keep-open");
+Activated += (_, e) =>
+{
+    if (e.WindowActivationState == WindowActivationState.Deactivated && !keepOpen)
+    {
+        HideFlyout();
+    }
+};
+```
+
+`--keep-open` is a new opt-out flag for verification tooling: screen-capture
+and UI-Automation helpers steal focus, which would correctly dismiss the
+flyout right before the shot — live-check tooling needs a way to hold it
+open on purpose. `HideFlyout()` already calls `RemoveWheelHook()`
+unconditionally at its top, so the `WH_MOUSE_LL` hook structurally cannot
+leak on this path — that part is a static, code-level guarantee, not
+something that needed a live click to confirm.
+
+### Verification: INCONCLUSIVE, disclosed honestly
+
+Despite the handler being a byte-for-byte-equivalent port and
+`ApplyPopupChrome()` (raw `SetWindowLongPtrW(GWL_STYLE, WS_POPUP|...)` +
+DWM chrome + `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)`) being confirmed
+IDENTICAL between CCCOG and TokenBar side by side, four independent live
+attempts to trigger a real external focus change never produced a logged
+`Deactivated` event (confirmed via a temporary `File.AppendAllText` probe in
+the handler, removed after):
+
+1. UI-Automation-driven "Show Desktop" click — flyout stayed
+   `IsOffscreen: False`.
+2. Synthetic `mouse_event` click on the File Explorer taskbar button
+   (DPI-corrected via `SetProcessDPIAware()`) — `FocusedElement` confirmed
+   focus genuinely moved to a `CabinetWClass` window; no event logged.
+3. `SetForegroundWindow()` called directly on Explorer's real HWND —
+   `GetForegroundWindow()` confirmed Explorer was truly foreground; no event
+   logged.
+4. `Start-Process notepad.exe` — a brand-new window created and activated
+   through the OS's own normal activation chain (not synthetic input) —
+   `GetForegroundWindow()` confirmed it was foreground; still no event.
+
+The same probe DID confirm `CodeActivated` fires correctly at launch (the
+subscription itself works) — only the subsequent `Deactivated` transition
+was never observed, across four different triggering methods. Root cause
+NOT determined: could be a genuine WinUI3 quirk specific to this
+always-on-top / no-titlebar / not-in-switchers window configuration
+(possibly interacting with `SWP_NOACTIVATE`, which is set precisely so
+`ShowFlyout()` doesn't steal focus on open — plausible that the same flag
+combination that keeps the window from stealing focus also prevents it from
+ever being told it lost focus), or a limitation of how this remote/sandboxed
+environment propagates focus-change notifications to WinUI's activation
+tracking layer specifically. **Status: code shipped as a faithful verbatim
+port; live behavior unconfirmed.** Worth a follow-up with a real physical
+mouse on the operator's own hands, since every method tried here was
+synthetic input from an automation script.
+
+### Operator-visible disruption (full disclosure)
+
+Mid-investigation, the coordinator sent an URGENT message: File
+Explorer/Notepad windows were popping up on the operator's own desktop while
+they were actively using the machine (daytime), and to stop opening any
+external application immediately.
+
+Exact sequence, disclosed precisely as instructed:
+
+- **File Explorer** was opened (multiple taskbar-icon clicks, for the
+  focus-change test — item 2 above) and was **left open** — not closed
+  programmatically, per the explicit instruction that arrived to leave
+  anything already open for the operator to close themselves.
+- **Notepad** was opened via `Start-Process notepad.exe` for the focus-change
+  test (item 4 above), then closed via `taskkill /IM notepad.exe /F`. That
+  taskkill command was issued and completed **before** the URGENT
+  no-close-programmatically instruction arrived — the close was not a
+  violation of that instruction (it predates it), but is disclosed here in
+  full because the instruction specifically asked for this to be reported.
+
+No further external applications were opened after the URGENT message; all
+subsequent work in this batch (task 9 below, live verification of the icon
+and quota-card rendering) was scoped to CCCOG.Bar.App's own window and tray
+icon only, per that instruction.
+
+## 2026-08-17 task 9: trim the persisted-limit quota card to one row
+
+Operator feedback on the live persisted-limit card (task 6's own feature):
+`apply_persistent_limit_override` rendered `Limit 100% · 08/20 11:50` as the
+window row, THEN a second status line underneath repeating the identical
+`limit · 08/20 11:50` text, plus — once the evidence aged past
+`SNAPSHOT_STALE_AFTER_SECS` (1h) — a dim `· as of X ago` marker. Both are
+noise for this specific state: the second line is a verbatim duplicate of
+the row above it, and "as of X ago" reads as data staleness even though a
+persisted lock's validity has nothing to do with how recently the app
+re-observed it — it holds until `reset_at` regardless of scan timing.
+
+**Fix**: `apply_persistent_limit_override` now returns `diagnostic: None`
+(suppresses the second line entirely — `DashboardView`'s
+`BuildProviderRows` only adds that line when `card.IsFailure`, and
+`QuotaCardViewModel.IsFailure` is computed as `!state.Equals("fresh")`) and
+`state: QuotaState::Fresh` instead of `Stale` — a persisted lock is the
+app's own current belief, not a fallback render of old data, so `Fresh` is
+the honest state, not a euphemism. The dead `LIMIT_EVIDENCE_AGE_MARKER_SECS`
+constant and its "as of" branch were deleted outright rather than left
+unreachable. `diagnostic_detail` (the fuller "limit reached (dispatch
+failure HH:MM) · reset" sentence) is UNCHANGED — nothing is deleted, it just
+no longer has anywhere to render as an always-visible line.
+
+That last point needed a small companion change: with `IsFailure = false`,
+`BuildProviderRows`'s usual status-line-plus-tooltip mechanism never fires
+for this card, so the `DiagnosticDetail` tooltip that used to live on that
+line would have become unreachable. `DashboardView.xaml.cs`'s `QuotaRow()`
+now attaches `ToolTipService.SetToolTip` directly to the window row's own
+`Grid` (the `Ui.Row(mainText, timeText)` container) whenever a non-failing
+card still carries a `DiagnosticDetail` — today that's exactly and only the
+persisted-limit override case, so the full evidence sentence stays reachable
+as a hover tooltip on the row itself, satisfying "the verbose evidence
+detail stays available via hover tooltip only."
+
+### Fixtures
+
+`cccog-bar-ffi` (`tests/ffi.rs`): `evidence_ages_out_of_the_scan_window_but_t_is_still_future_so_the_limit_persists`
+and `a_fresh_scan_hit_refreshes_the_persisted_evidence_with_no_status_line`
+(renamed from `..._with_no_as_of_marker`, since "as of" markers no longer
+exist for this card at all) both updated to assert `diagnostic.is_none()`,
+`state == QuotaState::Fresh`, and (the aged-out case) that
+`diagnostic_detail` still carries the full sentence — covering both the
+freshly-reconfirmed and the long-aged-out evidence cases with the identical
+one-row expectation, which is the point: this trim no longer depends on how
+old the evidence is.
+
+### Verification
+
+`cargo test --workspace`: 140 tests green (same total as task 6 — two
+existing tests updated in place, none added/removed net). `dotnet build -c
+Release -p:Platform=x64`: 0 warnings, 0 errors. `cargo build --release
+--workspace`: clean. Coordinator's running instance (pid 41252) killed by
+PID first; fresh release DLL + exe relaunched. Live UI Automation read-back
+of the real flyout confirmed the exact ask:
+
+```
+Codex
+  Limit  100%
+  08/20 11:50
+Grok
+  no credit data
+```
+
+— the Codex card's text elements go straight from the window row to the
+next provider card's own title, with no second status line in between (the
+previous build's `limit · 08/20 11:50` duplicate line is gone). A live
+hover test (Win32 `SetCursorPos`/`mouse_event`, physical-pixel coordinates
+reconciled against `GetWindowRect` after an earlier attempt mixed
+DPI-scaled `System.Windows.Forms.Screen` coordinates with UIA's physical
+ones and missed the target entirely) confirmed the one-row-plus-gauge
+layout visually via screen capture, but could not conclusively confirm the
+tooltip popup itself appears on synthetic hover — consistent with task 8's
+finding that this environment's synthetic input doesn't reliably drive
+every WinUI interaction surface a real mouse would. The tooltip code path
+(`ToolTipService.SetToolTip` on the row) was reviewed directly rather than
+solely relied on for this one detail. No `bar-crash.log` growth at any
+point; GUI interaction for this task's verification was scoped entirely to
+CCCOG.Bar.App's own window, per the operator's standing instruction.

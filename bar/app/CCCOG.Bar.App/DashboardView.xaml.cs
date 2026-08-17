@@ -169,7 +169,22 @@ public sealed partial class DashboardView : UserControl
         // the tooltip/back-compat callers already depending on it.
         var mainText = Ui.Text($"{card.WindowLabel}  {card.UsedText}", 11, bold: true);
         var timeText = Ui.Dim(card.ResetText, 9);
-        root.Children.Add(Ui.Row(mainText, timeText));
+        var row = Ui.Row(mainText, timeText);
+        // Task 9 (2026-08-17, persisted-limit card trim): a persisted-limit
+        // card renders with IsFailure=false (state=Fresh — this IS the
+        // app's current belief, not stale fallback data), so
+        // BuildProviderRows never adds its usual failing-card status line —
+        // that line, and the tooltip that lived on it, is exactly what the
+        // operator asked to drop from the always-visible surface. The full
+        // evidence detail must still reach the hover tooltip somehow, so
+        // it's attached directly to this window row instead whenever a
+        // non-failing card carries one (only the persisted-limit override
+        // sets DiagnosticDetail on an otherwise-Fresh card today).
+        if (!card.IsFailure && !string.IsNullOrEmpty(card.DiagnosticDetail))
+        {
+            ToolTipService.SetToolTip(row, card.DiagnosticDetail);
+        }
+        root.Children.Add(row);
         root.Children.Add(Ui.GaugeBar(card.UsedPercent));
         return root;
     }
