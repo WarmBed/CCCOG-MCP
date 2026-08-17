@@ -254,7 +254,12 @@ public sealed partial class DashboardView : UserControl
         {
             Width = row.Depth > 0 ? 6 : 8,
             Height = row.Depth > 0 ? 6 : 8,
-            Fill = row.DotBrush,
+            // Task 12: built here, on the UI thread, from the plain
+            // `Provider` string — not carried pre-built on the row anymore
+            // (that construction used to happen on the background fetch
+            // thread and threw a COMException every time; see
+            // FlowTreeRowViewModel.Provider's doc comment).
+            Fill = new SolidColorBrush(ProviderPalette.Color(row.Provider)),
             Opacity = row.DotOpacity,
             VerticalAlignment = VerticalAlignment.Center,
         });

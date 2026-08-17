@@ -70,12 +70,22 @@ public sealed class FlowTreeRowViewModel
     public string? TypeModelText { get; init; }
     /// <summary>Drives both the dot color and — for a child row only — the
     /// <see cref="TypeModelText"/> run's own color (operator rule: "same
-    /// palette as the dots").</summary>
+    /// palette as the dots"). Task 12 (2026-08-17): this row is now built on
+    /// a background thread (<c>FlyoutWindow.NativeControlClient.ToRow</c>,
+    /// off the UI thread per the async-fetch fix) — a `SolidColorBrush` used
+    /// to be constructed right there and stored as a `DotBrush` property,
+    /// which threw a `COMException` every single time (WinUI XAML objects
+    /// have UI-thread/apartment affinity; constructing one off-thread fails
+    /// silently into an empty Flow tree, since the exception unwound out of
+    /// the whole fetch). `Provider` — a plain string, no thread affinity —
+    /// is carried instead, and `DashboardView.BuildFlowRow` (which DOES run
+    /// on the UI thread, after the DispatcherQueue hop) builds the actual
+    /// `SolidColorBrush` from it at render time, exactly like it already did
+    /// for the type/model text's own color a few lines below.</summary>
     public required string Provider { get; init; }
     public required string StateLabel { get; init; }
     public bool Pulse { get; init; }
     public required string ElapsedText { get; init; }
-    public required Microsoft.UI.Xaml.Media.Brush DotBrush { get; init; }
     public double DotOpacity { get; init; } = 1.0;
 }
 

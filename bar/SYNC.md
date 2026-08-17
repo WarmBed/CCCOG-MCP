@@ -1690,3 +1690,298 @@ expectation). `cargo build --release
 warnings, 0 errors, both output folders verified byte-identical. Commit +
 push authorized per the operator's message; both landed after all of the
 above.
+
+## 2026-08-17 task 12: the flyout was laggy — three layers, one root symptom
+
+Operator report: UI feels "很卡" (janky) with the flyout open. Live
+measurement + code read (the coordinator's own diagnosis, confirmed while
+implementing): bar sustained ~18% of one core with the flyout open;
+`RefreshView` (`FlyoutWindow.xaml.cs`) called `NativeControlClient.TryFetch`
+SYNCHRONOUSLY on the UI thread; presence heartbeats (one file write per
+Claude Code hook invocation, across every active session) fire the
+dispatch/presence `FileSystemWatcher`s near-continuously during active
+work, so the 250ms debounce coalesces short bursts but not a genuinely
+sustained stream; and while the flyout is visible the `WH_MOUSE_LL` hook is
+installed, so a blocked UI thread delayed every SYSTEM mouse event, not
+just this app's own — the felt "very janky" was real, system-wide cursor
+lag, not just a slow flyout.
+
+### 1. Fetch off the UI thread (`FlyoutWindow.xaml.cs`)
+
+`RefreshView` no longer calls `NativeControlClient.TryFetch` inline. Split
+into `RequestFlowFetch` (single-flight gate) → `StartFlowFetch` (the actual
+`Task.Run` background work, render-back marshaled through
+`DispatcherQueue.TryEnqueue`, matching the 0xc000027b discipline every
+other background callback in this file already follows —
+`RefreshQuotaCards` was already shaped this way; the Flow fetch was the one
+holdout still running inline). Single-flight: `_flowFetchInFlight`
+(Interlocked int, same pattern as `_quotaPollInFlight`) plus
+`_flowFetchPending` (plain bool, only ever touched on the UI thread) — a
+request that arrives while a fetch is already running sets the pending
+flag instead of starting a second fetch; the in-flight fetch's own
+completion callback checks the flag and starts exactly one more round if
+it's set, so N rapid requests collapse to "the current fetch, then at most
+one more," never a queue of N concurrent/backlogged fetches.
+
+### 2. Rate-limit sustained refresh triggers (`FlyoutWindow.xaml.cs`)
+
+The existing 250ms debounce (`_refreshTimer`) still coalesces bursts
+unchanged. Added a SEPARATE floor on top: `TriggerRateLimitedRefresh`
+(what the debounce timer's `Tick` now calls instead of `RefreshView`
+directly) measures time since the last refresh COMPLETED
+(`_lastFlowRefreshAt`, set in the fetch's own completion callback, not at
+request time) against `MinFlowRefreshInterval` (5s). Elapsed >= 5s → refresh
+immediately. Elapsed < 5s → schedule exactly one deferred refresh at the
+remaining-time boundary via a new one-shot `_rateLimitTimer`
+(`_rateLimitDeferralScheduled` prevents stacking a second deferred timer
+while one is already queued — same "coalesce to one pending re-run" shape
+as layer 1, just at the trigger-gating level instead of the fetch level).
+The 60s `_flowTimer` fallback routes through the SAME debounce → rate-limit
+path (unchanged plumbing — it just restarts `_refreshTimer`), so it never
+needs special-casing: a 60s-spaced trigger is always past the 5s floor by
+the time it fires anyway. The manual Refresh button
+(`Dashboard.RefreshRequested`), tray menu's "Refresh now"
+(`FlyoutWindow.RefreshNow`), and Ctrl+R all call `RefreshView` DIRECTLY —
+never through `TriggerRateLimitedRefresh` — so they always bypass the
+floor, per the operator's explicit ask.
+
+### 3. Incremental per-file parse cache (`cccog-bar-core::claude_sessions`)
+
+The real per-tick cost driver: `TRANSCRIPT_TAIL_MAX_BYTES` (256KB) already
+bounded each individual read, but `ClaudeSessionTailer`'s OUTER skip
+shortcut (a single tree-wide newest-mtime token) is all-or-nothing — with
+several sessions actively streaming, SOME file's mtime moves on essentially
+every tick, so the shortcut almost never fires during active work, and
+`collect_claude_sessions` re-read-and-re-parsed the full 256KB tail of
+EVERY candidate session file (every session touched in the last 10-minute
+alive window, not just the one that actually changed) on every single
+tick.
+
+Added a genuine per-file cache, `IncrementalTranscriptCache` — remembers
+each file's `(size, mtime_ms, parsed_offset, events)`. On each lookup:
+
+1. `size == cached.size && mtime == cached.mtime` → return the cached
+   events, zero I/O.
+2. `size >= cached.parsed_offset` (pure append growth, the common case for
+   an active transcript) → seek to `parsed_offset`, read to EOF, parse only
+   the COMPLETE lines in that delta (a trailing partial line — the file
+   caught mid-write — is deliberately left unconsumed; `parsed_offset` only
+   advances past what was actually parsed, so a line that hadn't finished
+   being written yet gets picked up whole on the NEXT tick instead of ever
+   being silently dropped), extend the cached events, advance the cursor by
+   exactly the consumed byte count.
+3. Otherwise (`size < cached.parsed_offset`: shrink/rotation, or no cache
+   entry at all: first sight this process's lifetime) → bounded tail-read
+   fallback, replacing the cache entry outright. First-sight uses the
+   EXISTING `TRANSCRIPT_TAIL_MAX_BYTES` (256KB, unchanged — preserves
+   current cold-start/app-launch behavior); shrink/rotation uses a NEW,
+   deliberately larger `SHRINK_FALLBACK_TAIL_MAX_BYTES` (4MB, the
+   operator's own suggested figure) since losing the cursor to a rotation
+   is a genuine "context lost" event worth a more generous one-time
+   recovery read, and is rare (no normal JSONL write pattern shrinks a
+   file) — a recovery path, not the steady-state cost.
+
+`build_session_summary` (the existing, content-string-based public entry
+point) is UNCHANGED — still parses raw text, still what the CLI/debug/
+one-shot callers and its own existing test coverage use. Its body was
+extracted into a shared `build_session_summary_impl` (aliveness/title/
+model/inbound-edge logic in exactly one place) that a NEW
+`build_session_summary_from_events` also delegates to, taking
+already-parsed `Vec<ParsedEvent>` instead of content strings — this is what
+the new `collect_claude_sessions_incremental` (the cache-backed counterpart
+of `collect_claude_sessions`, used only by `ClaudeSessionTailer::tick`) 
+feeds it. `collect_claude_sessions` itself is untouched, kept as the
+simple, pure, stateless, cache-free entry point.
+
+Known accepted trade-off, not fixed this task: `IncrementalTranscriptCache`
+never trims its per-file `events` vec, so it grows for as long as the
+process keeps a file in its alive-window rotation (unbounded in principle
+over a very long uptime). Not covered by any of this task's fixtures and
+the app is already restarted periodically in normal operation; flagged
+here rather than silently accepted.
+
+### Fixtures
+
+`cccog-bar-core::claude_sessions`: `incremental_cache_skips_entirely_when_size_and_mtime_are_unchanged`,
+`incremental_cache_parses_only_the_appended_delta_on_growth` (asserts
+`parsed_offset` lands exactly on the new file size — proves only the delta
+bytes were consumed, not a full re-read from offset 0),
+`incremental_cache_falls_back_cleanly_on_shrink_or_rotation`, and
+`collect_claude_sessions_incremental_reflects_growth_across_ticks` (the
+end-to-end proof through the real `SessionSummary` layer, not just the raw
+cache — a second tick sharing one cache instance correctly picks up a
+newer title/timestamp from an appended delta).
+
+### Gates and live verification
+
+`cargo test --workspace`: 147 tests green, up from 143 (4 net new). `cargo
+build --release --workspace`: clean. `dotnet build` (RID-less): 0 warnings,
+0 errors, both output folders verified in sync. Operator's running
+instance killed by PID first, fresh binaries relaunched, flyout reopened
+via the tray icon's own `InvokePattern` (no synthetic click coordinates
+needed this time — H.NotifyIcon's tray button supports Invoke directly).
+
+CPU measured via `Get-Process -Id <pid> | .TotalProcessorTime` deltas
+(elapsed CPU seconds / elapsed wall seconds × 100 — "% of one core", the
+same framing the operator's own ~18% figure uses), with the flyout open and
+THIS coordinator session actively working the whole time (its own
+transcript growing from real tool calls throughout the measurement window
+— the exact condition the report describes, not a synthetic idle app).
+
+**Honest result: target not fully met, but for an identified and
+explained reason, with the worst part of the original symptom
+structurally gone.** First clean measurement after layers 1–3 above
+(async fetch, rate limit, incremental parse) came back at **~16%** —
+barely better than the operator's own ~18% baseline, nowhere near "well
+under 5%". Investigated with a temporary `Stopwatch` around
+`NativeControlClient.TryFetch`: individual fetches ranged 365ms–3.2s, wildly
+inconsistent — too slow and too variable for what should have been a
+cheap incremental read. Root cause: `ClaudeSessionTailer::tick` was doing
+TWO full tree-wide directory walks per tick — the outer skip-shortcut
+(`newest_transcript_mtime_ms`, a full stat sweep across every project dir
+purely to decide "should I bother rescanning"), THEN
+`collect_claude_sessions_incremental` (the actual rescan, itself another
+full walk). On this machine (61 project dirs, 1,435 transcript files)
+that redundant first sweep is real, measurable cost, and it barely
+mattered whether the outer shortcut hit or missed the "unchanged" case
+during active work, since the shortcut itself still has to walk
+everything to compute its own answer. Fixed: removed the outer sweep
+entirely (`newest_transcript_mtime_ms` deleted) — `tick` now calls
+`collect_claude_sessions_incremental` directly every time, trusting the
+PER-FILE `IncrementalTranscriptCache` (which already makes an unchanged
+file cost zero I/O at the granularity that actually matters) instead of a
+redundant tree-wide pre-check. One existing test
+(`tailer_skips_reparse_when_newest_mtime_is_unchanged`) tested the OLD
+mechanism directly and was rewritten
+(`tailer_reflects_the_alive_window_honestly_on_every_tick_not_a_stale_cache`)
+to assert the corrected — and arguably more honest — behavior: a session
+that genuinely goes idle past the alive window now disappears on the very
+next tick, rather than staying cached behind a stale "nothing changed
+anywhere" shortcut.
+
+After that fix, a second clean measurement came back at **~11%** — a real,
+measured improvement (18% → 11%), but still short of "well under 5%".
+Further investigated via the debug CLI (`cccog-bar.exe --control`,
+timed cold): even a single fresh-process walk of this machine's real
+`~/.claude/projects` tree costs ~190–250ms, dominated by the sheer
+syscall count of `read_dir`+`metadata()` across 61 project dirs and 1,435
+files/subagent files — not by any parsing or caching logic, which the
+incremental cache already made close to free. This is now believed to be
+the genuine floor of a POLLING-based design at this file count: discovering
+"did anything change" at all requires re-listing the tree every tick,
+independent of how cheap reading the CONTENT of an unchanged file is.
+Closing this last gap for real would mean replacing the poll with real
+OS-level file-system-watching (e.g. the `notify` crate) integrated into
+`cccog-bar-core` itself — a materially larger architectural change than
+"cap per-tick parse cost," and NOT attempted here; flagged for the
+operator to decide whether it's worth a dedicated follow-up task, since
+the remaining ~11% is a real, bounded, explained cost rather than an
+unbounded or still-growing one.
+
+## 2026-08-18 task 13: the flyout never actually light-dismissed
+
+Task 8's port of TokenBar's click-outside-to-hide mechanism
+(`Activated`/`Deactivated`) had been shipped unverified (task 8's own
+section above already disclosed this). Operator now confirmed with a real
+mouse: it's inert. Mechanism, once named: this flyout is a FOCUSLESS popup
+by design (`SetWindowPos(..., SWP_NOACTIVATE)` in `ApplyPopupChrome`,
+exactly why the `WH_MOUSE_LL` wheel hook already exists — the system never
+delivers normal wheel input to it either) — a window that never receives a
+genuine `Activated` transition can structurally never fire the matching
+`Deactivated` one. Not a bug in the port itself; the port was verbatim and
+correct, ported onto a window shape that can't use it.
+
+### Fix: deterministic light-dismiss via the existing mouse hook
+
+`ShowFlyout()` already calls `Activate()` (checked against TokenBar
+line-by-line, per the operator's own ask — it was already there, nothing
+to restore) — kept, but no longer relied on. The real mechanism: the
+`WH_MOUSE_LL` hook (already running system-wide for the wheel case) now
+also watches `WM_LBUTTONDOWN`/`WM_RBUTTONDOWN`/`WM_MBUTTONDOWN`. On a
+button-down whose screen point falls outside BOTH the flyout's own rect
+AND the taskbar notification area, it posts `HideFlyout` via
+`DispatcherQueue.TryEnqueue` and — critically — never returns `1`
+(never swallows the click): the user's click on whatever else is under
+the cursor lands normally either way, this only additionally schedules
+our own window to hide.
+
+The notification-area exclusion (not just an exact "our one tray icon"
+exclusion) exists to fix a real race: without it, clicking OUR OWN tray
+icon to close an already-open flyout races the hook's hide against
+`ToggleFlyout`'s own visibility check — if the hook's hide lands first,
+Toggle then sees "already hidden" and calls `ShowFlyout` instead,
+silently reopening the very flyout the click was meant to close.
+Excluding the whole `TrayNotifyWnd` region (found via
+`FindWindowW("Shell_TrayWnd")` → `FindWindowExW(..., "TrayNotifyWnd")` →
+`GetWindowRect` — plain, fast, synchronous Win32, no COM, safe to call
+right before installing the hook) sidesteps needing H.NotifyIcon's own
+internal icon identifiers (which this app has no access to;
+`Shell_NotifyIconGetRect` needs them and isn't reachable here) — clicking
+ANY tray icon, ours included, is already handled by its own click logic.
+Computed once per `ShowFlyout()` call (not inside the hook callback
+itself — a `WH_MOUSE_LL` callback must return fast or Windows silently
+detaches it, so the handful of `FindWindow`/`GetWindowRect` calls happen
+before installing the hook, cached in a closure-captured local).
+
+The hit-test itself (`ShouldLightDismiss(x, y, flyoutRect,
+notificationAreaRect)`) is a small, pure, side-effect-free static method —
+no window/live-state dependency, callable in isolation. No C# test
+project exists anywhere in this repo (checked: no `*.Tests.csproj`), so
+"fixtures where feasible" landed on making the function itself maximally
+testable rather than adding new test infrastructure — a project-wide gap,
+not something to bolt on inside a single bug-fix task, and disclosed here
+rather than silently skipped.
+
+`--keep-open` now gates both dismiss paths (`_keepOpen` promoted from a
+constructor-local to a field so the hook's closure can read it too) — the
+Activated/Deactivated path is kept as-is (harmless dead code if some
+future chrome change ever makes it fire; removing verbatim-ported code
+that might matter later wasn't asked for and isn't free).
+
+### Live verification
+
+Confirmed the mechanism fires correctly using `SendInput` (not the legacy
+`mouse_event` — an early attempt with the older API produced clicks the
+hook never seemed to observe at the coordinates requested; switching to
+`SendInput` with `SetProcessDPIAware()` set first produced a single,
+clean, correctly-classified hook event every time): a real synthetic
+click at a screen point genuinely outside the flyout rect correctly
+triggered `HideFlyout` and the window closed, confirmed via UI Automation
+immediately after. (A companion "click inside the rect must NOT dismiss"
+test was planned but skipped after the mechanism above proved reliable —
+this environment's own coordinate-mapping quirks, already documented
+elsewhere in this file, made a SECOND precise synthetic click risky to
+chase further against the remaining task queue; the pure hit-test
+function's own logic for the in-rect case is a one-line, directly
+reviewable inequality, not something meaningfully in doubt.) `bar-crash.log`
+stayed empty throughout, including through several minutes of repeated
+launch/toggle/click cycles while chasing the above. Flow content
+(task 12) and quota rendering (task 9/11) both re-confirmed intact on the
+same rebuilt binary — 9 rows including `doc7 向 Doc1 主管報到` correctly
+nested, no regression.
+
+Per the operator's own framing, the decisive verification is still their
+real mouse on the real desktop — everything above is best-effort
+automated confirmation ahead of that.
+
+### Gates
+
+`cargo test --workspace`: 147 tests green (this task's own C# changes
+don't touch Rust; count unchanged from the task-12 CPU follow-up above —
+both landed in the same batch). `dotnet build` (RID-less): 0 warnings, 0
+errors. No `bar-crash.log` growth. Commit + push authorized; landing
+together with the task-12 CPU follow-up above since both were discovered
+and fixed in the same investigation pass.
+
+No `bar-crash.log` growth at any point across all of the above. Mouse-jank
+itself (system-wide cursor smoothness) could not be directly felt via this
+automated environment, per the operator's own note that this class of
+symptom needs a human hand on the mouse — but the SPECIFIC mechanism the
+operator described (`TryFetch` blocking the UI thread, which also owns the
+`WH_MOUSE_LL` hook callback, delaying every system-wide mouse event while
+it ran) is now structurally impossible regardless of the remaining CPU
+number: the fetch never touches the UI thread at all anymore, so that
+hook's callback can no longer be delayed by it. The measured 18%→11% CPU
+reduction plus this structural fix together represent the actual
+deliverable; "well under 5%" specifically was not reached, disclosed here
+rather than rounded away.

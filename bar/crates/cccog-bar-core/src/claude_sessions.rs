@@ -80,7 +80,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// A session (or agent) with no event in this many seconds is not "alive" —
@@ -419,19 +419,57 @@ pub fn build_session_summary(
     window_secs: i64,
 ) -> Option<SessionSummary> {
     let events = parse_transcript(main_content);
+    let agents_in = subagents
+        .iter()
+        .map(|s| (s.agent_id.to_owned(), parse_transcript(s.content), s.meta_json.map(str::to_owned)))
+        .collect();
+    build_session_summary_impl(project_slug, session_id, events, agents_in, now, window_secs)
+}
+
+/// Task 12 (2026-08-17): the incremental-cache entry point — identical
+/// summary-building logic to [`build_session_summary`], but fed
+/// ALREADY-PARSED events (from [`IncrementalTranscriptCache::events_for`])
+/// instead of raw transcript text, so `ClaudeSessionTailer::tick` never
+/// re-runs `parse_transcript` over bytes it already parsed on a previous
+/// tick. `subagents` is `(agent_id, events, meta_json)` — owned, since the
+/// cache hands back an owned `Vec<ParsedEvent>` per file (no long-lived
+/// borrow to attach a lifetime to, unlike `SubagentInput`'s `&str` content).
+pub fn build_session_summary_from_events(
+    project_slug: &str,
+    session_id: &str,
+    main_events: Vec<ParsedEvent>,
+    subagents: Vec<(String, Vec<ParsedEvent>, Option<String>)>,
+    now: DateTime<Utc>,
+    window_secs: i64,
+) -> Option<SessionSummary> {
+    build_session_summary_impl(project_slug, session_id, main_events, subagents, now, window_secs)
+}
+
+/// Shared core both public entry points above delegate to — aliveness,
+/// title/model resolution, and inbound-edge extraction live in exactly one
+/// place regardless of whether the caller handed over raw content (parsed
+/// here) or already-parsed events (task 12's incremental cache path).
+fn build_session_summary_impl(
+    project_slug: &str,
+    session_id: &str,
+    events: Vec<ParsedEvent>,
+    agents_in: Vec<(String, Vec<ParsedEvent>, Option<String>)>,
+    now: DateTime<Utc>,
+    window_secs: i64,
+) -> Option<SessionSummary> {
     let own_last_event_at = events.iter().filter_map(|event| event.timestamp).max();
 
-    struct AgentEvents<'a> {
-        subagent: &'a SubagentInput<'a>,
+    struct AgentEvents {
+        agent_id: String,
+        meta_json: Option<String>,
         events: Vec<ParsedEvent>,
         last_event_at: Option<DateTime<Utc>>,
     }
-    let agent_events: Vec<AgentEvents> = subagents
-        .iter()
-        .map(|subagent| {
-            let events = parse_transcript(subagent.content);
+    let agent_events: Vec<AgentEvents> = agents_in
+        .into_iter()
+        .map(|(agent_id, events, meta_json)| {
             let last_event_at = events.iter().filter_map(|event| event.timestamp).max();
-            AgentEvents { subagent, events, last_event_at }
+            AgentEvents { agent_id, meta_json, events, last_event_at }
         })
         .collect();
 
@@ -481,15 +519,15 @@ pub fn build_session_summary(
         }
         let agent_model = agent.events.iter().rev().find_map(|event| event.model.clone());
         let label = agent
-            .subagent
             .meta_json
+            .as_deref()
             .and_then(|raw| serde_json::from_str::<AgentMeta>(raw).ok())
             .and_then(|meta| meta.description)
             .map(|description| summarize_prompt(description.as_bytes(), 4 * 1024, AGENT_LABEL_MAX_BYTES))
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| format!("agent-{}", index + 1));
         agents.push(AgentSummary {
-            agent_id: agent.subagent.agent_id.to_owned(),
+            agent_id: agent.agent_id.clone(),
             model: agent_model,
             last_event_at: agent_last_event,
             label,
@@ -686,46 +724,263 @@ fn collect_subagent_files(dir: &Path, cutoff_ms: u64) -> Vec<(String, String, Op
     out
 }
 
-/// Cheap stat-only sweep (no file reads) of the newest mtime across every
-/// transcript file under `root` — what [`ClaudeSessionTailer`] compares tick
-/// to tick to decide whether a full rescan is even needed. Mirrors
-/// `tokscale_core::latest_source_mtime_ms`.
-fn newest_transcript_mtime_ms(root: &Path) -> Option<u64> {
-    let mut newest: Option<u64> = None;
+// ── Task 12 (2026-08-17): incremental per-file parse cache ─────────────────
+//
+// Live-measured regression: with several sessions actively streaming near-
+// continuously (presence heartbeats fire on every tool call), the OUTER
+// skip-shortcut below (`ClaudeSessionTailer`'s own mtime token) almost never
+// triggers during active work — SOME file under `root` is touched on
+// essentially every tick — so `collect_claude_sessions` ran its full
+// stat-sweep-plus-bounded-tail-read-plus-reparse for EVERY candidate session
+// file on EVERY tick, even though only one file had actually changed and
+// even that one had usually only grown by a handful of lines. Fixed with a
+// genuine per-file incremental cache: remember each file's last-seen
+// (size, mtime) plus its already-parsed events, and on the next tick either
+// (a) skip entirely (unchanged), (b) parse only the bytes appended since
+// last time (pure growth — the common case for an active transcript), or
+// (c) fall back to a bounded tail re-read (shrink/rotation, or first sight
+// of this file this process's lifetime).
+
+/// The shrink/rotation fallback window — deliberately larger than
+/// [`TRANSCRIPT_TAIL_MAX_BYTES`] (256KB, still used for a file's first-ever
+/// sight this process's lifetime, unchanged from before this task): losing
+/// the incremental cursor to a shrink/rotation is a genuine "context lost"
+/// event, worth a more generous one-time recovery read, and is expected to
+/// be rare (no normal JSONL transcript write pattern shrinks a file) — this
+/// is a recovery path, not the steady-state cost.
+const SHRINK_FALLBACK_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// One file's incremental read state: `parsed_offset` is the byte offset up
+/// to which `events` reflects fully-parsed, COMPLETE lines — always
+/// `<= size`. A trailing partial line (the file caught mid-write at the
+/// moment of a read) is deliberately left unconsumed past `parsed_offset` so
+/// the next tick re-reads it whole, rather than ever silently losing a line
+/// that hadn't finished being written yet.
+struct FileCursor {
+    mtime_ms: u64,
+    size: u64,
+    parsed_offset: u64,
+    events: Vec<ParsedEvent>,
+}
+
+/// Read and parse only the complete lines appended after `from_offset`.
+/// Returns `consumed_bytes` (<= the available delta length) so the caller
+/// advances its cursor only past what was actually parsed — if the delta
+/// ends mid-line (no trailing `\n`), `consumed_bytes` is 0 and `events` is
+/// empty; the next call re-reads from the same `from_offset` once the line
+/// has finished being written.
+struct DeltaRead {
+    events: Vec<ParsedEvent>,
+    consumed_bytes: u64,
+}
+
+fn read_delta(path: &Path, from_offset: u64) -> Option<DeltaRead> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(from_offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() {
+        return Some(DeltaRead { events: Vec::new(), consumed_bytes: 0 });
+    }
+    let Some(complete_len) = bytes.iter().rposition(|&byte| byte == b'\n').map(|index| index + 1) else {
+        return Some(DeltaRead { events: Vec::new(), consumed_bytes: 0 }); // no complete line yet
+    };
+    let text = String::from_utf8_lossy(&bytes[..complete_len]);
+    Some(DeltaRead { events: parse_transcript(&text), consumed_bytes: complete_len as u64 })
+}
+
+/// Process-wide per-file cache backing [`collect_claude_sessions_incremental`]
+/// — same long-lived-instance shape as [`ClaudeSessionTailer`] itself (which
+/// owns one), since the whole point is remembering state ACROSS ticks.
+pub struct IncrementalTranscriptCache {
+    files: Mutex<HashMap<PathBuf, FileCursor>>,
+}
+
+impl Default for IncrementalTranscriptCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IncrementalTranscriptCache {
+    pub fn new() -> Self {
+        Self { files: Mutex::new(HashMap::new()) }
+    }
+
+    /// The parsed events for `path`'s CURRENT content, doing the minimum
+    /// work versus the previous call for this exact path: zero I/O if
+    /// untouched, a bounded delta read on pure append growth, a bounded
+    /// fallback tail read on shrink/rotation or first sight.
+    fn events_for(&self, path: &Path) -> Vec<ParsedEvent> {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(path);
+            return Vec::new();
+        };
+        let size = metadata.len();
+        let Some(mtime) = mtime_ms(path) else {
+            return Vec::new();
+        };
+
+        let mut files = self.files.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let existing = files.get(path).map(|cursor| (cursor.size, cursor.mtime_ms, cursor.parsed_offset));
+
+        match existing {
+            Some((cached_size, cached_mtime, _)) if cached_size == size && cached_mtime == mtime => {
+                // Unchanged since last tick: zero I/O, zero re-parse.
+                files.get(path).map(|cursor| cursor.events.clone()).unwrap_or_default()
+            }
+            Some((_, _, parsed_offset)) if size >= parsed_offset => {
+                // Pure append growth (or a no-op re-check) — parse only the
+                // delta and extend the cached events, never re-parsing what
+                // was already consumed.
+                match read_delta(path, parsed_offset) {
+                    Some(delta) => {
+                        let cursor = files.get_mut(path).expect("Some((.., parsed_offset)) implies an entry exists");
+                        cursor.events.extend(delta.events);
+                        cursor.parsed_offset += delta.consumed_bytes;
+                        cursor.size = size;
+                        cursor.mtime_ms = mtime;
+                        cursor.events.clone()
+                    }
+                    None => {
+                        files.remove(path);
+                        Vec::new()
+                    }
+                }
+            }
+            Some(_) => {
+                // size < parsed_offset: the file shrank or was rotated out
+                // from under us — the cursor no longer makes sense, recover
+                // with a bounded tail read.
+                reload_with_fallback(&mut files, path, size, mtime, SHRINK_FALLBACK_TAIL_MAX_BYTES)
+            }
+            None => {
+                // First time this process has looked at this exact path.
+                reload_with_fallback(&mut files, path, size, mtime, TRANSCRIPT_TAIL_MAX_BYTES)
+            }
+        }
+    }
+}
+
+fn reload_with_fallback(
+    files: &mut HashMap<PathBuf, FileCursor>,
+    path: &Path,
+    size: u64,
+    mtime: u64,
+    max_bytes: u64,
+) -> Vec<ParsedEvent> {
+    let Some(content) = tail_read(path, max_bytes) else {
+        files.remove(path);
+        return Vec::new();
+    };
+    let events = parse_transcript(&content);
+    files.insert(
+        path.to_owned(),
+        FileCursor { mtime_ms: mtime, size, parsed_offset: size, events: events.clone() },
+    );
+    events
+}
+
+/// `(agent_id, path)` for every subagent transcript that passes the same
+/// mtime prefilter as a top-level session file — the incremental-cache
+/// counterpart of [`collect_subagent_files`], which hands back the PATH
+/// (for `cache.events_for`) rather than already-read content.
+fn collect_subagent_paths(dir: &Path, cutoff_ms: u64) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if !is_candidate(&path, cutoff_ms) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(agent_id) = stem.strip_prefix("agent-") else {
+            continue;
+        };
+        out.push((agent_id.to_owned(), path));
+    }
+    out
+}
+
+/// Same stat-sweep and candidate filtering as [`collect_claude_sessions`],
+/// but routes every file read through `cache` instead of a fresh bounded
+/// tail read every tick — the incremental-parse discipline task 12 asks
+/// for. Kept as a separate function (rather than adding an `Option<&cache>`
+/// parameter to `collect_claude_sessions`) so that function stays a simple,
+/// pure, stateless entry point for the CLI/debug/one-shot callers and its
+/// own existing test coverage, unaffected by this addition — only
+/// `ClaudeSessionTailer::tick` (the actual live steady-state path) uses
+/// this one.
+pub fn collect_claude_sessions_incremental(
+    root: &Path,
+    now: DateTime<Utc>,
+    cache: &IncrementalTranscriptCache,
+) -> Vec<SessionSummary> {
+    let cutoff_ms = now
+        .timestamp_millis()
+        .saturating_sub((CLAUDE_ALIVE_WINDOW_SECS + MTIME_MARGIN_SECS) * 1000)
+        .max(0) as u64;
+
+    let mut out = Vec::new();
     let Ok(project_entries) = std::fs::read_dir(root) else {
-        return None;
+        return out;
     };
     for project_entry in project_entries.flatten() {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
             continue;
         }
+        let Some(slug) = project_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
         let Ok(session_files) = std::fs::read_dir(&project_path) else {
             continue;
         };
         for session_entry in session_files.flatten() {
             let session_path = session_entry.path();
-            if session_path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-                if let Some(mtime) = mtime_ms(&session_path) {
-                    newest = Some(newest.map_or(mtime, |current| current.max(mtime)));
-                }
-                let subagents_dir = project_path
-                    .join(session_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(""))
-                    .join("subagents");
-                if let Ok(subagent_entries) = std::fs::read_dir(&subagents_dir) {
-                    for subagent_entry in subagent_entries.flatten() {
-                        let subagent_path = subagent_entry.path();
-                        if subagent_path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-                            if let Some(mtime) = mtime_ms(&subagent_path) {
-                                newest = Some(newest.map_or(mtime, |current| current.max(mtime)));
-                            }
-                        }
-                    }
-                }
+            if session_path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(session_id) = session_path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let subagents_dir = project_path.join(session_id).join("subagents");
+            if !is_candidate(&session_path, cutoff_ms) && !any_subagent_candidate(&subagents_dir, cutoff_ms) {
+                continue;
+            }
+            let main_events = cache.events_for(&session_path);
+
+            let subagents: Vec<(String, Vec<ParsedEvent>, Option<String>)> =
+                collect_subagent_paths(&subagents_dir, cutoff_ms)
+                    .into_iter()
+                    .map(|(agent_id, agent_path)| {
+                        let events = cache.events_for(&agent_path);
+                        let meta_json = std::fs::read_to_string(agent_path.with_extension("meta.json")).ok();
+                        (agent_id, events, meta_json)
+                    })
+                    .collect();
+
+            if let Some(summary) = build_session_summary_from_events(
+                slug,
+                session_id,
+                main_events,
+                subagents,
+                now,
+                CLAUDE_ALIVE_WINDOW_SECS,
+            ) {
+                out.push(summary);
             }
         }
     }
-    newest
+    out
 }
 
 /// Snapshot-replaced per tick, skip-parse shortcut when nothing changed —
@@ -733,9 +988,13 @@ fn newest_transcript_mtime_ms(root: &Path) -> Option<u64> {
 /// type. A process-wide static instance lives in `cccog-bar-ffi` (the FFI
 /// boundary is stateless per call, so the tailer itself has to be the
 /// long-lived thing, same pattern as that crate's `quota_resilience_cache`).
+/// Task 12 added `transcript_cache`: the OUTER shortcut here (a single
+/// tree-wide newest-mtime token) is a fast all-or-nothing early exit for the
+/// fully-idle case; the cache is what keeps a tick CHEAP once that shortcut
+/// doesn't fire — most files touched by any given tick are unchanged and
+/// cost nothing, the rest cost only their own delta.
 pub struct ClaudeSessionTailer {
-    last_newest_mtime_ms: Mutex<Option<u64>>,
-    last_result: Mutex<Vec<SessionSummary>>,
+    transcript_cache: IncrementalTranscriptCache,
 }
 
 impl Default for ClaudeSessionTailer {
@@ -746,35 +1005,29 @@ impl Default for ClaudeSessionTailer {
 
 impl ClaudeSessionTailer {
     pub fn new() -> Self {
-        Self {
-            last_newest_mtime_ms: Mutex::new(None),
-            last_result: Mutex::new(Vec::new()),
-        }
+        Self { transcript_cache: IncrementalTranscriptCache::new() }
     }
 
+    /// Task 12 addendum (2026-08-18, live CPU measurement follow-up): this
+    /// used to check [`newest_transcript_mtime_ms`] first (a FULL tree-wide
+    /// stat sweep — every project dir, every session file, every
+    /// subagents/ dir) purely to decide whether to bother doing ANOTHER
+    /// full sweep in `collect_claude_sessions_incremental`. On a real
+    /// machine with 61 project dirs / 1,435 transcript files, that
+    /// redundant first sweep alone measured 300ms-3.2s per tick live (via
+    /// a temporary `Stopwatch` around this call) — the exact "well under
+    /// 5%" target this task exists to hit was NOT met with it in place
+    /// (~16% measured, barely better than the operator's original ~18%),
+    /// because doubling an O(files) directory walk on every tick
+    /// dominates however cheap the PER-FILE incremental cache made the
+    /// actual parsing. Removed outright: `collect_claude_sessions_incremental`
+    /// already walks the tree exactly once per tick, and its own
+    /// per-file `IncrementalTranscriptCache` (this struct's real
+    /// state) already makes an unchanged file cost zero I/O at the
+    /// granularity that actually matters — the outer sweep was pure
+    /// duplicate work, not a real optimization.
     pub fn tick(&self, root: &Path, now: DateTime<Utc>) -> Vec<SessionSummary> {
-        let newest = newest_transcript_mtime_ms(root);
-        let mut last_token = self
-            .last_newest_mtime_ms
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let (Some(current), Some(previous)) = (newest, *last_token) {
-            if current == previous {
-                return self
-                    .last_result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-            }
-        }
-        let result = collect_claude_sessions(root, now);
-        *last_token = newest;
-        drop(last_token);
-        *self
-            .last_result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = result.clone();
-        result
+        collect_claude_sessions_incremental(root, now, &self.transcript_cache)
     }
 }
 
@@ -1288,7 +1541,17 @@ mod tests {
     }
 
     #[test]
-    fn tailer_skips_reparse_when_newest_mtime_is_unchanged() {
+    fn tailer_reflects_the_alive_window_honestly_on_every_tick_not_a_stale_cache() {
+        // Task 12 addendum (2026-08-18): ClaudeSessionTailer used to have a
+        // SEPARATE tree-wide "has anything changed anywhere" shortcut on
+        // top of the per-file IncrementalTranscriptCache — removed after a
+        // live CPU measurement showed it doubled the directory-walk cost
+        // (walk once to check, walk again to act) for no real benefit once
+        // the per-file cache already makes an unchanged file cost zero I/O
+        // at the granularity that actually matters. This test now proves
+        // the CORRECTED behavior: a session going idle past the alive
+        // window is reflected immediately on the very next tick, never
+        // masked behind a stale "nothing changed anywhere" shortcut.
         let now = real_now();
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("proj");
@@ -1307,15 +1570,163 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].title, "T1");
 
-        // Black-box proof of the skip-parse shortcut: pass a `now` two hours
-        // later — if the tailer actually re-parsed, the session's last event
-        // (60s before the FIRST `now`) would fall outside the alive window
-        // and the row would disappear. Since no file's mtime moved, the
-        // shortcut must return the untouched cached snapshot instead.
+        // No file touched, but `now` moved two hours later: the session's
+        // own last event (60s before the FIRST `now`) is now well outside
+        // the alive window and must correctly disappear -- a stale cache
+        // would have kept showing it.
         let much_later = now + chrono::Duration::hours(2);
         let second = tailer.tick(root.path(), much_later);
-        assert_eq!(second.len(), 1, "skip-parse shortcut must reuse the cached snapshot, not rescan");
-        assert_eq!(second[0].title, "T1");
+        assert_eq!(second.len(), 0, "an idle-past-window session must disappear on the very next tick, not stay cached");
+
+        // Re-ticking with the ORIGINAL `now` still works correctly too
+        // (proves the per-file cache serving this from its own state isn't
+        // somehow wedged after the alive-window miss above).
+        let third = tailer.tick(root.path(), now);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].title, "T1");
+    }
+
+    // ── Task 12 (2026-08-17): IncrementalTranscriptCache fixtures ──────────
+
+    #[test]
+    fn incremental_cache_skips_entirely_when_size_and_mtime_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, transcript(&[r#"{"type":"custom-title","customTitle":"T1","sessionId":"s1"}"#])).unwrap();
+
+        let cache = IncrementalTranscriptCache::new();
+        let first = cache.events_for(&path);
+        assert_eq!(first.len(), 1);
+        let offset_after_first = {
+            let files = cache.files.lock().unwrap();
+            files.get(&path).unwrap().parsed_offset
+        };
+
+        // No write in between: size and mtime are byte-for-byte identical.
+        let second = cache.events_for(&path);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].custom_title.as_deref(), Some("T1"));
+        let offset_after_second = {
+            let files = cache.files.lock().unwrap();
+            files.get(&path).unwrap().parsed_offset
+        };
+        assert_eq!(
+            offset_after_second, offset_after_first,
+            "an untouched file must never advance the cursor -- proves the second call did zero I/O, not a re-read that happened to land on the same offset"
+        );
+    }
+
+    #[test]
+    fn incremental_cache_parses_only_the_appended_delta_on_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, transcript(&[r#"{"type":"custom-title","customTitle":"T1","sessionId":"s1"}"#])).unwrap();
+        let initial_size = std::fs::metadata(&path).unwrap().len();
+
+        let cache = IncrementalTranscriptCache::new();
+        let first = cache.events_for(&path);
+        assert_eq!(first.len(), 1);
+        {
+            let files = cache.files.lock().unwrap();
+            assert_eq!(files.get(&path).unwrap().parsed_offset, initial_size, "cold-start cursor covers the whole initial file");
+        }
+
+        // Pure append: a second, real JSONL line.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, r#"{{"type":"custom-title","customTitle":"T2","sessionId":"s1"}}"#).unwrap();
+        }
+        let new_size = std::fs::metadata(&path).unwrap().len();
+        assert!(new_size > initial_size, "fixture precondition: the file actually grew");
+
+        let second = cache.events_for(&path);
+        assert_eq!(second.len(), 2, "both the original and the newly appended line must be present");
+        assert_eq!(second[1].custom_title.as_deref(), Some("T2"), "the appended line was parsed");
+        let files = cache.files.lock().unwrap();
+        let cursor = files.get(&path).unwrap();
+        assert_eq!(
+            cursor.parsed_offset, new_size,
+            "the cursor advances exactly to the new file size -- proves only the delta bytes (new_size - initial_size) were read and parsed, not the whole file again from offset 0"
+        );
+    }
+
+    #[test]
+    fn incremental_cache_falls_back_cleanly_on_shrink_or_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(
+            &path,
+            transcript(&[
+                r#"{"type":"custom-title","customTitle":"Long","sessionId":"s1"}"#,
+                r#"{"type":"custom-title","customTitle":"Session Content Before Rotation","sessionId":"s1"}"#,
+            ]),
+        )
+        .unwrap();
+
+        let cache = IncrementalTranscriptCache::new();
+        let first = cache.events_for(&path);
+        assert_eq!(first.len(), 2);
+        let offset_before_shrink = {
+            let files = cache.files.lock().unwrap();
+            files.get(&path).unwrap().parsed_offset
+        };
+
+        // Simulate log rotation / truncation: replace with much shorter
+        // content — the recorded parsed_offset is now PAST the new EOF.
+        std::fs::write(&path, transcript(&[r#"{"type":"custom-title","customTitle":"Rotated","sessionId":"s1"}"#])).unwrap();
+        let shrunk_size = std::fs::metadata(&path).unwrap().len();
+        assert!(shrunk_size < offset_before_shrink, "fixture precondition: the file is now smaller than the old cursor");
+
+        let second = cache.events_for(&path);
+        assert_eq!(second.len(), 1, "must recover cleanly with the new content, not panic/error/return stale data");
+        assert_eq!(second[0].custom_title.as_deref(), Some("Rotated"));
+        let files = cache.files.lock().unwrap();
+        let cursor = files.get(&path).unwrap();
+        assert_eq!(cursor.parsed_offset, shrunk_size, "cursor resyncs to the new (smaller) file size after the fallback read");
+    }
+
+    #[test]
+    fn collect_claude_sessions_incremental_reflects_growth_across_ticks() {
+        // End-to-end proof (not just the low-level cache): a session's
+        // title/last_event_at reported by the real collection path updates
+        // correctly across two ticks that share one IncrementalTranscriptCache,
+        // the actual shape `ClaudeSessionTailer` uses in production.
+        let now = real_now();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("s1.jsonl");
+        std::fs::write(
+            &path,
+            transcript(&[
+                r#"{"type":"custom-title","customTitle":"Before","sessionId":"s1"}"#,
+                &format!(r#"{{"type":"assistant","timestamp":"{}","message":{{}}}}"#, rfc3339_offset(now, -30)),
+            ]),
+        )
+        .unwrap();
+
+        let cache = IncrementalTranscriptCache::new();
+        let first = collect_claude_sessions_incremental(root.path(), now, &cache);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].title, "Before");
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, r#"{{"type":"custom-title","customTitle":"After","sessionId":"s1"}}"#).unwrap();
+            writeln!(file, r#"{{"type":"assistant","timestamp":"{}","message":{{}}}}"#, rfc3339_offset(now, -5)).unwrap();
+        }
+
+        let second = collect_claude_sessions_incremental(root.path(), now, &cache);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].title, "After", "the newest custom-title, from the appended delta, must win");
+        // Compare against the SAME millisecond-precision round-trip the
+        // fixture's own written string went through (`rfc3339_offset` formats
+        // with SecondsFormat::Millis) — `now` itself carries full nanosecond
+        // precision `Utc::now()` produced, which the on-disk string never had.
+        let expected_last_event = DateTime::parse_from_rfc3339(&rfc3339_offset(now, -5)).unwrap().with_timezone(&Utc);
+        assert_eq!(second[0].last_event_at, expected_last_event);
     }
 
     #[test]

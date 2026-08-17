@@ -35,9 +35,43 @@ public sealed partial class FlyoutWindow : Window
     private readonly DispatcherQueueTimer _refreshTimer;
     private readonly DispatcherQueueTimer _quotaTimer;
     private readonly DispatcherQueueTimer _flowTimer;
+    /// <summary>Task 12 (2026-08-17, live-measured lag: bar sustained ~18% of
+    /// one core with the flyout open, blocking the system-wide mouse cursor
+    /// via the WH_MOUSE_LL hook while the UI thread sat inside a synchronous
+    /// native fetch): a one-shot deferral timer for
+    /// <see cref="TriggerRateLimitedRefresh"/> — when a watcher/timer-driven
+    /// refresh request arrives less than <see cref="MinFlowRefreshInterval"/>
+    /// after the last one COMPLETED, this fires exactly once at the
+    /// remaining-time boundary instead of refreshing immediately.</summary>
+    private readonly DispatcherQueueTimer _rateLimitTimer;
     private FileSystemWatcher? _watcher;
     private FileSystemWatcher? _presenceWatcher;
     private int _quotaPollInFlight;
+    /// <summary>Single-flight guard for the Flow fetch (task 12): 0 = idle,
+    /// 1 = a background fetch is in progress. <see cref="_flowFetchPending"/>
+    /// remembers that ANOTHER refresh was requested while one was already
+    /// running — the in-flight fetch's own completion callback starts
+    /// exactly one more round when it sees this set, so N rapid requests
+    /// collapse to at most "the current fetch, then one more", never a
+    /// queue of N.</summary>
+    private int _flowFetchInFlight;
+    private bool _flowFetchPending;
+    /// <summary>When the last Flow fetch COMPLETED (render already applied)
+    /// — <see cref="TriggerRateLimitedRefresh"/> measures against this, never
+    /// against when a refresh merely started.</summary>
+    private DateTimeOffset _lastFlowRefreshAt = DateTimeOffset.MinValue;
+    private bool _rateLimitDeferralScheduled;
+    /// <summary>Task 12: sustained watcher-triggered bursts (presence
+    /// heartbeats fire near-continuously while a session is actively
+    /// working) render at most this often — bursts still coalesce via the
+    /// existing 250ms debounce, this is the SEPARATE floor on top of it.
+    /// The manual Refresh button/menu item/Ctrl+R call <see cref="RefreshView"/>
+    /// directly and never pass through this gate at all.</summary>
+    private static readonly TimeSpan MinFlowRefreshInterval = TimeSpan.FromSeconds(5);
+    /// <summary>Verification opt-out (task 8) for BOTH dismiss paths — the
+    /// Activated/Deactivated handler and, as of task 13, the mouse hook's
+    /// own light-dismiss check. Set once from argv in the constructor.</summary>
+    private bool _keepOpen;
     private bool _closing;
     /// <summary>Set only by <see cref="Shutdown"/> (App.QuitApp's path): lets
     /// the real WM_CLOSE through instead of the tray-resident hide-on-close
@@ -95,10 +129,20 @@ public sealed partial class FlyoutWindow : Window
         // hook — screen-capture/UI-Automation helpers steal focus, which
         // would correctly dismiss the flyout right before the shot, so
         // live-check tooling (including this repo's own) needs an opt-out.
-        var keepOpen = Environment.GetCommandLineArgs().Contains("--keep-open");
+        // Task 13 (2026-08-18, operator live-confirmed with a real mouse):
+        // this Activated/Deactivated path never actually fires for this
+        // window — it's a focusless popup (SWP_NOACTIVATE in
+        // ApplyPopupChrome, exactly why the WH_MOUSE_LL wheel hook exists
+        // in the first place: the system never delivers normal input to it
+        // either), so a window that never receives a real Activated
+        // transition can never fire the matching Deactivated one. Kept
+        // anyway (harmless if some future chrome change ever makes it
+        // fire); the real, deterministic mechanism is now the mouse hook's
+        // own light-dismiss check below — `_keepOpen` gates both paths.
+        _keepOpen = Environment.GetCommandLineArgs().Contains("--keep-open");
         Activated += (_, e) =>
         {
-            if (e.WindowActivationState == WindowActivationState.Deactivated && !keepOpen)
+            if (e.WindowActivationState == WindowActivationState.Deactivated && !_keepOpen)
             {
                 HideFlyout();
             }
@@ -109,6 +153,21 @@ public sealed partial class FlyoutWindow : Window
         _refreshTimer.Tick += (_, _) =>
         {
             _refreshTimer.Stop();
+            // Task 12: the 250ms debounce still coalesces BURSTS (many
+            // watcher events arriving close together collapse to the one
+            // tick that fires after they stop), but a SUSTAINED stream of
+            // events spaced further apart than 250ms would otherwise fire
+            // this every ~250ms indefinitely — TriggerRateLimitedRefresh is
+            // the separate floor on top: at most one real refresh per
+            // MinFlowRefreshInterval regardless of how often this tick
+            // itself fires.
+            TriggerRateLimitedRefresh();
+        };
+        _rateLimitTimer = DispatcherQueue.CreateTimer();
+        _rateLimitTimer.Tick += (_, _) =>
+        {
+            _rateLimitTimer.Stop();
+            _rateLimitDeferralScheduled = false;
             RefreshView();
         };
         _quotaTimer = DispatcherQueue.CreateTimer();
@@ -152,6 +211,7 @@ public sealed partial class FlyoutWindow : Window
             _watcher?.Dispose();
             _presenceWatcher?.Dispose();
             _refreshTimer.Stop();
+            _rateLimitTimer.Stop();
             _quotaTimer.Stop();
             _flowTimer.Stop();
             _acrylic?.Dispose();
@@ -290,10 +350,101 @@ public sealed partial class FlyoutWindow : Window
             return;
         }
 
-        var rows = NativeControlClient.TryFetch(out var visibleJobs);
-        Dashboard.RenderFlow(rows, visibleJobs);
-        Dashboard.SetRefreshedText($"refreshed {DateTime.Now:HH:mm:ss}");
+        RequestFlowFetch();
         RefreshQuotaCards(manualQuota);
+    }
+
+    /// <summary>Task 12 (2026-08-17): entry point for the manual/rate-limited
+    /// Flow refresh — starts a background fetch if none is running, or
+    /// coalesces to exactly one pending re-run if one already is (never
+    /// queues N). Called both directly from <see cref="RefreshView"/> (the
+    /// manual-button/menu path, unrate-limited) and, via the same
+    /// <see cref="RefreshView"/> call, from <see cref="TriggerRateLimitedRefresh"/>
+    /// once its own 5s floor clears.</summary>
+    private void RequestFlowFetch()
+    {
+        if (_closing)
+        {
+            return;
+        }
+        if (Interlocked.CompareExchange(ref _flowFetchInFlight, 1, 0) != 0)
+        {
+            _flowFetchPending = true;
+            return;
+        }
+        StartFlowFetch();
+    }
+
+    /// <summary>The actual native fetch (Flow snapshot — now backed by
+    /// cccog-bar-core's incremental transcript parser, task 12, but still a
+    /// blocking native call in principle) runs on a threadpool worker, never
+    /// the UI thread — a synchronous call here was directly responsible for
+    /// the live-measured lag (~18% of one core sustained, system-wide mouse
+    /// jank via the WH_MOUSE_LL hook while the UI thread was blocked inside
+    /// it). Only the render-back touches XAML/DispatcherQueue state, per the
+    /// 0xc000027b discipline every other background callback in this file
+    /// already follows.</summary>
+    private void StartFlowFetch()
+    {
+        _ = Task.Run(() =>
+        {
+            IReadOnlyList<FlowTreeRowViewModel> rows;
+            int visibleJobs;
+            try
+            {
+                rows = NativeControlClient.TryFetch(out visibleJobs);
+            }
+            catch (Exception exception)
+            {
+                CrashLog.Append(exception);
+                rows = [];
+                visibleJobs = 0;
+            }
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                Interlocked.Exchange(ref _flowFetchInFlight, 0);
+                if (_closing)
+                {
+                    return;
+                }
+                Dashboard.RenderFlow(rows, visibleJobs);
+                Dashboard.SetRefreshedText($"refreshed {DateTime.Now:HH:mm:ss}");
+                _lastFlowRefreshAt = DateTimeOffset.UtcNow;
+                if (_flowFetchPending)
+                {
+                    // A refresh was requested while this one was running —
+                    // coalesced to exactly one more round, not dropped.
+                    _flowFetchPending = false;
+                    RequestFlowFetch();
+                }
+            });
+        });
+    }
+
+    /// <summary>Task 12: the rate-limit floor on top of the existing 250ms
+    /// debounce — reached only via the debounce timer's own tick (watcher
+    /// bursts / the 60s fallback timer), never from the manual Refresh
+    /// button/menu item/Ctrl+R, which call <see cref="RefreshView"/> directly
+    /// and so always bypass this gate, per the operator's explicit ask.</summary>
+    private void TriggerRateLimitedRefresh()
+    {
+        if (_closing)
+        {
+            return;
+        }
+        var elapsed = DateTimeOffset.UtcNow - _lastFlowRefreshAt;
+        if (elapsed >= MinFlowRefreshInterval)
+        {
+            RefreshView();
+            return;
+        }
+        if (_rateLimitDeferralScheduled)
+        {
+            return; // one is already queued for the boundary -- coalesce
+        }
+        _rateLimitDeferralScheduled = true;
+        _rateLimitTimer.Interval = MinFlowRefreshInterval - elapsed;
+        _rateLimitTimer.Start();
     }
 
     /// <summary>
@@ -758,20 +909,28 @@ public sealed partial class FlyoutWindow : Window
     [DllImport("user32.dll")]
     private static extern uint GetDpiForSystem();
 
-    // ── WH_MOUSE_LL wheel-focus workaround ───────────────────────────────
+    // ── WH_MOUSE_LL: wheel-focus workaround + task 13's light-dismiss ──────
 
     private delegate nint LowLevelMouseProc(int code, nint wParam, nint lParam);
 
     private LowLevelMouseProc? _mouseProc; // kept alive while the hook is set
     private nint _mouseHook;
 
-    /// <summary>Last resort for wheel input: the system never delivers wheel
-    /// messages to this focusless popup, so while the flyout is visible a
-    /// WH_MOUSE_LL hook watches for wheel events inside the flyout rect,
-    /// scrolls the dashboard, and swallows the event so the focused app
-    /// doesn't also scroll. Installed only while visible — ported verbatim
-    /// from TokenBar's FlyoutWindow.xaml.cs (the tray-flyout standard,
-    /// EarTrumpet et al.).</summary>
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_MBUTTONDOWN = 0x0207;
+    private const int WM_MOUSEWHEEL = 0x020A;
+
+    /// <summary>Wheel input (unchanged, task 7) and, as of task 13, light-
+    /// dismiss: the system never delivers normal input (wheel OR
+    /// activation) to this focusless popup, so both problems share one
+    /// root cause and — since we're already watching every system-wide
+    /// mouse event for the wheel case — the same WH_MOUSE_LL hook, so a
+    /// button-down anywhere outside the flyout hides it deterministically,
+    /// independent of whatever the window's own Activated/Deactivated
+    /// state does or doesn't do. Installed only while visible — ported
+    /// verbatim from TokenBar's FlyoutWindow.xaml.cs (the tray-flyout
+    /// standard, EarTrumpet et al.) for the wheel half.</summary>
     private void InstallWheelHook()
     {
         if (_mouseHook != 0)
@@ -779,24 +938,52 @@ public sealed partial class FlyoutWindow : Window
             return;
         }
 
+        // Computed once per show, not per click inside the hook callback —
+        // a WH_MOUSE_LL callback has to return fast (Windows silently
+        // detaches a hook that blocks the input pipeline too long), so the
+        // handful of FindWindow/GetWindowRect calls this needs happen here
+        // instead, cached in a closure-captured local for the hook to just
+        // read.
+        var notificationAreaRect = GetNotificationAreaRect();
+
         _mouseProc = (code, wParam, lParam) =>
         {
-            if (code >= 0 && wParam == 0x020A /* WM_MOUSEWHEEL */)
+            if (code >= 0)
             {
-                var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                var pos = AppWindow.Position;
-                var size = AppWindow.Size;
-                var inside = AppWindow.IsVisible &&
-                    data.pt.X >= pos.X && data.pt.X < pos.X + size.Width &&
-                    data.pt.Y >= pos.Y && data.pt.Y < pos.Y + size.Height;
-                if (inside)
+                if (wParam == WM_MOUSEWHEEL)
                 {
-                    var delta = unchecked((short)(data.mouseData >> 16));
-                    var windowX = data.pt.X - pos.X;
-                    var windowY = data.pt.Y - pos.Y;
-                    _ = DispatcherQueue.TryEnqueue(() =>
-                        Dashboard.RouteGlobalWheel(windowX, windowY, delta));
-                    return 1; // consumed: don't let the focused app scroll too
+                    var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                    var pos = AppWindow.Position;
+                    var size = AppWindow.Size;
+                    var inside = AppWindow.IsVisible &&
+                        data.pt.X >= pos.X && data.pt.X < pos.X + size.Width &&
+                        data.pt.Y >= pos.Y && data.pt.Y < pos.Y + size.Height;
+                    if (inside)
+                    {
+                        var delta = unchecked((short)(data.mouseData >> 16));
+                        var windowX = data.pt.X - pos.X;
+                        var windowY = data.pt.Y - pos.Y;
+                        _ = DispatcherQueue.TryEnqueue(() =>
+                            Dashboard.RouteGlobalWheel(windowX, windowY, delta));
+                        return 1; // consumed: don't let the focused app scroll too
+                    }
+                }
+                else if (!_keepOpen && AppWindow.IsVisible &&
+                    (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN))
+                {
+                    var data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                    var pos = AppWindow.Position;
+                    var size = AppWindow.Size;
+                    var flyoutRect = new RectInt32(pos.X, pos.Y, size.Width, size.Height);
+                    if (ShouldLightDismiss(data.pt.X, data.pt.Y, flyoutRect, notificationAreaRect))
+                    {
+                        // Never swallow the click (return falls through to
+                        // CallNextHookEx below either way) — the user's
+                        // click on whatever else is under the cursor must
+                        // still land normally; this only schedules OUR
+                        // window to hide.
+                        _ = DispatcherQueue.TryEnqueue(HideFlyout);
+                    }
                 }
             }
 
@@ -815,6 +1002,76 @@ public sealed partial class FlyoutWindow : Window
             _mouseProc = null;
         }
     }
+
+    /// <summary>Pure hit-test (task 13): should a button-down at physical
+    /// screen point (<paramref name="x"/>, <paramref name="y"/>) hide the
+    /// flyout? True exactly when the click lands outside BOTH the
+    /// flyout's own rect and the taskbar notification area. The second
+    /// exclusion matters even though our own tray icon is a separate
+    /// concern from "clicking away" — without it, clicking our OWN tray
+    /// icon to close an already-open flyout races this hook's hide against
+    /// <see cref="ToggleFlyout"/>'s own visibility check: if the hook's
+    /// hide lands first, Toggle then sees "already hidden" and calls
+    /// ShowFlyout instead of HideFlyout, silently reopening the very
+    /// flyout the click was meant to close. Excluding the whole
+    /// notification area (not just our one icon's exact bounds, which
+    /// would need internals this app doesn't have access to — H.NotifyIcon
+    /// doesn't expose the icon's own `Shell_NotifyIconGetRect` identifiers)
+    /// is a deliberately generous but robust proxy: clicking any tray icon
+    /// is already handled by ITS OWN click logic, ours included.
+    /// No dependency on live window/game state — callable and testable in
+    /// isolation.</summary>
+    internal static bool ShouldLightDismiss(int x, int y, RectInt32 flyoutRect, RectInt32? notificationAreaRect)
+    {
+        if (Contains(flyoutRect, x, y))
+        {
+            return false;
+        }
+        if (notificationAreaRect is { } tray && Contains(tray, x, y))
+        {
+            return false;
+        }
+        return true;
+
+        static bool Contains(RectInt32 rect, int px, int py) =>
+            px >= rect.X && px < rect.X + rect.Width && py >= rect.Y && py < rect.Y + rect.Height;
+    }
+
+    /// <summary>The taskbar's notification-area child window
+    /// ("TrayNotifyWnd", the standard Explorer window class hosting every
+    /// tray icon plus the "show hidden icons" arrow and the clock) — a
+    /// plain, fast, synchronous Win32 lookup (no COM, no UI Automation),
+    /// safe to call right before installing the hook. `null` on any lookup
+    /// failure (custom shells, a transient Explorer restart, etc.) — the
+    /// light-dismiss check just skips the tray exclusion in that case
+    /// rather than failing closed.</summary>
+    private static RectInt32? GetNotificationAreaRect()
+    {
+        var trayWnd = FindWindowW("Shell_TrayWnd", null);
+        if (trayWnd == 0)
+        {
+            return null;
+        }
+        var notifyWnd = FindWindowExW(trayWnd, 0, "TrayNotifyWnd", null);
+        if (notifyWnd == 0)
+        {
+            return null;
+        }
+        if (!GetWindowRect(notifyWnd, out var rect))
+        {
+            return null;
+        }
+        return new RectInt32(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint FindWindowW(string? className, string? windowName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint FindWindowExW(nint parent, nint childAfter, string? className, string? windowName);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(nint hwnd, out RECT rect);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MSLLHOOKSTRUCT
@@ -1128,7 +1385,6 @@ internal static class NativeControlClient
             StateLabel = stateLabel,
             Pulse = pulse,
             ElapsedText = FormatTreeElapsed(elapsedSeconds),
-            DotBrush = new SolidColorBrush(ProviderPalette.Color(provider)),
             DotOpacity = StatusVisual.Opacity(stateLabel),
         };
     }
