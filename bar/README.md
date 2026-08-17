@@ -65,7 +65,7 @@ bar/
                              #   control, dispatch, graph, owners, refresh,
                              #     privacy, inbox — the CCCG dispatch-root
                              #     scanner/reducer this all grew from
-                             # (76 tests: lib + graph/parsers/refresh/usage
+                             # (79 tests: lib + graph/parsers/refresh/usage
                              # integration suites)
   crates/cccog-bar-quota    # provider quota agents behind an injected HTTP
                              # client: Codex local rollout rate_limits
@@ -201,11 +201,11 @@ full message content is never parsed, stored, or displayed.
 
 ```powershell
 cd bar
-cargo test --workspace                 # 140 tests across core/quota/ffi
+cargo test --workspace                 # 143 tests across core/quota/ffi
 cargo build --release --workspace      # produces target/release/cccog_bar_ffi.dll
 
 cd ..
-dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64
 ```
 
 The csproj copies `cccog_bar_ffi.dll` from `target/release` next to the
@@ -213,6 +213,21 @@ built exe automatically when it exists, so build the Rust workspace in
 release mode first. It also copies `Assets/tray-icon.ico` (regenerate it
 with `python bar/tools/generate_tray_icon.py` if you ever change the
 design — the `.ico` is generated from that script, never hand-edited).
+
+**Do not pass `-p:RuntimeIdentifier=win-x64` on this command** (task 11,
+2026-08-17, live-confirmed footgun): the csproj produces TWO independently
+launchable copies of the app — the base
+`bin\x64\Release\net10.0-windows10.0.19041.0\CCCOG.Bar.App.exe` and the
+RID-specific `...\win-x64\CCCOG.Bar.App.exe` — and its own
+`SyncWinX64RidOutput` target only cascades a base (RID-less) build INTO
+win-x64, never the reverse. Passing `-p:RuntimeIdentifier=win-x64`
+explicitly builds ONLY that one folder and silently leaves the base folder
+stale; whichever shortcut/habit launches the base exe will keep running
+old binaries indefinitely with no error or version warning. The RID-less
+command above updates both (verify with a hash/mtime check on
+`cccog_bar_ffi.dll` in both folders if in doubt — they should always
+match after a build). Only pass `-p:RuntimeIdentifier=win-x64` for a
+deliberate win-x64-only smoke build, never as the routine command.
 
 ## Out of scope
 

@@ -114,12 +114,14 @@ pub struct OwnerInput {
 /// explicit current behavior, not a silent third mode.
 ///
 /// - `initiator_wins`: within a session PAIR, only the pair's INITIATOR
-///   (whoever sent the chronologically first in-window message, in either
-///   direction, marker or not) can ever become the other's controller.
-///   Every message in the opposite direction is a reply and is dropped
-///   before it can create an edge or flip control — this removes the A⇄B
-///   mutual-edge cycle at the source (`break_cycles` stays as a safety
-///   net, but should rarely trigger with this on).
+///   (whoever sent the chronologically first *marked* dispatch in-window,
+///   in either direction — task 11, 2026-08-17: unmarked messages, e.g. a
+///   worker's own check-in report, never claim initiator status even when
+///   they land first) can ever become the other's controller. Every
+///   message in the opposite direction is a reply and is dropped before it
+///   can create an edge or flip control — this removes the A⇄B mutual-edge
+///   cycle at the source (`break_cycles` stays as a safety net, but should
+///   rarely trigger with this on).
 /// - `marker_only`: only edges whose message body starts with a dispatch
 ///   marker (`claude_sessions::body_has_dispatch_marker`) are even
 ///   considered candidates — a bare reply/report/ack never restructures
@@ -290,16 +292,35 @@ fn pair_key(a: &str, b: &str) -> (String, String) {
     }
 }
 
-/// Rule 1's direction lock: for every unordered pair with traffic in
-/// either direction within the window, the pair's initiator is whoever
-/// sent the chronologically EARLIEST message — computed from the raw
-/// (unfiltered by marker) edge set, since "who spoke first" is a fact
-/// about the conversation itself, independent of whether `marker_only`
-/// separately restricts which of those messages can become an edge.
-fn compute_pair_initiators(resolved_edges: &HashMap<String, Vec<ResolvedEdge>>) -> HashMap<(String, String), String> {
+/// Rule 1's direction lock: for every unordered pair with traffic in either
+/// direction within the window, the pair's initiator is whoever sent the
+/// chronologically EARLIEST message. Task 11 (2026-08-17, live-verified
+/// regression): when `marked_only` is set, "earliest" is restricted to
+/// MARKED messages only — a real "Doc7 向 Doc1 主管報到" check-in (an
+/// unmarked worker report, no dispatch marker at all) landed before Doc1's
+/// own first marked dispatch to doc7; the raw/unfiltered version of this
+/// function let that unmarked check-in claim doc7 as the pair's permanent
+/// initiator, which under `initiator_wins` locked Doc1 out of ever
+/// controlling doc7, even from a later, genuine, marked dispatch. "Who
+/// spoke first" is only a meaningful signal about WHO DISPATCHED WHOM when
+/// restricted to messages that are actually dispatches; a report, a
+/// check-in, or chatter sent first doesn't make its sender the controller.
+///
+/// `marked_only` is deliberately the caller's own `edge_rules.marker_only`
+/// value, not unconditional: with `marker_only` OFF, `initiator_wins` is a
+/// pure "who genuinely spoke first, content-agnostic" cycle-breaker in its
+/// own right (see `edge_rule_combinations_produce_different_topologies_on_the_same_fixture`,
+/// which exists specifically to keep the four rule combinations visibly
+/// distinct for the operator's A/B) — gating the fix here, rather than
+/// applying it unconditionally, keeps that mode's own semantics intact
+/// while still fixing the live "both rules on" bug this task targets.
+fn compute_pair_initiators(resolved_edges: &HashMap<String, Vec<ResolvedEdge>>, marked_only: bool) -> HashMap<(String, String), String> {
     let mut earliest: HashMap<(String, String), (DateTime<Utc>, String)> = HashMap::new();
     for (receiver, edges) in resolved_edges {
         for edge in edges {
+            if marked_only && !edge.is_dispatch_marker {
+                continue; // an unmarked report/check-in never claims initiator status
+            }
             let key = pair_key(receiver, &edge.controller_id);
             let is_new_earliest = earliest.get(&key).is_none_or(|(at, _)| edge.at < *at);
             if is_new_earliest {
@@ -343,7 +364,7 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
     }
 
     let initiator_of_pair: HashMap<(String, String), String> = if edge_rules.initiator_wins {
-        compute_pair_initiators(&resolved_edges)
+        compute_pair_initiators(&resolved_edges, edge_rules.marker_only)
     } else {
         HashMap::new()
     };
@@ -716,6 +737,62 @@ mod tests {
         assert_eq!(children[0].label, "CCCG開發");
     }
 
+    /// Task 11 (2026-08-17): the real live regression, reproduced with the
+    /// real session titles and the real message shapes. "Doc7 向 Doc1 主管
+    /// 報到" initiated contact first (an unmarked worker check-in, 11:00) —
+    /// under the OLD raw-earliest initiator computation this alone would
+    /// have permanently locked Doc1 out of ever controlling doc7. Doc1's
+    /// own dispatch to doc7 (`doc1 → doc7:歡迎加入...`, the real arrow-prefix
+    /// shape, 11:30 — after the check-in) must still win: it's the pair's
+    /// only MARKED message.
+    #[test]
+    fn unmarked_checkin_does_not_block_a_later_marked_dispatch_from_the_opposite_direction() {
+        let doc1_content = r#"{"type":"custom-title","customTitle":"Doc1 主管","sessionId":"d1"}
+{"type":"user","timestamp":"2026-08-16T11:54:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"Doc7\">Doc7 向 Doc1 主管報到</desktop-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:54:10Z","message":{"model":"claude-sonnet-5"}}"#;
+        let doc7_content = r#"{"type":"custom-title","customTitle":"Doc7","sessionId":"d7"}
+{"type":"user","timestamp":"2026-08-16T11:58:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"Doc1 主管\">doc1 → doc7:歡迎加入...</desktop-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:58:10Z","message":{"model":"claude-sonnet-5"}}"#;
+        let doc1 = build_session_summary("slug", "d1", doc1_content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        let doc7 = build_session_summary("slug", "d7", doc7_content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+
+        let rows = tree_with_rules(vec![doc1, doc7], EdgeRules { initiator_wins: true, marker_only: true });
+
+        let top: Vec<&TreeRow> = rows.iter().filter(|r| r.depth == 0).collect();
+        assert_eq!(top.len(), 1, "doc7's unmarked check-in must not create a second top-level anchor: {rows:?}");
+        assert_eq!(top[0].label, "Doc1 主管");
+        let children: Vec<&TreeRow> = rows.iter().filter(|r| r.depth == 1).collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].label, "Doc7", "doc1's real dispatch must nest doc7 under it, unblocked by the earlier check-in");
+    }
+
+    /// Task 11: once a pair's initiator is locked in by its first MARKED
+    /// message, a LATER marked message in the opposite direction is a
+    /// reply, not a flip -- dropped, never restructuring the tree. Real
+    /// example this guards against: doc7 (correctly nested under Doc1)
+    /// later sends its OWN marked-shaped status update back to Doc1; that
+    /// must not un-nest doc7 and re-parent Doc1 under it.
+    #[test]
+    fn a_later_marked_message_in_the_opposite_direction_does_not_flip_the_initiator() {
+        let doc1_content = r#"{"type":"custom-title","customTitle":"Doc1 主管","sessionId":"d1"}
+{"type":"user","timestamp":"2026-08-16T11:58:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"Doc7\">doc7 → doc1:完成回報...</desktop-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:58:10Z","message":{"model":"claude-sonnet-5"}}"#;
+        let doc7_content = r#"{"type":"custom-title","customTitle":"Doc7","sessionId":"d7"}
+{"type":"user","timestamp":"2026-08-16T11:55:00Z","message":{"content":"<desktop-session-message from=\"x\" name=\"Doc1 主管\">doc1 → doc7:歡迎加入...</desktop-session-message>"}}
+{"type":"assistant","timestamp":"2026-08-16T11:58:10Z","message":{"model":"claude-sonnet-5"}}"#;
+        let doc1 = build_session_summary("slug", "d1", doc1_content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+        let doc7 = build_session_summary("slug", "d7", doc7_content, &[], at(NOW), crate::claude_sessions::CLAUDE_ALIVE_WINDOW_SECS).unwrap();
+
+        let rows = tree_with_rules(vec![doc1, doc7], EdgeRules { initiator_wins: true, marker_only: true });
+
+        let top: Vec<&TreeRow> = rows.iter().filter(|r| r.depth == 0).collect();
+        assert_eq!(top.len(), 1, "doc7's later marked reply must not create a second top-level anchor: {rows:?}");
+        assert_eq!(top[0].label, "Doc1 主管", "the pair's initiator (doc1, first marked dispatch at 11:55) never flips");
+        let children: Vec<&TreeRow> = rows.iter().filter(|r| r.depth == 1).collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].label, "Doc7");
+    }
+
     fn init_and_reply_sessions() -> (SessionSummary, SessionSummary) {
         // zz_init sends aa_reply a plain (non-marker) message FIRST
         // (11:59:00) -- establishing it as the pair's initiator. aa_reply
@@ -785,13 +862,19 @@ mod tests {
         assert_eq!(top.label, "AReply", "marker_only alone still lets a marker-shaped REPLY win control");
         assert!(rows.iter().any(|r| r.depth == 1 && r.label == "ZInit"));
 
-        // Both together (the operator's original combined design): the
-        // initiator's own message wasn't marker-tagged, so no message in
-        // either direction qualifies -- both stay independent, the
-        // conservative outcome when no genuine in-window dispatch exists.
+        // Both together (the operator's original combined design, task 11
+        // fix applied): the RAW first sender (ZInit, unmarked "嗨") no
+        // longer claims initiator status just for having spoken first --
+        // only MARKED messages compete for that. AReply's later "[派工]"
+        // is the pair's only marked message, so AReply -- not ZInit -- is
+        // the initiator, and its dispatch to ZInit creates the edge. This
+        // is the same shape as the real doc7 bug this task fixes: an
+        // earlier unmarked message must never block a later genuine
+        // dispatch from the opposite direction.
         let rows = tree_with_rules(vec![init, reply], EdgeRules { initiator_wins: true, marker_only: true });
-        assert_eq!(rows.iter().filter(|r| r.depth == 0).count(), 2, "no qualifying edge in either direction -- both stay independent: {rows:?}");
-        assert_eq!(rows.iter().filter(|r| r.depth == 1).count(), 0);
+        let top = rows.iter().find(|r| r.depth == 0).expect("AReply's marked dispatch must anchor the pair");
+        assert_eq!(top.label, "AReply", "the first MARKED sender wins, not the raw-first (but unmarked) sender");
+        assert!(rows.iter().any(|r| r.depth == 1 && r.label == "ZInit"));
     }
 
     /// Task 4: real non-dispatch bodies (a completion report and a recall

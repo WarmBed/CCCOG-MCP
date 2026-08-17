@@ -257,9 +257,28 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
 /// shape is `<tag ...>\n[派工|...`, a newline before the bracket).
 const DISPATCH_MARKERS: &[&str] = &["[派工", "【任務", "[任務", "[assign", "[dispatch", "【派工"];
 
+/// Task 11 (2026-08-17, live-verified against Doc1 主管's real dispatch
+/// bodies): the coordinator's ACTUAL convention is never one of
+/// [`DISPATCH_MARKERS`] — every real dispatch found on this machine reads
+/// `doc1 → doc7:歡迎加入...`, `doc1 → doc2:**發車令生效...**`, an explicit
+/// `<sender> <arrow> <recipient>:` prefix. This is a STRONGER signal than
+/// the bracket markers (it names both ends of the edge, not just "this is a
+/// dispatch"), so it gets its own recognizer alongside them, not a
+/// replacement. Three arrow spellings accepted: the Unicode arrow `→`
+/// (U+2192, what every real example above actually uses), the ASCII `->`
+/// fallback, and the CJK fullwidth punctuation spelling `－＞` (fullwidth
+/// hyphen-minus + fullwidth greater-than, U+FF0D U+FF1E — plausible from a
+/// fullwidth IME) some clients might emit instead of the Unicode arrow
+/// glyph.
+const ARROW_MARKERS: &[&str] = &["→", "->", "－＞"];
+
 fn body_has_dispatch_marker(body: &str) -> bool {
     let trimmed = body.trim_start();
-    DISPATCH_MARKERS.iter().any(|marker| starts_with_marker(trimmed, marker))
+    if DISPATCH_MARKERS.iter().any(|marker| starts_with_marker(trimmed, marker)) {
+        return true;
+    }
+    let first_line = trimmed.lines().next().unwrap_or("");
+    first_line_has_arrow_prefix(first_line)
 }
 
 fn starts_with_marker(text: &str, marker: &str) -> bool {
@@ -268,6 +287,38 @@ fn starts_with_marker(text: &str, marker: &str) -> bool {
     } else {
         text.starts_with(marker)
     }
+}
+
+/// Matches `<word> <arrow> <word>:` anchored at the START of the line —
+/// `word` is a short bare token (letters/digits/`_`/`-`, no spaces or
+/// punctuation, e.g. `doc1`/`doc7`), so a line like `研究一下 -> 做完` (prose
+/// that merely contains an arrow) never qualifies: `研究一下` fails the
+/// short-token check the same way a real sentence would. What follows the
+/// colon (the dispatch body itself — possibly markdown-bold, possibly CJK
+/// prose) is never inspected; only the `sender arrow recipient:` prefix
+/// shape matters.
+fn first_line_has_arrow_prefix(first_line: &str) -> bool {
+    ARROW_MARKERS.iter().any(|arrow| {
+        let Some(idx) = first_line.find(arrow) else {
+            return false;
+        };
+        let sender = first_line[..idx].trim();
+        let after = &first_line[idx + arrow.len()..];
+        let Some(colon_idx) = after.find(':') else {
+            return false;
+        };
+        let recipient = after[..colon_idx].trim();
+        is_short_name_token(sender) && is_short_name_token(recipient)
+    })
+}
+
+/// `doc1`, `doc7`, `Doc1_主管`-style short names — plain identifiers, never
+/// containing whitespace or the arrow/colon delimiters themselves. Kept
+/// deliberately loose (no length cap on legitimate names, just "no
+/// delimiter characters") since the real sender/recipient tokens observed
+/// on this machine are short but this isn't a validated ID format.
+fn is_short_name_token(token: &str) -> bool {
+    !token.is_empty() && !token.contains(char::is_whitespace) && !token.contains(':') && ARROW_MARKERS.iter().all(|arrow| !token.contains(arrow))
 }
 
 /// `"claude-sonnet-5"` → `"sonnet-5"` — the `claude-` prefix is redundant
@@ -870,6 +921,34 @@ mod tests {
         assert!(body_has_dispatch_marker("【任務】中文任務"));
         assert!(body_has_dispatch_marker("【派工】中文派工"));
         assert!(!body_has_dispatch_marker("assign without the bracket"));
+        assert!(!body_has_dispatch_marker(""));
+    }
+
+    /// Task 11 (2026-08-17): Doc1 主管's REAL dispatch convention, verified
+    /// against the live transcripts — never one of the bracket markers
+    /// above, always an explicit `sender -> recipient:` prefix.
+    #[test]
+    fn arrow_prefix_dispatch_marker_recognizes_the_real_doc1_convention() {
+        // The exact real bodies (bar/SYNC.md task-11 section).
+        assert!(body_has_dispatch_marker("doc1 → doc7:歡迎加入..."));
+        assert!(body_has_dispatch_marker("doc1 → doc2:**發車令生效...**"), "bold-wrapped text right after the colon must not block the prefix match");
+        assert!(body_has_dispatch_marker("doc1 → doc4:..."));
+        assert!(body_has_dispatch_marker("doc1 → doc5:..."));
+        // ASCII arrow fallback and the fullwidth punctuation spelling.
+        assert!(body_has_dispatch_marker("doc1 -> doc7: hello"));
+        assert!(body_has_dispatch_marker("doc1－＞doc7:hello"));
+        // Leading whitespace/newline before the arrow line is trimmed, same
+        // as the bracket markers.
+        assert!(body_has_dispatch_marker("  \n doc1 → doc7: hi"));
+        // Only the FIRST line is inspected — an arrow appearing later in a
+        // multi-line body (e.g. inside the dispatch's own prose) must not
+        // retroactively mark an unrelated first line as a dispatch.
+        assert!(!body_has_dispatch_marker("收到,馬上處理\ndoc1 → doc7: this arrow is not on the first line"));
+        // Prose that merely contains an arrow is not a dispatch: the
+        // "sender"/"recipient" tokens must be short, space-free, colon-free
+        // identifiers, not sentence fragments.
+        assert!(!body_has_dispatch_marker("研究一下 -> 這個問題 應該怎麼做: 先看文件"));
+        assert!(!body_has_dispatch_marker("plain text with no arrow at all"));
         assert!(!body_has_dispatch_marker(""));
     }
 

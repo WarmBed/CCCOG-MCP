@@ -223,7 +223,7 @@ cd bar
 cargo build --release --workspace
 
 cd ..
-dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64
 ```
 
 Run the built `CCCOG.Bar.App.exe` — the tray icon (a claude-orange

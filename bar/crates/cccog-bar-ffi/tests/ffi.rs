@@ -283,14 +283,15 @@ fn job_failure_override_beats_the_stale_annotation_and_carries_the_failure_time(
     assert_eq!(card.windows.len(), 1);
     assert_eq!(card.windows[0].used_percent, 100.0, "red 100% bar");
     assert_eq!(card.windows[0].remaining_percent, 0.0);
-    // Condensed on-card line (operator direction, bar/SYNC.md: "at most ONE
-    // short status line"): status word + the unified bare date only — the
-    // dispatch-failure time and "reached" prose move to diagnostic_detail.
+    // Task 11 (2026-08-17, operator direction: "same one-row treatment... so
+    // BOTH paths render identically" as the persisted override): no second
+    // status line under the window row — diagnostic is None, state is
+    // Fresh (this IS the app's current belief, not stale fallback data).
+    // The dispatch-failure time and "reached" prose live in
+    // diagnostic_detail for the hover tooltip only.
     let want_reset = expected_reset_display(Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap());
-    assert_eq!(
-        card.diagnostic.as_deref(),
-        Some(format!("limit · {want_reset}").as_str())
-    );
+    assert!(card.diagnostic.is_none(), "no second status line on the scan-path override either");
+    assert_eq!(card.state, QuotaState::Fresh);
     assert_eq!(
         card.diagnostic_detail.as_deref(),
         Some(format!("limit reached (dispatch failure 09:30) · {want_reset}").as_str())
@@ -325,7 +326,8 @@ fn job_failure_override_scans_stdout_tail_when_status_error_is_generic() {
     // numbers, not `expected_reset_display`'s UTC->Local conversion (that
     // helper is still correct for every OTHER reset source in this file,
     // which do carry an explicit/unambiguous UTC instant).
-    assert_eq!(card.diagnostic.as_deref(), Some("limit · 08/20 11:50"));
+    assert!(card.diagnostic.is_none(), "no second status line on the scan-path override either");
+    assert_eq!(card.state, QuotaState::Fresh);
     assert_eq!(
         card.diagnostic_detail.as_deref(),
         Some("limit reached (dispatch failure 09:13) · 08/20 11:50")
@@ -359,10 +361,12 @@ fn job_failure_override_applies_to_grok_and_is_skipped_without_a_match() {
     };
     let overridden = enrich_quota_cards(vec![grok_card.clone()], Some(root.path()), NOW_SECONDS);
     assert_eq!(overridden[0].windows[0].used_percent, 100.0);
-    // No date-shaped text in "HTTP 402 Payment Required" -> honest "unknown",
-    // never a guess; the condensed diagnostic never carries the
-    // dispatch-failure time (moved to diagnostic_detail instead).
-    assert_eq!(overridden[0].diagnostic.as_deref(), Some("limit · unknown"));
+    // No date-shaped text in "HTTP 402 Payment Required" -> honest "unknown"
+    // in the window row's own resetsAt, never a guess. Task 11: no second
+    // status line either way — the dispatch-failure time lives only in
+    // diagnostic_detail for the hover tooltip.
+    assert!(overridden[0].diagnostic.is_none(), "no second status line on the scan-path override either");
+    assert_eq!(overridden[0].state, QuotaState::Fresh);
     assert!(overridden[0]
         .diagnostic_detail
         .as_deref()

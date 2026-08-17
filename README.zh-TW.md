@@ -211,7 +211,7 @@ cd bar
 cargo build --release --workspace
 
 cd ..
-dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+dotnet build bar/app/CCCOG.Bar.App/CCCOG.Bar.App.csproj -c Release -p:Platform=x64
 ```
 
 執行編譯出來的 `CCCOG.Bar.App.exe`,系統匣圖示(claude 橘色圓角方塊徽章,

@@ -495,15 +495,17 @@ fn walk_jobs_for_quota_failure(
 
 /// Overrides a card to an honest "we saw this happen" state: a single 100%
 /// window — the red-bar color communicates blocked-ness as a status color,
-/// never a synthesized percentage — and a condensed one-line diagnostic
-/// (operator direction, bar/SYNC.md: "at most ONE short status line" —
-/// `"limit · 08/20 11:50"`, status word plus the unified bare reset date,
-/// nothing else). The reset text goes through `normalize_reset_display`
-/// (the single reset-time-format normalizer) so it matches the bare
-/// `MM/DD HH:MM` format the regular per-window `resetsAt` field renders.
-/// The fuller story this was condensed from — the dispatch failure's own
-/// timestamp and the verbatim provider reset text — is never discarded:
-/// it goes in `diagnostic_detail` for a hover tooltip instead.
+/// never a synthesized percentage. Task 11 (2026-08-17, operator direction:
+/// "apply the same one-row treatment... so BOTH paths render identically"):
+/// this ephemeral/scan-path override renders exactly like
+/// [`apply_persistent_limit_override`] now — `state: Fresh`,
+/// `diagnostic: None` (no second status line under the window row; a
+/// limit-blocked card is the app's own current belief, not stale fallback
+/// data needing a staleness flag), full detail moved to
+/// `diagnostic_detail` for the hover tooltip. The reset text goes through
+/// `normalize_reset_display` (the single reset-time-format normalizer) so
+/// it matches the bare `MM/DD HH:MM` format the regular per-window
+/// `resetsAt` field renders.
 fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> QuotaCards {
     let time_text = failure.at.format("%H:%M").to_string();
     let reset_display = failure
@@ -511,7 +513,6 @@ fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> 
         .as_deref()
         .map(normalize_reset_display)
         .unwrap_or_else(|| "unknown".to_owned());
-    let diagnostic = format!("limit · {reset_display}");
     let diagnostic_detail =
         format!("limit reached (dispatch failure {time_text}) · {reset_display}");
     QuotaCards {
@@ -523,9 +524,9 @@ fn apply_quota_limit_override(card: QuotaCards, failure: &QuotaLimitFailure) -> 
             remaining_percent: 0.0,
             resets_at: failure.reset_hint.as_deref().map(normalize_reset_display),
         }],
-        state: QuotaState::Stale,
+        state: QuotaState::Fresh,
         observed_at: card.observed_at,
-        diagnostic: Some(diagnostic),
+        diagnostic: None,
         diagnostic_detail: Some(diagnostic_detail),
         retry_after_seconds: None,
     }

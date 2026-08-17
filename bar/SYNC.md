@@ -1494,3 +1494,199 @@ icon's bounding rect, DPI-corrected via `SetProcessDPIAware()`) confirmed
 the real running taskbar shows the new claude-orange badge with a legible
 white "C", not the old three-dot design or a stale/blank icon. Quit
 verified clean via the app's own footer button.
+
+## 2026-08-17 task 11: real dispatch convention (arrow prefix), initiator-lock fix, scan-path quota parity — plus a build-folder root cause found along the way
+
+Three asks landed together: two `cccog-bar-core` control-edge rule changes
+and a `cccog-bar-ffi` quota-rendering follow-up, all triggered by the
+operator finding the live Flow tree flat again.
+
+### 1. Arrow-prefix dispatch marker
+
+Doc1 主管's REAL dispatch convention, confirmed against live transcripts,
+is never one of [`DISPATCH_MARKERS`] (`[派工`/`【任務`/etc) — every real
+example is an explicit `<sender> <arrow> <recipient>:` prefix
+(`doc1 → doc7:歡迎加入...`, `doc1 → doc2:**發車令生效...**`). Added
+`ARROW_MARKERS` (`claude_sessions.rs`) alongside the existing bracket
+markers — `→` (U+2192, the real shape), ASCII `->`, and the fullwidth
+punctuation spelling `－＞` (U+FF0D U+FF1E) — matched against the FIRST
+non-whitespace line only, anchored (`sender`/`recipient` must be bare
+short tokens: no whitespace, no colon, no arrow substring — so prose that
+merely contains an arrow, e.g. "研究一下 -> 這個問題 應該怎麼做:", never
+qualifies). Bold-wrapped text right after the colon
+(`**發車令生效...**`) is untouched since only the prefix shape is
+inspected, never the body after the colon.
+
+### 2. Initiator lock must be computed over MARKED messages only
+
+Live bug: a new session titled "Doc7 向 Doc1 主管報到" sent an UNMARKED
+check-in to Doc1 first; under `initiator_wins`, `compute_pair_initiators`
+used the RAW (unfiltered) edge set to decide "who spoke first in this
+pair" — so that unmarked check-in permanently locked Doc1 out of ever
+controlling doc7, even from a later, genuine, marked dispatch. Fix:
+`compute_pair_initiators` gained a `marked_only: bool` parameter, wired to
+the caller's own `edge_rules.marker_only` — NOT unconditional. Two
+reasons it's gated rather than applied everywhere:
+
+- Semantically, `initiator_wins` ALONE (marker_only off) is meant to be a
+  pure "who genuinely spoke first, content-agnostic" cycle-breaker in its
+  own right — applying the marked-only filter unconditionally would have
+  quietly changed that mode's own behavior too, not just the "both rules
+  on" production configuration the live bug was actually observed in.
+- The existing `edge_rule_combinations_produce_different_topologies_on_the_same_fixture`
+  test exists SPECIFICALLY to keep the four rule combinations visibly
+  distinct for the operator's own A/B comparison — an unconditional filter
+  would have collapsed two of those four combinations to look identical on
+  fixtures shaped like the doc7 bug, defeating that test's whole purpose.
+  (First implementation attempt WAS unconditional; both this test and
+  `the_old_cycle_fixture_resolves_deterministically_via_initiator_wins`
+  broke as a direct, correctly-predicted consequence — confirming the gate
+  was the right call, not just a defensive guess.)
+
+New fixtures: `unmarked_checkin_does_not_block_a_later_marked_dispatch_from_the_opposite_direction`
+(the doc1/doc7 case, real titles and real message shapes, both rules on)
+and `a_later_marked_message_in_the_opposite_direction_does_not_flip_the_initiator`
+(doc7's own later marked reply must not un-nest itself and re-parent
+doc1 — this already worked structurally once rule 1's initiator lock is
+correct, since the main loop's existing
+`initiator_of_pair.get(&key) != Some(&edge.controller_id)` guard drops any
+non-initiator sender regardless of marker status; the test exists to prove
+it, not to add new drop logic). `edge_rule_combinations_produce_different_topologies_on_the_same_fixture`'s
+"both rules together" block updated in place — its own fixture turned out
+to be the SAME shape as the doc7 bug (unmarked-first-then-marked-second,
+opposite senders), so its expected winner correctly flips from "both stay
+independent" to "the marked sender wins", which is the fix actually
+working, not a loosened assertion.
+
+### 3. Quota card: the scan-path/ephemeral override needed the same trim
+
+Task 9 only touched `apply_persistent_limit_override` (the persisted-cache
+path `enrich_quota_cards_persistent`/`poll_remote_quotas_json` actually use
+in production). `apply_quota_limit_override` — the older, ephemeral
+override behind `enrich_quota_cards`, exercised directly by its own test
+suite and kept as "a still-tested, non-persistent building block" per its
+own doc comment — still rendered the old two-line shape. Applied the
+identical trim: `state: Fresh`, `diagnostic: None`, full detail moved to
+`diagnostic_detail`. Three `tests/ffi.rs` cases updated
+(`job_failure_override_beats_the_stale_annotation_and_carries_the_failure_time`,
+`job_failure_override_scans_stdout_tail_when_status_error_is_generic`,
+`job_failure_override_applies_to_grok_and_is_skipped_without_a_match`) to
+assert the one-row shape instead of the old `"limit · <reset>"` diagnostic
+text.
+
+Investigated first whether this function is actually live in production
+before touching it (memory: don't implement a fix without checking the
+premise) — traced `poll_remote_quotas_json` and confirmed it calls
+`enrich_quota_cards_persistent` exclusively, which routes every override
+through `apply_persistent_limit_override` regardless of whether the round
+just refreshed evidence or is relying on older persisted evidence; so
+`apply_quota_limit_override` is NOT reachable from the app's own live quota
+poll today. Applied the fix anyway, exactly as asked ("so BOTH paths
+render identically") — it costs nothing, keeps the two override functions
+in visible lockstep for whoever reads them side by side, and the real
+explanation for what the operator's 16:25 screenshot actually showed
+turned out to be unrelated to this function entirely (see below).
+
+### The actual root cause of the operator's 16:25 screenshot: two divergent output folders
+
+While hunting for how the operator could still be seeing the pre-task-9
+duplicate-line text despite `apply_persistent_limit_override` already being
+fixed and previously live-verified, found the real explanation: this
+project's `.csproj` produces TWO independently launchable copies of the
+app — `bin\x64\Release\net10.0-windows10.0.19041.0\CCCOG.Bar.App.exe` (the
+base, RID-less output) and `...\win-x64\CCCOG.Bar.App.exe` (the
+RID-specific one) — and every `dotnet build` this whole multi-task session
+used `-p:RuntimeIdentifier=win-x64` explicitly, which builds ONLY the
+win-x64 folder. The `SyncWinX64RidOutput` MSBuild target (added earlier
+this session, task 5-ish, for exactly this class of bug) only fires when
+`$(RuntimeIdentifier) == ''` — i.e. it cascades FROM a RID-less build INTO
+win-x64, not the other way around. Passing `-p:RuntimeIdentifier=win-x64`
+explicitly bypasses that target's own condition entirely, so the base
+folder was never touched by any build this session ran.
+
+Confirmed with hashes: the operator's actual running instance (pid 43084,
+`StartTime` exactly `16:25:05` — matching the screenshot timestamp) was
+launched from the base-folder exe, whose `cccog_bar_ffi.dll` (mtime
+`12:05:47`, predating even this task) was genuinely stale — a completely
+different binary than the one every "live-verified" claim in tasks 6–10
+actually exercised (all of which launched the win-x64 copy). Every prior
+task's live verification in this session was real and accurate for the
+binary it launched — but that binary was silently the WRONG one from the
+operator's own point of view, since their own launch path (however they
+invoke it — a shortcut, muscle memory, whatever) uses the base folder.
+
+**Fix**: rebuild with the RID-less command
+(`dotnet build ... -c Release -p:Platform=x64`, no `-p:RuntimeIdentifier`)
+— this single command now updates the base folder directly AND cascades
+into win-x64 via the existing sync target, confirmed via SHA-256: all three
+pairs (dll/exe/icon) are byte-identical across both folders after this
+build. This is the build command every task from here forward should use;
+the plain `-p:RuntimeIdentifier=win-x64` form used throughout tasks 6–10 is
+still fine for a quick win-x64-only check but must not be assumed to also
+refresh the base folder.
+
+### Live verification: quota fix confirmed; Flow-tree nesting NOT conclusively confirmed (disclosed honestly)
+
+Killed the operator's stale pid (43084), rebuilt with the corrected
+RID-less command, relaunched from the BASE folder path (matching what the
+operator's own instance was running from) as a fresh process. No
+`bar-crash.log` at any point; quit path confirmed clean (`Stop-Process`,
+since the flyout was not on-screen at that moment for the UI-Automation
+Quit-button path used in earlier tasks).
+
+**Quota card**: confirmed live — Codex card renders `Limit 100% / 08/20
+11:50` then straight to the Grok card, no second line, from the
+corrected/synced binary.
+
+**Flow-tree nesting**: NOT conclusively confirmed. The live tree still
+showed "Doc7 向 Doc1 主管報到" and "Doc1 主管" as separate top-level rows.
+Traced this as far as time allowed: Doc1's real dispatch/approval traffic
+to doc7 goes through `mcp__ccd_session_mgmt__send_message` (confirmed
+directly in Doc1's own session transcript, e.g. `doc1 → doc7:首單品質很高,
+驗收通過...` at 08:51:13Z, targeting `session_id:
+"local_e1fabe20-8b56-40ca-92e0-ae367a4a54c3"`) — a CCD-native tool, not a
+literal `<cross-session-message>`/`<desktop-session-message>` XML tag
+authored directly into a transcript. `mcp__ccd_session_mgmt__get_session`
+confirms that target session genuinely exists (title "Doc7 向 Doc1 主管報到",
+`lastActivityAt` matching the Flow view's own "閒置 3m" to the second), but
+its raw transcript file could not be located under this machine's
+`%USERPROFILE%\.claude\projects` tree by session id, by cwd-derived slug, or
+by content (`search_session_transcripts` for the literal sent text also
+came back empty) — every avenue available in this session came up empty.
+Two live-plausible, NOT-distinguished-between explanations:
+
+1. The delivery ultimately does land as a `<desktop-session-message>` tag
+   the way earlier tasks' confirmed real examples did, in a transcript file
+   this investigation simply failed to locate in the time available (a
+   file-finding gap, not a code gap) — in which case the rule fixes above
+   are already correct and should show up once that specific pair's
+   messages are actually within a fresh scan's alive window.
+2. `ccd_session_mgmt`'s delivery path is architecturally different from
+   the transcript-file convention `claude_sessions.rs` was built to read at
+   all, in which case NO amount of marker-detection tuning inside
+   `cccog-bar-core` fixes this pair specifically — the gap would be one
+   level up, in what Flow's session scanner reads in the first place.
+
+This is deliberately reported as an open question rather than either "it
+works" or "it's still broken" — neither claim is honestly supportable from
+what could be verified here. The code changes themselves are correct and
+provably so via the unit fixtures above, which encode the exact real bug
+shape byte-for-byte; what's unconfirmed is only whether they're the
+complete fix for what the operator will see live. Flagged for the operator
+to either re-run this exact live check once a dispatch using the confirmed
+`<desktop-session-message>` mechanism is fresh and in-window, or to help
+locate where `ccd_session_mgmt`-routed sessions' transcripts actually live
+on disk if the second explanation is the real one.
+
+### Gates
+
+`cargo test --workspace`: 143 tests green, up from 140 (3 net new
+`cccog-bar-core` tests: the arrow-marker fixture plus the two doc1/doc7
+tree fixtures; 3 pre-existing `cccog-bar-ffi` tests updated in place to the
+new quota-render shape; 2 pre-existing `cccog-bar-core` tests updated in
+place to the corrected — and correctly narrower — initiator-gate
+expectation). `cargo build --release
+--workspace`: clean. `dotnet build` (RID-less, the corrected command): 0
+warnings, 0 errors, both output folders verified byte-identical. Commit +
+push authorized per the operator's message; both landed after all of the
+above.
