@@ -1186,6 +1186,17 @@ fn collect_dispatch_jobs_for_tree(jobs_root: &Path) -> Vec<DispatchJobInput> {
     jobs
 }
 
+/// Task 16: the `finishedAt` fallback for a terminal job whose
+/// `status.json` never recorded one — the FILE's own last-modified time,
+/// which for a `status.json` that's never rewritten after the job finishes
+/// (this codebase's convention) is a faithful proxy for "when did this job
+/// actually finish".
+fn status_file_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    DateTime::<Utc>::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
+}
+
 fn walk_jobs_for_tree(dir: &Path, out: &mut Vec<DispatchJobInput>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1221,6 +1232,24 @@ fn walk_jobs_for_tree(dir: &Path, out: &mut Vec<DispatchJobInput>) {
             .or(status.created_at.as_deref())
             .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
             .map(|value| value.with_timezone(&Utc));
+        // Task 16 (2026-08-18): only meaningful for a TERMINAL job — the
+        // tree's own terminal aggregation filters by this, per the
+        // operator's own instruction: `status.json`'s `finishedAt`,
+        // falling back to the FILE's own mtime (not startedAt/createdAt —
+        // deliberately a different fallback chain than `control.rs`'s own
+        // separate windowed reducer uses, since a job that somehow never
+        // recorded `finishedAt` at all is better judged by "when did we
+        // last touch this record" than by when it merely started).
+        let finished_at = if active {
+            None
+        } else {
+            status
+                .finished_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+                .map(|value| value.with_timezone(&Utc))
+                .or_else(|| status_file_mtime(&path))
+        };
         let target_label = status
             .session_id
             .as_deref()
@@ -1235,6 +1264,7 @@ fn walk_jobs_for_tree(dir: &Path, out: &mut Vec<DispatchJobInput>) {
             running,
             model: status.model,
             time,
+            finished_at,
             target_label,
         });
     }

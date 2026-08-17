@@ -147,9 +147,22 @@ pub struct DispatchJobInput {
     pub running: bool,
     pub model: Option<String>,
     /// Active: start time. Used for elapsed-seconds only; terminal jobs are
-    /// aggregated by count, not shown individually, so their own time isn't
-    /// needed here.
+    /// aggregated by count, not shown individually, so their own start time
+    /// isn't needed here — see `finished_at` for what DOES gate a terminal
+    /// job.
     pub time: Option<DateTime<Utc>>,
+    /// Task 16 (2026-08-18): a TERMINAL job's own authoritative finish time
+    /// — `status.json`'s own `finishedAt`, falling back to the file's own
+    /// mtime when absent (the operator's own instruction; NOT
+    /// `startedAt`/`createdAt`, unlike `control.rs`'s own separate
+    /// windowed reducer — this crate's two aggregations are allowed to use
+    /// different fallback chains, they just must share the identical
+    /// WINDOW, see `crate::control::TERMINAL_WINDOW_SECS`). `None` only
+    /// when the caller couldn't determine either (never observed on a real
+    /// `status.json`, which always has SOME mtime) — such a job is treated
+    /// as NOT within the window, never rendered as if it were fresh.
+    /// Meaningless/unset for active jobs.
+    pub finished_at: Option<DateTime<Utc>>,
     /// Short display label for the job's target (session id prefix or a
     /// resolved title) — already bounded/sanitized by the caller.
     pub target_label: String,
@@ -602,10 +615,24 @@ pub fn build_tree(input: TreeBuildInput) -> Vec<TreeRow> {
         rows.extend(children);
     }
 
-    // Bottom aggregate: terminal dispatch jobs, per provider.
+    // Bottom aggregate: terminal dispatch jobs, per provider. Task 16
+    // (2026-08-18): live-confirmed bug — this used to count EVERY terminal
+    // job ever seen, unwindowed (`codex ×60`/`grok ×34` staying fixed for
+    // hours after the last real dispatch, long past
+    // `control::TERMINAL_WINDOW_SECS`, which this aggregation never
+    // actually applied). Now filtered by the identical window, keyed off
+    // `finished_at` — an empty/all-filtered-out provider renders no row at
+    // all (never a fabricated `×0`).
     let mut terminal_counts: HashMap<String, u32> = HashMap::new();
     for job in &jobs {
         if job.active {
+            continue;
+        }
+        let Some(finished_at) = job.finished_at else {
+            continue; // no determinable finish time at all — never assumed fresh
+        };
+        let age = (now - finished_at).num_seconds();
+        if !(0..=crate::control::TERMINAL_WINDOW_SECS).contains(&age) {
             continue;
         }
         *terminal_counts.entry(job.provider.clone()).or_insert(0) += 1;
@@ -1078,6 +1105,7 @@ mod tests {
             running: true,
             model: Some("luna-max".to_owned()),
             time: Some(at("2026-08-16T11:57:00Z")),
+            finished_at: None, // active job — not read for the terminal-window filter
             target_label: "Doc5c".to_owned(),
         };
         let mut input = empty_input(vec![controller]);
@@ -1101,6 +1129,7 @@ mod tests {
             running: false,
             model: None,
             time: None,
+            finished_at: Some(at("2026-08-16T11:00:00Z")), // 1h before NOW, inside the 2h terminal window
             target_label: "x".to_owned(),
         }];
         input.owners = vec![OwnerInput { provider: "grok".to_owned(), live: false }];
@@ -1110,6 +1139,67 @@ mod tests {
         let resumable = rows.iter().find(|r| r.kind == "resumable").unwrap();
         assert_eq!(resumable.state_label, RESUMABLE_STATE);
         assert_eq!(resumable.label, "grok");
+    }
+
+    fn terminal_job(provider: &str, finished_at: Option<DateTime<Utc>>) -> DispatchJobInput {
+        DispatchJobInput {
+            provider: provider.to_owned(),
+            caller_label: None,
+            hop_chain: None,
+            active: false,
+            running: false,
+            model: None,
+            time: None,
+            finished_at,
+            target_label: "x".to_owned(),
+        }
+    }
+
+    /// Task 16 (2026-08-18) regression: this is the exact live-confirmed
+    /// bug — a terminal job whose `finished_at` is OUTSIDE
+    /// `control::TERMINAL_WINDOW_SECS` (2h) must not count at all, and if
+    /// EVERY job for a provider is stale, that provider's terminal row
+    /// must not render at all (never a fabricated `codex ×0`) — this
+    /// aggregation used to count every terminal job ever seen, unwindowed.
+    #[test]
+    fn terminal_jobs_outside_the_window_produce_no_row_at_all() {
+        let mut input = empty_input(Vec::new());
+        input.jobs = vec![
+            terminal_job("codex", Some(at("2026-08-16T09:00:00Z"))), // 3h before NOW — outside the 2h window
+            terminal_job("codex", Some(at("2026-08-15T12:00:00Z"))), // 1 day before NOW — outside
+        ];
+        let rows = build_tree(input);
+        assert!(rows.iter().all(|r| r.kind != "terminal"), "every codex terminal job is stale — no row, not `codex ×0`");
+    }
+
+    /// A provider with a MIX of fresh and stale terminal jobs must count
+    /// only the fresh ones — proves the filter is per-job, not
+    /// per-provider (a single fresh job doesn't "rescue" its stale
+    /// siblings into the count, and a single stale job doesn't suppress
+    /// the otherwise-fresh count).
+    #[test]
+    fn terminal_jobs_count_only_the_ones_inside_the_window() {
+        let mut input = empty_input(Vec::new());
+        input.jobs = vec![
+            terminal_job("codex", Some(at("2026-08-16T11:00:00Z"))), // 1h before NOW — inside
+            terminal_job("codex", Some(at("2026-08-16T10:30:00Z"))), // 1.5h before NOW — inside
+            terminal_job("codex", Some(at("2026-08-16T08:00:00Z"))), // 4h before NOW — outside
+        ];
+        let rows = build_tree(input);
+        let terminal = rows.iter().find(|r| r.kind == "terminal").unwrap();
+        assert_eq!(terminal.label, "codex ×2", "only the 2 in-window jobs count, the 4h-stale one doesn't");
+    }
+
+    /// A job with no determinable finish time at all (`finished_at: None`
+    /// — the FFI layer's own fallback chain, `finishedAt` then the file's
+    /// mtime, only returns `None` if BOTH are unavailable) must never be
+    /// treated as fresh by default — excluded, same as a stale one.
+    #[test]
+    fn terminal_job_with_no_determinable_finish_time_is_excluded() {
+        let mut input = empty_input(Vec::new());
+        input.jobs = vec![terminal_job("grok", None)];
+        let rows = build_tree(input);
+        assert!(rows.iter().all(|r| r.kind != "terminal"), "no finish time at all must never default to 'fresh'");
     }
 
     #[test]

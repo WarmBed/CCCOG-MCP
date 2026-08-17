@@ -2238,3 +2238,80 @@ quota 30 and ffi 34 unchanged). `dotnet build -c Release -p:Platform=x64`
 (after `cargo build --release --workspace` first, per task 14's own
 re-learned lesson): 0 warnings, 0 errors. No `bar-crash.log` growth.
 Commit + push authorized.
+
+## 2026-08-18 task 16: terminal aggregate rows were never windowed
+
+Live-confirmed bug: `codex ×60`/`grok ×34` at the bottom of the Flow tree
+stayed FIXED for many hours after the last real dispatch — `control.rs`'s
+own `TERMINAL_WINDOW_SECS = 2h` (line 46) is real and correctly applied
+by `control.rs`'s OWN windowed reducer (`build_terminal_rows`, verified
+still filtering correctly by `job.time` inside `(0..=TERMINAL_WINDOW_SECS)`
+— that path was never the bug), but `tree::build_tree`'s SEPARATE,
+simpler terminal aggregation (task 12's own doc comment on
+`DispatchJobInput::time` said it outright: "terminal jobs are aggregated
+by count, not shown individually, so their own time isn't needed here")
+counted every non-active job it had EVER walked off disk, with no window
+applied at all. Two aggregations of the same underlying `dispatch/jobs`
+tree, only one of them windowed — a same-concept-two-implementations gap
+(see `project_same_concept_many_impls_audit` in memory), not a
+regression in either one individually.
+
+### Fix
+
+`control::TERMINAL_WINDOW_SECS` promoted from a private `const` to
+`pub(crate)` so both aggregations import the IDENTICAL constant — the
+whole point being that a future edit to the window can never again drift
+between the two paths the way this bug shows it already did once.
+
+`tree::DispatchJobInput` gained `finished_at: Option<DateTime<Utc>>` — a
+terminal job's own authoritative finish time, deliberately using a
+DIFFERENT fallback chain than `control.rs`'s own separate reducer
+(`finished.or(started).or(created)`): the operator's own instruction was
+`status.json`'s `finishedAt`, falling back to the FILE's own mtime (new
+`cccog-bar-ffi::status_file_mtime` helper) — not `startedAt`/`createdAt`.
+The two aggregations are allowed to disagree on their fallback chain;
+they only need to share the WINDOW, which they now structurally do via
+the shared constant. `build_tree`'s terminal-counting loop now skips any
+job whose `finished_at` is `None` or outside `(0..=TERMINAL_WINDOW_SECS)`
+of `now` before incrementing that provider's count — a provider with
+every job filtered out renders NO row at all (never a fabricated
+`codex ×0`), and the registry files on disk are completely untouched
+(display-only filtering, per the task's own scope).
+
+4 new/updated fixtures in `tree.rs`: the exact regression shape (every
+job stale → no row, not `×0`), a mix of fresh+stale for one provider
+(only the fresh ones count — proves the filter is per-job), a job with
+no determinable finish time at all (excluded, never defaulted to
+"fresh"), and the pre-existing terminal-aggregate test updated with an
+explicit in-window `finished_at` (it previously relied on the field not
+existing/not being checked at all).
+
+### Live verification
+
+Rebuilt the release FFI DLL and CLI, killed and relaunched the app.
+Before this fix (this same live run, checked earlier in this session
+while still on task 15's binary): the Flow tree showed `codex ×60` and
+`grok ×34` as two extra bottom rows. After: a fresh `AutomationElement`
+text dump of the running flyout —
+
+```
+CCCG開發 ... 執行中 · 0s ctx 39%
+Add Claude session liveness to Flow ... 執行中 · 0s ctx 36%
+doc5 Api文件檢查 ... 執行中 · 35s ctx 10%
+3 flow row(s) - tokens only
+```
+
+— confirms both terminal rows are GONE entirely, exactly the task's own
+predicted live result ("nothing terminal in the last 2h" — the last
+real dispatch was hours before this check). No `bar-crash.log` growth.
+
+### Gates
+
+`cargo test --workspace`: 159 tests green (core crate 77 lib + 5 graph +
+4 parsers + 4 refresh + 5 usage = 95, +3 net from this task's fixtures;
+quota 30 and ffi 34 unchanged). `dotnet build -c Release -p:Platform=x64`
+(release Rust rebuild first): 0 warnings, 0 errors — this task's own
+changes are Rust-only (display-only filtering on data the C# side
+already just renders whatever rows arrive), so the C# rebuild here is
+solely to pick up the fresh FFI DLL, no source changes on that side.
+Commit + push authorized.

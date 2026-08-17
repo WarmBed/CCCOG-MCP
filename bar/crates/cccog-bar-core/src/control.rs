@@ -42,8 +42,13 @@ const LABEL_MAX_BYTES: usize = 80;
 const TITLE_MAX_BYTES: usize = 24;
 const STATUS_MAX_BYTES: usize = 32;
 /// Terminal jobs stay visible for two hours after their authoritative time
-/// (TokenBar's `agent_cccog.rs` constant, reused unchanged).
-const TERMINAL_WINDOW_SECS: i64 = 2 * 60 * 60;
+/// (TokenBar's `agent_cccog.rs` constant, reused unchanged). `pub(crate)`
+/// (task 16, 2026-08-18) so `tree::build_tree`'s own, separate terminal
+/// aggregation shares the IDENTICAL window rather than risking a second
+/// hardcoded `2 * 60 * 60` silently drifting from this one — that drift is
+/// exactly how tree.rs's own aggregation went unwindowed in the first
+/// place (it simply never applied any window at all).
+pub(crate) const TERMINAL_WINDOW_SECS: i64 = 2 * 60 * 60;
 /// CCCOG-original: active jobs queued/running past this age collapse into
 /// one `stale ×N` row (pre-dates this port; kept unchanged).
 const STALE_ACTIVE_SECS: i64 = 6 * 60 * 60;
