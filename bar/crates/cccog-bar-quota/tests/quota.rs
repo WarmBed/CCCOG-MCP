@@ -1,7 +1,7 @@
 use cccog_bar_quota::{
-    fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_codex_quota_from_sessions,
-    load_grok_token, parse_codex_rate_limits, HttpClient, HttpRequest, HttpResponse,
-    OAuthCredential, PollGate, QuotaState,
+    fetch_claude_quota, fetch_grok_quota, load_claude_credential, load_claude_credential_with_store,
+    load_codex_quota_from_sessions, load_grok_token, parse_codex_rate_limits, CredentialStore,
+    HttpClient, HttpRequest, HttpResponse, OAuthCredential, PollGate, QuotaState,
 };
 use chrono::{Local, TimeZone, Utc};
 
@@ -265,6 +265,118 @@ fn missing_credential_files_are_none_not_errors() {
     let grok_path = directory.path().join("missing-grok.json");
     assert_eq!(load_claude_credential(&claude_path).expect("ok"), None);
     assert_eq!(load_grok_token(&grok_path).expect("ok"), None);
+}
+
+/// Task 18 (2026-08-18): a fake `CredentialStore` so these fixtures never
+/// touch the real Windows Credential Manager — the same injection
+/// discipline `FakeHttp` already gives the network boundary.
+struct FakeCredentialStore {
+    result: Result<Option<String>, String>,
+}
+
+impl CredentialStore for FakeCredentialStore {
+    fn read_generic_credential(&self, _target_name: &str) -> Result<Option<String>, String> {
+        self.result.clone()
+    }
+}
+
+const CLAUDE_OAUTH_BLOB: &str =
+    r#"{"claudeAiOauth":{"accessToken":"cm-access","refreshToken":"cm-refresh","expiresAt":3000000}}"#;
+const CLAUDE_OAUTH_BLOB_LOGGED_OUT: &str = r#"{"claudeAiOauth":{"scopes":["user:inference"]}}"#;
+
+/// The Windows Credential Manager blob is parsed with the IDENTICAL shape
+/// the file already uses — same field names, same millisecond-to-second
+/// normalization — and, when it hits, the file is never even opened
+/// (`missing-claude.json` doesn't exist).
+#[test]
+fn credential_manager_blob_parses_the_same_shape_as_the_file_and_wins_over_it() {
+    let directory = tempfile::tempdir().expect("temp fixture");
+    let claude_path = directory.path().join("missing-claude.json");
+    let store = FakeCredentialStore {
+        result: Ok(Some(CLAUDE_OAUTH_BLOB.to_owned())),
+    };
+    let credential = load_claude_credential_with_store(&store, &claude_path)
+        .expect("parse ok")
+        .expect("credential present");
+    assert_eq!(credential.access_token, "cm-access");
+    assert_eq!(credential.refresh_token.as_deref(), Some("cm-refresh"));
+    assert_eq!(credential.expires_at, Some(3000));
+}
+
+/// A blob that's present in the store but logged out (`claudeAiOauth`
+/// exists with no `accessToken` — TokenBar's own documented #26
+/// daily-logout state) is skipped, not treated as a failure: the file,
+/// which DOES have a usable credential here, must still be reached.
+#[test]
+fn credential_manager_logged_out_blob_falls_through_to_the_file() {
+    let directory = tempfile::tempdir().expect("temp fixture");
+    let claude_path = directory.path().join("claude.json");
+    std::fs::write(
+        &claude_path,
+        r#"{"claudeAiOauth":{"accessToken":"file-access","refreshToken":"file-refresh","expiresAt":2000000}}"#,
+    )
+    .expect("write file fixture");
+    let store = FakeCredentialStore {
+        result: Ok(Some(CLAUDE_OAUTH_BLOB_LOGGED_OUT.to_owned())),
+    };
+    let credential = load_claude_credential_with_store(&store, &claude_path)
+        .expect("parse ok")
+        .expect("credential present from the file");
+    assert_eq!(credential.access_token, "file-access");
+}
+
+/// The store reporting "no such credential" (`Ok(None)` — the common case,
+/// most installs never write one) falls through to the file the same way.
+#[test]
+fn credential_manager_miss_falls_through_to_the_file() {
+    let directory = tempfile::tempdir().expect("temp fixture");
+    let claude_path = directory.path().join("claude.json");
+    std::fs::write(
+        &claude_path,
+        r#"{"claudeAiOauth":{"accessToken":"file-access","refreshToken":"file-refresh","expiresAt":2000000}}"#,
+    )
+    .expect("write file fixture");
+    let store = FakeCredentialStore { result: Ok(None) };
+    let credential = load_claude_credential_with_store(&store, &claude_path)
+        .expect("parse ok")
+        .expect("credential present from the file");
+    assert_eq!(credential.access_token, "file-access");
+}
+
+/// A genuine Credential-Manager-layer read error is never more actionable
+/// than the file fallback, so it degrades the same way a miss does —
+/// never surfaced as this call's own hard failure while the file still
+/// has a usable credential.
+#[test]
+fn credential_manager_read_error_falls_through_to_the_file() {
+    let directory = tempfile::tempdir().expect("temp fixture");
+    let claude_path = directory.path().join("claude.json");
+    std::fs::write(
+        &claude_path,
+        r#"{"claudeAiOauth":{"accessToken":"file-access","refreshToken":"file-refresh","expiresAt":2000000}}"#,
+    )
+    .expect("write file fixture");
+    let store = FakeCredentialStore {
+        result: Err("simulated Credential Manager failure".to_owned()),
+    };
+    let credential = load_claude_credential_with_store(&store, &claude_path)
+        .expect("parse ok")
+        .expect("credential present from the file");
+    assert_eq!(credential.access_token, "file-access");
+}
+
+/// Mirrors `missing_credential_files_are_none_not_errors`, but through the
+/// injectable entry point with a genuinely empty store AND a missing file
+/// — the fully-absent case must still resolve to `Ok(None)`, not an error.
+#[test]
+fn credential_manager_miss_and_missing_file_together_are_none_not_an_error() {
+    let directory = tempfile::tempdir().expect("temp fixture");
+    let claude_path = directory.path().join("missing-claude.json");
+    let store = FakeCredentialStore { result: Ok(None) };
+    assert_eq!(
+        load_claude_credential_with_store(&store, &claude_path).expect("ok"),
+        None
+    );
 }
 
 #[test]

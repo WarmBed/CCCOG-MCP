@@ -73,7 +73,7 @@ bar/
                              # .claude.com token refresh, Grok cli-chat-proxy
                              # billing. Concrete failure reasons only
                              # ("HTTP 401", "token refresh rejected", ...).
-                             # (30 tests)
+                             # (35 tests)
   crates/cccog-bar-ffi      # stable C ABI: versioned flow+quota envelope,
                              # background quota poller with a hard 60s floor,
                              # the persisted quota-limit cache, flow.edgeRules
@@ -201,7 +201,7 @@ full message content is never parsed, stored, or displayed.
 
 ```powershell
 cd bar
-cargo test --workspace                 # 161 tests across core/quota/ffi
+cargo test --workspace                 # 166 tests across core/quota/ffi
 cargo build --release --workspace      # produces target/release/cccog_bar_ffi.dll
 
 cd ..

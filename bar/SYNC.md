@@ -2438,3 +2438,128 @@ Release -p:Platform=x64`: 0 warnings, 0 errors — Rust-only fix, no C#
 changes were needed (the existing rendering pipeline was already correct
 once fed the right wire JSON). No `bar-crash.log` growth. Commit + push
 authorized.
+
+## 2026-08-18 task 18: Windows Credential Manager as a first-choice Claude credential source — implemented, but its premise did not hold on this machine
+
+The dispatched task's own diagnosis: `load_claude_credential` reads ONLY
+`~/.claude/.credentials.json`, but on Windows Claude Code allegedly keeps
+the LIVE `claudeAiOauth` blob in Windows Credential Manager under
+service `Claude Code-credentials`, with "TokenBar's `agent_usage.rs`
+reads it FIRST via keychain lookup, file second" cited as the reference
+implementation to port.
+
+### Both premises were checked directly and neither held on this machine
+
+1. **TokenBar's actual source, read directly** (`D:\code\TokenBar-Windows`,
+   the same read-only local clone `bar/SYNC.md`'s own derivation record
+   already documents) — checked BOTH the pinned derivation commit
+   (`a829d51`) and the latest `origin/main` (`d5b8ce6`, fetched read-only
+   for this check, nothing in the clone modified). In both,
+   `load_claude_credentials_from_keychain_item` is explicitly
+   `#[cfg(not(target_os = "macos"))] -> Ok(None)` — a macOS-only path
+   (`/usr/bin/security find-generic-password`), stubbed out entirely on
+   Windows. TokenBar does not read Claude credentials from Windows
+   Credential Manager, on either commit available to check.
+2. **The live credential store itself** — `cmdkey /list` (enumerates this
+   user's Credential Manager entries by target name, reveals no secrets)
+   returned ~30 entries (git/GitHub, Bitbucket, Xbox Live, NordVPN, VS
+   Code CLI, Microsoft account SSO) and **zero** matching "Claude" in any
+   form. This machine's own `claude` command resolves to a native binary
+   under `~/.local/bin` (not an npm/`keytar` install), which is
+   independent corroborating evidence it likely never had a reason to
+   write one.
+
+Both checks are reproducible and neither depends on trusting the
+dispatched task's own framing — see the exact commands in the commit body
+below.
+
+### Implemented anyway — it's sound, safe, forward-compatible engineering regardless
+
+A Windows install of Claude Code that DOES use a Node `keytar`-style
+native credential module (the npm package, not the native binary this
+machine has) plausibly still writes to Credential Manager under that
+exact service name — TokenBar's own doc comment for the macOS path
+frames it as "the LIVE blob," implying its authors expect a Node-side
+component to maintain it more actively than the on-disk file snapshot,
+which matches task 17's own root cause (a rotated-out refresh token in
+the file). Adding Credential-Manager-first, file-fallback is read-only,
+gracefully degrading, and costs nothing when absent (this machine's own
+live test below shows exactly the same fallback-to-file behavior as
+before this task).
+
+New `CredentialStore` trait (`cccog-bar-quota`) — the same injection
+discipline `HttpClient` already gives the network boundary — so fixtures
+never touch the real OS store. `WindowsCredentialManager` (`#[cfg(windows)]`,
+a `#[cfg(not(windows))] -> Ok(None)` stub off-Windows so `cargo check`
+stays possible on any host) wraps a small, isolated `CredReadW`/`CredFree`
+module (`windows_credential_manager`) — read-only by construction (only
+ever calls those two functions, never `CredWriteW`/`CredDeleteW`), and
+never logs the blob it reads (only the parsed `claudeAiOauth` struct
+flows further, same as the file path already did). `CredentialBlob` has
+no fixed encoding at the Win32 API level; decoding tries UTF-16LE first
+(the convention Node's `keytar` uses, treating the value as a wide
+"password" string) then falls back to raw UTF-8, since this reader can't
+assume which native module, if any, actually wrote the entry —
+unverified in practice on this machine (nothing to decode), flagged
+honestly rather than asserted as confirmed-correct.
+
+`parse_claude_oauth_blob` is now the SINGLE shared parser for both
+sources (Credential Manager blob and file — identical `claudeAiOauth`
+JSON shape). This unified a genuine behavior difference the old
+file-only code had: a present-but-logged-out blob (valid JSON, no
+`accessToken`) used to be a hard `Err` ("Claude OAuth access token
+missing"); it's now `Ok(None)` for BOTH sources — TokenBar's own
+documented behavior for this exact daily-logout state, and the correct
+one for a chain where "this source has nothing usable, try the next" is
+the whole point. Confirmed via grep that no existing test relied on the
+old error-throwing behavior before changing it.
+
+Chain: Credential Manager hit (parses to a usable, logged-in credential)
+wins outright; anything else — miss, logged-out blob, malformed blob, or
+a genuine read error — falls through to the file. 5 new fixtures via a
+fake `CredentialStore`: blob parses the identical shape the file uses
+and wins over it; a logged-out CM blob falls through to a valid file;
+a CM miss falls through to a valid file; a CM read error falls through
+the same way; both sources absent together resolve to `Ok(None)`, not
+an error.
+
+### Live verification
+
+Rebuilt release Rust workspace (`cargo build --release --workspace`,
+task 14's own lesson: before `dotnet build`, not after — the csproj only
+copies the FFI DLL, never builds it), 0 warnings/errors on the C# side.
+Fresh relaunch: no `bar-crash.log`, app stable. The Claude card shows
+exactly the same three lines as before this task —
+
+```
+5h  7%   08/17 00:09
+7d  7%   08/23 13:59
+stale · token refresh rejected · 14:13
+```
+
+— confirming the new code path is correctly wired (it runs on every
+poll now) and degrades exactly as designed when Credential Manager has
+nothing to offer: no crash, no behavior change, same honest stale badge
+task 17 already established as correct for this machine's actual state.
+
+**The task's own live gate — "the card must match Claude Code's official
+usage panel within one refresh, stale badge disappears" — could not be
+satisfied and is not claimed here.** There is no live Claude credential
+anywhere on this machine right now (neither the file's rotated-out
+refresh token, task 17's finding, nor a Credential Manager entry, this
+task's own finding) for the app to refresh with — the stale badge is the
+correct, honest thing to show, not a bug this task's own code could
+fix. If the operator's REAL machine (as opposed to wherever this
+diagnosis ran) has a genuine `Claude Code-credentials` entry, this same
+build should pick it up automatically on its next poll with no further
+change — worth a live spot-check there specifically, since that's the
+one thing this session could not verify directly.
+
+### Gates
+
+`cargo test --workspace`: 166 tests green (core 95 unchanged; ffi 36
+unchanged; quota 35, +5 from this task's fixtures). `dotnet build -c
+Release -p:Platform=x64`: 0 warnings, 0 errors. No `bar-crash.log`
+growth. Commit + push authorized — shipping the mechanism itself since
+it's sound and safe regardless of this machine's own state, with the
+verification gap disclosed above rather than papered over.

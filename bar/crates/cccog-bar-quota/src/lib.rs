@@ -146,26 +146,80 @@ fn is_archived_path(path: &Path) -> bool {
         .any(|component| component.eq_ignore_ascii_case("cccg-archive"))
 }
 
-/// Read Claude's local OAuth JSON without modifying it.  `expiresAt` is the
-/// CLI's millisecond timestamp and is normalized to seconds for the poller.
-pub fn load_claude_credential(path: &Path) -> Result<Option<OAuthCredential>, String> {
-    if !path.is_file() {
-        return Ok(None);
+/// Task 18 (2026-08-18): abstraction over "read the raw JSON blob for a
+/// named Windows Credential Manager generic credential" — injected so
+/// fixtures never touch the real OS credential store, the same discipline
+/// [`HttpClient`] already uses for the network boundary. `Ok(None)` means
+/// no such credential exists in the store (the common case, and NOT an
+/// error — most installs never write one); `Err` is a genuine read
+/// failure. Implementations must be read-only: never write or delete a
+/// credential, never log its contents.
+pub trait CredentialStore {
+    fn read_generic_credential(&self, target_name: &str) -> Result<Option<String>, String>;
+}
+
+/// The generic-credential service name some Windows Claude Code installs
+/// (ones using a Node `keytar`-style native credential module rather than a
+/// plain file) write their LIVE `claudeAiOauth` blob under — identical JSON
+/// shape to `~/.claude/.credentials.json`. Reading it first, file second,
+/// means a rotating refresh token that's kept current in the OS store isn't
+/// silently shadowed by a stale on-disk snapshot the way task 17's
+/// diagnosis found. NOT confirmed present on every Windows install — this
+/// machine's own Claude Code install (a native binary under
+/// `~/.local/bin`, not the npm/keytar package) has no such entry, verified
+/// read-only via `cmdkey /list` while diagnosing this task; the file
+/// fallback below is not a rare edge case; it's this machine's actual live
+/// path today.
+const CLAUDE_CODE_CREDENTIAL_SERVICE: &str = "Claude Code-credentials";
+
+#[cfg(windows)]
+pub struct WindowsCredentialManager;
+
+#[cfg(windows)]
+impl CredentialStore for WindowsCredentialManager {
+    fn read_generic_credential(&self, target_name: &str) -> Result<Option<String>, String> {
+        windows_credential_manager::read_generic_credential(target_name)
     }
-    let raw =
-        std::fs::read_to_string(path).map_err(|_| "cannot read Claude OAuth file".to_owned())?;
+}
+
+/// A portability stub — this workspace only ships for Windows, but keeping
+/// `cargo check` possible on any host (matching this crate's own existing
+/// "no dependency on the flow/graph core" portability stance) costs nothing
+/// here: there is no Credential Manager off Windows, so `Ok(None)` is
+/// simply correct, not a placeholder pretending to work.
+#[cfg(not(windows))]
+pub struct WindowsCredentialManager;
+
+#[cfg(not(windows))]
+impl CredentialStore for WindowsCredentialManager {
+    fn read_generic_credential(&self, _target_name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
+/// Parses the `claudeAiOauth` JSON blob shape shared by BOTH sources (the
+/// Windows Credential Manager entry and the on-disk file). A
+/// present-but-logged-out blob — valid JSON, but no `accessToken` — returns
+/// `Ok(None)`, not an error: TokenBar's own documented behavior for this
+/// exact daily-logout state (a stored blob surviving after `claude logout`
+/// or a session expiry with no token left in it), so the caller keeps
+/// trying its next source instead of treating a present-but-empty blob as
+/// "credentials broken."
+fn parse_claude_oauth_blob(raw: &str) -> Result<Option<OAuthCredential>, String> {
     let value: Value =
-        serde_json::from_str(&raw).map_err(|_| "Claude OAuth JSON malformed".to_owned())?;
+        serde_json::from_str(raw).map_err(|_| "Claude OAuth JSON malformed".to_owned())?;
     let oauth = value
         .get("claudeAiOauth")
         .ok_or_else(|| "Claude OAuth entry missing".to_owned())?;
-    let access = oauth
+    let Some(access) = oauth
         .get("accessToken")
         .or_else(|| oauth.get("access_token"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| "Claude OAuth access token missing".to_owned())?;
+    else {
+        return Ok(None); // present but logged out — not an error
+    };
     let refresh = oauth
         .get("refreshToken")
         .or_else(|| oauth.get("refresh_token"))
@@ -182,6 +236,44 @@ pub fn load_claude_credential(path: &Path) -> Result<Option<OAuthCredential>, St
         })
         .map(|millis| millis / 1_000);
     Ok(Some(OAuthCredential::new(access, refresh, expires_at)))
+}
+
+fn load_claude_credential_from_file(path: &Path) -> Result<Option<OAuthCredential>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(path).map_err(|_| "cannot read Claude OAuth file".to_owned())?;
+    parse_claude_oauth_blob(&raw)
+}
+
+/// Task 18: Windows Credential Manager first, the on-disk file second — the
+/// injectable form, so fixtures supply a fake [`CredentialStore`] and never
+/// touch the real OS store. Any Credential-Manager-layer outcome other than
+/// "found a usable, logged-in blob" (absent, logged-out, malformed, or a
+/// genuine read error) falls through to the file rather than failing —
+/// the file is a real, independently-working fallback, so a raw
+/// Credential-Manager hiccup is never more actionable to the caller than
+/// just trying it.
+pub fn load_claude_credential_with_store(
+    store: &impl CredentialStore,
+    path: &Path,
+) -> Result<Option<OAuthCredential>, String> {
+    if let Ok(Some(raw)) = store.read_generic_credential(CLAUDE_CODE_CREDENTIAL_SERVICE) {
+        if let Ok(Some(credential)) = parse_claude_oauth_blob(&raw) {
+            return Ok(Some(credential));
+        }
+    }
+    load_claude_credential_from_file(path)
+}
+
+/// Read Claude's OAuth credential without modifying anything: Windows
+/// Credential Manager first, `~/.claude/.credentials.json` second (see
+/// [`load_claude_credential_with_store`] for the injectable/testable form
+/// this delegates to). `expiresAt` is the CLI's millisecond timestamp and
+/// is normalized to seconds for the poller.
+pub fn load_claude_credential(path: &Path) -> Result<Option<OAuthCredential>, String> {
+    load_claude_credential_with_store(&WindowsCredentialManager, path)
 }
 
 /// Read only the genuine `auth.x.ai::<client>` OIDC entry.  A foreign bearer
@@ -925,6 +1017,80 @@ pub fn extract_human_reset_date(text: &str) -> Option<String> {
     static PATTERN: &str = r"(?i)\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}(?:,?\s+\d{1,2}:\d{2}\s*(?:am|pm))?";
     let re = regex::Regex::new(PATTERN).ok()?;
     re.find(text).map(|found| found.as_str().to_owned())
+}
+
+/// Task 18 (2026-08-18): the real `CredReadW` boundary — kept in its own
+/// module so the unsafe FFI surface is small and reviewable in one place.
+/// Read-only: only ever calls `CredReadW`/`CredFree`; never `CredWriteW`/
+/// `CredDeleteW`. Never logs the blob it reads (only the parsed
+/// `claudeAiOauth` structure flows further, and even that never through a
+/// log line — same discipline the file-based path already followed).
+#[cfg(windows)]
+mod windows_credential_manager {
+    use windows_sys::Win32::Security::Credentials::{
+        CredFree, CredReadW, CRED_TYPE_GENERIC, CREDENTIALW,
+    };
+
+    pub(super) fn read_generic_credential(target_name: &str) -> Result<Option<String>, String> {
+        let wide_target: Vec<u16> = target_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut credential_ptr: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: `wide_target` is a valid null-terminated UTF-16 string,
+        // live for the duration of this call. `credential_ptr` is a valid
+        // out-pointer. On success `CredReadW` allocates its own buffer,
+        // freed below via `CredFree` before this function returns.
+        let ok = unsafe { CredReadW(wide_target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential_ptr) };
+        if ok == 0 {
+            // The overwhelmingly common case is ERROR_NOT_FOUND (no such
+            // credential). Every other CredReadW failure is treated the
+            // same way — Ok(None) — since the caller always has a working
+            // file fallback; a raw OS error code here is never more
+            // actionable than just trying that fallback.
+            return Ok(None);
+        }
+        // SAFETY: `ok != 0` guarantees `credential_ptr` is a valid,
+        // CredReadW-allocated `CREDENTIALW` until the `CredFree` call below.
+        let blob = unsafe {
+            let credential = &*credential_ptr;
+            decode_credential_blob(credential.CredentialBlob, credential.CredentialBlobSize)
+        };
+        // SAFETY: `credential_ptr` was allocated by the `CredReadW` call
+        // above and has not been freed yet.
+        unsafe { CredFree(credential_ptr as *const _) };
+        Ok(blob)
+    }
+
+    /// `CredentialBlob` carries no encoding metadata at the Win32 API level.
+    /// Node's `keytar` (the common path for a JS app to write a Windows
+    /// Credential Manager entry) stores the value as UTF-16LE, treating it
+    /// as a wide "password" string — tried first; a raw UTF-8 byte
+    /// interpretation is the fallback, since nothing in the API itself pins
+    /// the encoding and this reader can't assume which native module (if
+    /// any) actually wrote the entry.
+    fn decode_credential_blob(blob: *mut u8, size: u32) -> Option<String> {
+        if blob.is_null() || size == 0 {
+            return None;
+        }
+        // SAFETY: `blob` points to `size` valid bytes owned by the
+        // `CREDENTIALW` this was read from, for the lifetime of this call
+        // (before the caller's `CredFree`).
+        let bytes = unsafe { std::slice::from_raw_parts(blob, size as usize) };
+        if size % 2 == 0 {
+            let utf16: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            if let Ok(text) = String::from_utf16(&utf16) {
+                let trimmed = text.trim_end_matches('\0').to_owned();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(str::to_owned)
+            .filter(|text| !text.is_empty())
+    }
 }
 
 #[cfg(test)]
