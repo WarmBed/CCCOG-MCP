@@ -55,11 +55,51 @@ try {
     );
   }
 
-  if (rows.length === 0) process.exit(0); // idle = silent, no noise
+  // Bridge-shim presence check (gh#86012): every Desktop/engine auto-update
+  // installs a clean engine dir and silently drops the shim, breaking CCD
+  // cross-session messaging until someone notices. Warn on the first turn
+  // instead. Engine dirs live under the MSIX LocalCache path (the visible
+  // %APPDATA% variant is a container-only virtualized view).
+  const shimWarnings = [];
+  try {
+    const engineRoot = path.join(
+      process.env.LOCALAPPDATA || '', 'Packages',
+      'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'Claude', 'claude-code'
+    );
+    if (fs.existsSync(engineRoot)) {
+      // Only the highest engine version matters — Desktop launches the
+      // newest dir; older dirs are superseded leftovers (stale stock copies
+      // of already-shimmed engines would otherwise false-alarm).
+      const versions = fs.readdirSync(engineRoot)
+        .filter(v => /^\d+\.\d+\.\d+$/.test(v))
+        .sort((a, b) => {
+          const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+          return (pa[0] - pb[0]) || (pa[1] - pb[1]) || (pa[2] - pb[2]);
+        });
+      const v = versions[versions.length - 1];
+      if (v) {
+        const dir = path.join(engineRoot, v);
+        const hasManifest = fs.existsSync(path.join(dir, '.bridge-shim-manifest.json'));
+        const hasSidecar = fs.readdirSync(dir).some(n => n.startsWith('claude.anthropic-'));
+        if (!hasManifest || !hasSidecar) {
+          shimWarnings.push(
+            `⚠️ Engine ${v} has NO bridge shim (likely a fresh auto-update). CCD cross-session ` +
+            `messaging is presumed BROKEN on it (gh#86012). Do not dispatch via send_message without a ` +
+            `single-shot transcript-verified test; reinstall via experiments/claude-desktop-bridge-shim ` +
+            `(adapt install-test-shim-*.ps1: new version + SHA-256, PS 5.1 compat, LocalCache path).`
+          );
+        }
+      }
+    }
+  } catch { /* never block the turn on this check */ }
 
-  const lines = ['<cccg-state>', `In-flight CCCG dispatches: ${rows.length}`];
+  if (rows.length === 0 && shimWarnings.length === 0) process.exit(0); // idle = silent, no noise
+
+  const lines = ['<cccg-state>'];
+  if (rows.length > 0) lines.push(`In-flight CCCG dispatches: ${rows.length}`);
   lines.push(...rows.slice(0, 8));
   if (rows.length > 8) lines.push(`… and ${rows.length - 8} more`);
+  lines.push(...shimWarnings);
 
   if (stuck > 0) {
     lines.push('');
