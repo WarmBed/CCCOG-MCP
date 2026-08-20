@@ -1,6 +1,24 @@
+using System.Text;
 using System.Text.Json;
 
 namespace CCCG.Core.Dispatch;
+
+/// <summary>
+/// Whether a provider's raw stdout stream already carries a terminal outcome
+/// (the provider itself reported completion or failure), independent of
+/// whether the CCCG dispatch worker process that launched it is still alive
+/// to record that outcome. Used by the dead-worker reconciler: a stuck
+/// "running" job whose worker died can still be resolved correctly by
+/// reading what the provider actually said before the worker was killed.
+/// </summary>
+public readonly record struct TerminalOutcome(bool IsTerminal, bool Succeeded, string? Error)
+{
+    public static readonly TerminalOutcome NotTerminal = new(false, false, null);
+
+    public static TerminalOutcome Success() => new(true, true, null);
+
+    public static TerminalOutcome Failure(string? error) => new(true, false, error);
+}
 
 public static class ProviderOutputParser
 {
@@ -191,6 +209,152 @@ public static class ProviderOutputParser
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Dead-worker reconciler support: inspect the stdout tail for a
+    /// terminal marker the provider already emitted before the CCCG worker
+    /// process was found dead. Reads only the last <paramref name="tailBytes"/>
+    /// of the file (the marker is always the newest line for the JSONL
+    /// providers), so this stays cheap even against multi-megabyte streams
+    /// from long xhigh reasoning turns.
+    /// </summary>
+    public static TerminalOutcome FindTerminalOutcome(
+        string provider,
+        string stdoutPath,
+        int tailBytes = 131072)
+    {
+        if (!File.Exists(stdoutPath))
+        {
+            return TerminalOutcome.NotTerminal;
+        }
+
+        if (provider.Equals("codex", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var line in ReadTailLines(stdoutPath, tailBytes))
+            {
+                if (!TryParseLine(line, out var root)
+                    || !root.TryGetProperty("type", out var type))
+                {
+                    continue;
+                }
+
+                var typeName = type.GetString();
+                if (string.Equals(typeName, "turn.completed", StringComparison.Ordinal))
+                {
+                    return TerminalOutcome.Success();
+                }
+
+                // codex exec --json has no confirmed failure-marker schema in
+                // this codebase's evidence; these two are checked defensively
+                // in case a future/older CLI emits them, but the primary
+                // signal remains turn.completed presence/absence.
+                if (string.Equals(typeName, "turn.failed", StringComparison.Ordinal)
+                    || string.Equals(typeName, "error", StringComparison.Ordinal))
+                {
+                    var message = root.TryGetProperty("message", out var messageValue)
+                        && messageValue.ValueKind == JsonValueKind.String
+                            ? messageValue.GetString()
+                            : null;
+                    return TerminalOutcome.Failure(message ?? "Codex reported a turn failure.");
+                }
+            }
+
+            return TerminalOutcome.NotTerminal;
+        }
+
+        if (provider.Equals("claude", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var line in ReadTailLines(stdoutPath, tailBytes))
+            {
+                if (!TryParseLine(line, out var root)
+                    || !root.TryGetProperty("type", out var type)
+                    || !string.Equals(type.GetString(), "result", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var isError = root.TryGetProperty("is_error", out var errorValue)
+                    && errorValue.ValueKind is JsonValueKind.True;
+                var message = root.TryGetProperty("result", out var resultValue)
+                    && resultValue.ValueKind == JsonValueKind.String
+                        ? resultValue.GetString()
+                        : null;
+                return isError
+                    ? TerminalOutcome.Failure(message ?? "Claude returned an error result.")
+                    : TerminalOutcome.Success();
+            }
+
+            return TerminalOutcome.NotTerminal;
+        }
+
+        if (provider.Equals("grok", StringComparison.OrdinalIgnoreCase))
+        {
+            // grok's CLI writes one JSON object at the very end of the turn,
+            // not JSONL, so a parseable object with a "text" field is itself
+            // the terminal marker.
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(stdoutPath));
+                if (document.RootElement.TryGetProperty("text", out var text)
+                    && text.ValueKind == JsonValueKind.String)
+                {
+                    return TerminalOutcome.Success();
+                }
+            }
+            catch (JsonException)
+            {
+            }
+
+            return TerminalOutcome.NotTerminal;
+        }
+
+        return TerminalOutcome.NotTerminal;
+    }
+
+    /// <summary>
+    /// Reads the last <paramref name="tailBytes"/> of a file and returns its
+    /// non-empty lines newest-first, so callers scanning for a terminal
+    /// marker (always the most recent JSONL line) can stop at the first hit.
+    /// A partial first line from seeking mid-file is dropped.
+    /// </summary>
+    private static IEnumerable<string> ReadTailLines(string path, int tailBytes)
+    {
+        using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var length = stream.Length;
+        var start = Math.Max(0, length - tailBytes);
+        stream.Position = start;
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        var text = reader.ReadToEnd();
+        var rawLines = text.Split('\n');
+        var lines = new List<string>(rawLines.Length);
+        for (var index = start > 0 ? 1 : 0; index < rawLines.Length; index++)
+        {
+            var line = rawLines[index].TrimEnd('\r');
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                lines.Add(line);
+            }
+        }
+
+        lines.Reverse();
+        return lines;
+    }
+
+    private static bool TryParseLine(string line, out JsonElement root)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(line);
+            root = document.RootElement.Clone();
+            return true;
+        }
+        catch (JsonException)
+        {
+            root = default;
+            return false;
+        }
     }
 
     private static string Truncate(string value, int maxChars) =>

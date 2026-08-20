@@ -100,6 +100,31 @@ public sealed class DispatchJobStore
 
     public string StatusPath(string jobId) => Path.Combine(JobDirectory(jobId), "status.json");
 
+    /// <summary>
+    /// Every job id with a status.json on disk, for a startup/periodic
+    /// reconciliation sweep. Best-effort: an unreadable or racing directory
+    /// listing simply yields fewer ids rather than throwing.
+    /// </summary>
+    public IReadOnlyList<string> ListJobIds()
+    {
+        if (!Directory.Exists(root))
+        {
+            return Array.Empty<string>();
+        }
+
+        var ids = new List<string>();
+        foreach (var directory in Directory.EnumerateDirectories(root))
+        {
+            var jobId = Path.GetFileName(directory);
+            if (File.Exists(Path.Combine(directory, "status.json")))
+            {
+                ids.Add(jobId);
+            }
+        }
+
+        return ids;
+    }
+
     public string CollectExcerpt(string jobId, int maxChars = 8000)
     {
         var path = StdoutPath(jobId);

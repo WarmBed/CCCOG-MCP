@@ -399,15 +399,21 @@ public sealed class DispatchRunner
 
             job.SessionId = resolvedSessionId;
             job.Status = DispatchJobStatus.Succeeded;
+
+            // Persist the terminal status EAGERLY: the provider turn already
+            // ran, so this write must land before any other post-processing
+            // (binding save, inbox post) that could itself throw or that a
+            // worker death could interrupt. A worker death after this point
+            // must not lose the verdict; a failure in the steps below must
+            // never relabel this already-recorded success as failed (see the
+            // outer catch's already-Succeeded guard below).
+            store.Write(job);
+
             if (!string.IsNullOrWhiteSpace(resolvedSessionId))
             {
                 bindings?.Save(selection.Provider, resolvedSessionId, selection.Cwd, managedByCccg: true);
             }
 
-            // Persist the terminal status BEFORE the inbox post: the provider
-            // turn already ran, so a post-success bookkeeping failure must not
-            // relabel the job Failed (the caller would retry a consumed turn).
-            store.Write(job);
             inbox?.Post(
                 selection.Provider,
                 "claude",
@@ -445,28 +451,120 @@ public sealed class DispatchRunner
         }
     }
 
+    /// <summary>
+    /// The dead-worker-detection message. A job Failed with exactly this
+    /// error was never told apart from "really failed" by the provider — it
+    /// only means the CCCG worker process that ran it was found dead before
+    /// recording a result. That makes it eligible for reconciliation even
+    /// after being marked Failed: if the provider stream turns out to carry
+    /// a terminal marker after all (the worker died on the way to recording
+    /// it, not on the way to producing it), the reconciler corrects the
+    /// label. A job failed for any other reason is never reopened.
+    /// </summary>
+    public const string WorkerDiedMessage =
+        "Dispatch worker exited before recording a terminal result.";
+
     public DispatchJob Status(string jobId)
     {
         var job = store.Require(jobId);
-        if (!IsTerminal(job.Status)
-            && job.WorkerPid is int workerPid
-            && !ProcessIsAlive(workerPid))
+        if (IsReconcilable(job) && job.WorkerPid is int workerPid && !ProcessIsAlive(workerPid))
         {
-            return store.Update(jobId, current =>
-            {
-                if (IsTerminal(current.Status))
-                {
-                    return;
-                }
-
-                current.Status = DispatchJobStatus.Failed;
-                current.Error = "Dispatch worker exited before recording a terminal result.";
-                current.FinishedAt = DateTimeOffset.UtcNow;
-            });
+            return ReconcileDeadWorker(jobId);
         }
 
         return job;
     }
+
+    /// <summary>
+    /// Startup/periodic sweep: reconcile every job on disk whose worker is
+    /// dead, so a job that finished successfully while nobody was polling
+    /// its status (e.g. the operator's session ended before checking back on
+    /// a long xhigh dispatch) still gets rescued instead of sitting stuck or
+    /// mislabeled indefinitely. Cheap and idempotent — jobs that are already
+    /// correctly terminal, or still have a live worker, are left untouched.
+    /// </summary>
+    public IReadOnlyList<DispatchJob> ReconcileStuckJobs()
+    {
+        var reconciled = new List<DispatchJob>();
+        foreach (var jobId in store.ListJobIds())
+        {
+            DispatchJob before;
+            try
+            {
+                before = store.Require(jobId);
+            }
+            catch (Exception exception) when (exception is IOException or InvalidDataException)
+            {
+                // A job directory mid-write (e.g. Create() has not yet
+                // finished its first Write) is not this sweep's concern.
+                continue;
+            }
+
+            if (!IsReconcilable(before)
+                || before.WorkerPid is not int workerPid
+                || ProcessIsAlive(workerPid))
+            {
+                continue;
+            }
+
+            var after = ReconcileDeadWorker(jobId);
+            if (after.Status != before.Status || after.Error != before.Error)
+            {
+                reconciled.Add(after);
+            }
+        }
+
+        return reconciled;
+    }
+
+    /// <summary>
+    /// True for a job whose outcome the dead-worker reconciler is allowed to
+    /// (re)decide: anything not yet terminal, plus a job already marked
+    /// Failed purely because a past dead-worker pass could not find a
+    /// terminal marker at the time. A job Succeeded, or Failed for any other
+    /// reason (provider exit code, thrown exception, etc.), is final.
+    /// </summary>
+    private static bool IsReconcilable(DispatchJob job) =>
+        !IsTerminal(job.Status)
+        || (job.Status == DispatchJobStatus.Failed && job.Error == WorkerDiedMessage);
+
+    private DispatchJob ReconcileDeadWorker(string jobId) =>
+        store.Update(jobId, current =>
+        {
+            if (!IsReconcilable(current))
+            {
+                // Someone else's reconcile pass (or the worker itself) already
+                // recorded a real outcome between our read and this update.
+                return;
+            }
+
+            var outcome = ProviderOutputParser.FindTerminalOutcome(
+                current.Provider,
+                store.StdoutPath(current.JobId));
+            if (outcome.IsTerminal)
+            {
+                current.Status = outcome.Succeeded
+                    ? DispatchJobStatus.Succeeded
+                    : DispatchJobStatus.Failed;
+                current.Error = outcome.Succeeded ? null : outcome.Error;
+                if (outcome.Succeeded)
+                {
+                    current.ExitCode = 0;
+                }
+
+                current.FinishedAt ??= DateTimeOffset.UtcNow;
+                current.Reason =
+                    "Recovered by the CCCG dead-worker reconciler: the provider "
+                    + "stream already carried a terminal marker when the dispatch "
+                    + "worker process was found dead.";
+            }
+            else
+            {
+                current.Status = DispatchJobStatus.Failed;
+                current.Error = WorkerDiedMessage;
+                current.FinishedAt ??= DateTimeOffset.UtcNow;
+            }
+        });
 
     public object Collect(string jobId)
     {
@@ -668,16 +766,17 @@ public sealed class DispatchRunner
                 receipt.Error ?? "The CCCG owner reported a failed delivery.");
         }
 
+        job.Status = DispatchJobStatus.Succeeded;
+        job.ExitCode = 0;
+        // Persist Succeeded EAGERLY, before the stdout file write and the
+        // inbox post: the receipt proves the provider ran the turn and the
+        // spool message is consumed, so nothing after this point (including
+        // a worker death) may leave the job recorded as anything but done.
+        store.Write(job);
         File.WriteAllText(
             store.StdoutPath(job.JobId),
             receipt.ResponseText ?? string.Empty,
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-        job.Status = DispatchJobStatus.Succeeded;
-        job.ExitCode = 0;
-        // Persist Succeeded BEFORE the inbox post: the receipt proves the
-        // provider ran the turn and the spool message is consumed, so nothing
-        // after this point may downgrade the job to Failed.
-        store.Write(job);
         inbox?.Post(
             selection.Provider,
             "claude",
@@ -745,10 +844,14 @@ public sealed class DispatchRunner
         var receipt = "{\"text\":" + JsonEncode(
                 $"Typed into the live {selection.Provider} window (pid {pid.Value}) as a new turn.")
             + "}";
-        File.WriteAllText(store.StdoutPath(job.JobId), receipt);
         job.Status = DispatchJobStatus.Succeeded;
         job.ExitCode = 0;
         job.FinishedAt = DateTimeOffset.UtcNow;
+        // Persist Succeeded EAGERLY, before the stdout file write and the
+        // inbox post: the keystrokes are already sent and unrecoverable, so
+        // nothing after this point may leave the job stuck non-terminal.
+        store.Write(job);
+        File.WriteAllText(store.StdoutPath(job.JobId), receipt);
         inbox?.Post(
             selection.Provider,
             "claude",
@@ -760,7 +863,6 @@ public sealed class DispatchRunner
             fromSessionId: selection.SessionId,
             toProvider: "claude",
             jobId: job.JobId);
-        store.Write(job);
         return job;
     }
 

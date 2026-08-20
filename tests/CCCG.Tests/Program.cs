@@ -8,6 +8,7 @@ using CCCG.Host;
 using ModelContextProtocol.Server;
 using System.ComponentModel;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 if (args is ["--emit-utf8-grok-json"])
 {
@@ -25,6 +26,55 @@ if (args is ["--echo-utf8-stdin"])
     using var buffer = new MemoryStream();
     input.CopyTo(buffer);
     Console.OpenStandardOutput().Write(buffer.ToArray());
+    return 0;
+}
+
+// Job-object breakaway probe fixtures for
+// DetachedProcessLauncherEscapesKillOnCloseJob: this executable re-invokes
+// itself to play the role of a job-controlled "one-shot worker" process
+// (--detached-probe-parent) that spawns both a plain child and a
+// DetachedProcessLauncher.TryStartBreakaway child, and the role of the
+// long-lived child itself (--detached-probe-sleep).
+if (args is ["--detached-probe-sleep"])
+{
+    Thread.Sleep(TimeSpan.FromSeconds(60));
+    return 0;
+}
+
+if (args is ["--detached-probe-parent", var plainPidFile, var breakawayPidFile])
+{
+    // Give the test driver a moment to assign THIS process to its job
+    // before any children exist to inherit that membership.
+    Thread.Sleep(TimeSpan.FromMilliseconds(500));
+
+    var selfExecutable = Environment.ProcessPath
+        ?? throw new InvalidOperationException("The current process executable is unavailable.");
+    var isDotnetHost = Path.GetFileNameWithoutExtension(selfExecutable)
+        .Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+    var selfLocation = Assembly.GetExecutingAssembly().Location;
+
+    var plainInfo = new System.Diagnostics.ProcessStartInfo
+    {
+        FileName = selfExecutable,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+    if (isDotnetHost)
+    {
+        plainInfo.ArgumentList.Add(selfLocation);
+    }
+
+    plainInfo.ArgumentList.Add("--detached-probe-sleep");
+    using var plainChild = System.Diagnostics.Process.Start(plainInfo)!;
+    File.WriteAllText(plainPidFile, plainChild.Id.ToString());
+
+    var breakawayArguments = isDotnetHost
+        ? new[] { selfLocation, "--detached-probe-sleep" }
+        : new[] { "--detached-probe-sleep" };
+    var breakawayPid = DetachedProcessLauncher.TryStartBreakaway(selfExecutable, breakawayArguments);
+    File.WriteAllText(breakawayPidFile, breakawayPid?.ToString() ?? "null");
+
+    Thread.Sleep(TimeSpan.FromSeconds(60));
     return 0;
 }
 
@@ -131,6 +181,17 @@ var tests = new (string Name, Action Run)[]
     ("dispatch runner starts a resumable job and collects success", DispatchRunnerCollectsSuccess),
     ("dispatch runners serialize the same managed peer across processes", DispatchRunnersSerializeManagedPeer),
     ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
+    ("dispatch runner records success before a post-success binding save can fail", DispatchRunnerRecordsSuccessBeforeBindingSaveCanFail),
+    ("provider output parser finds a codex turn.completed marker in the stdout tail", ProviderOutputParserFindsCodexTerminalOutcome),
+    ("provider output parser finds a claude error result marker", ProviderOutputParserFindsClaudeErrorOutcome),
+    ("provider output parser reports not-terminal when no marker exists yet", ProviderOutputParserReportsNotTerminalWithoutMarker),
+    ("provider output parser finds the marker past megabytes of unrelated tail content", ProviderOutputParserFindsMarkerPastLargeTail),
+    ("reconciler flips a stuck running job with a completion marker to succeeded", ReconcilerFlipsStuckRunningJobToSucceeded),
+    ("reconciler retries a job already mislabeled failed by a past dead-worker pass", ReconcilerRetriesPastMislabeledFailure),
+    ("reconciler leaves a genuinely unfinished dead-worker job failed", ReconcilerLeavesGenuinelyDeadJobFailed),
+    ("reconciler never reopens a job that failed for a real provider reason", ReconcilerNeverReopensGenuineFailure),
+    ("reconcile stuck jobs sweeps every job on disk exactly once", ReconcileStuckJobsSweepsAllJobs),
+    ("detached process launcher escapes a kill-on-close job object", DetachedProcessLauncherEscapesKillOnCloseJob),
     ("binding store marks and prefers the bound peer", BindingStorePrefersBoundPeer),
     ("inbox ledger posts lists and acks for Claude", InboxLedgerRoundTrips),
     ("inbox ledger preserves concurrent posts", InboxLedgerPreservesConcurrentPosts),
@@ -1924,6 +1985,448 @@ static void DispatchStatusFailsDeadWorker()
     var failed = runner.Status(job.JobId);
     Equal(DispatchJobStatus.Failed, failed.Status);
     True(failed.Error?.Contains("worker exited", StringComparison.OrdinalIgnoreCase) == true);
+}
+
+/// <summary>
+/// Regression test for the eager-write-ordering bug: before the fix,
+/// bindings.Save ran BEFORE the terminal store.Write, so a throwing binding
+/// save could mislabel an already-successful codex turn as Failed. This
+/// launcher writes a real turn.completed marker (the codex exec --json
+/// shape observed on job 20260820T161141Z_43f2fa95) and the bindings store
+/// is sabotaged so its Save() throws — the turn must still be recorded (and
+/// returned) Succeeded.
+/// </summary>
+static void DispatchRunnerRecordsSuccessBeforeBindingSaveCanFail()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-eager-write-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var bindingsRoot = Path.Combine(root, "bindings");
+    var bindings = new DispatchBindingStore(bindingsRoot);
+    const string cwd = "D:\\code\\app";
+
+    // Sabotage only the Save() write target, not Load(): both share the
+    // same hashed path, but Load() only checks File.Exists (false for a
+    // directory, so it safely returns null) while Save()'s atomic
+    // File.Move into that path throws because a directory already occupies
+    // it. This isolates the failure to exactly the step this test cares
+    // about — a post-success binding save blowing up.
+    bindings.Load("codex", cwd); // side effect: creates the hashed subdirectory
+    var hashDirectory = Directory.GetDirectories(bindingsRoot).Single();
+    var sabotagedFilePath = Path.Combine(hashDirectory, "codex.json");
+    Directory.CreateDirectory(sabotagedFilePath);
+
+    try
+    {
+        var peers = new[]
+        {
+            new Peer("codex", "sess-eager", PeerStatus.Resumable, cwd, "Eager", null, null, null, null, null, null)
+        };
+        var launcher = new FakeProcessLauncher(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"OK\"}}\n"
+            + "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}");
+        var runner = new DispatchRunner(store, _ => peers, launcher, bindings: bindings);
+        var job = runner.Enqueue("codex", "hello", "sess-eager", cwd, false);
+
+        var result = runner.Run(job.JobId);
+
+        Equal(DispatchJobStatus.Succeeded, result.Status);
+        Equal(DispatchJobStatus.Succeeded, store.Require(job.JobId).Status);
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void ProviderOutputParserFindsCodexTerminalOutcome()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-outcome-codex-{Guid.NewGuid():N}.log");
+    File.WriteAllText(
+        path,
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"hi\"}}\n"
+        + "{\"type\":\"turn.completed\",\"usage\":{}}");
+    try
+    {
+        var outcome = ProviderOutputParser.FindTerminalOutcome("codex", path);
+        True(outcome.IsTerminal);
+        True(outcome.Succeeded);
+        True(outcome.Error is null);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ProviderOutputParserFindsClaudeErrorOutcome()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-outcome-claude-{Guid.NewGuid():N}.log");
+    File.WriteAllText(
+        path,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n"
+        + "{\"type\":\"result\",\"is_error\":true,\"session_id\":\"s1\",\"result\":\"boom\"}");
+    try
+    {
+        var outcome = ProviderOutputParser.FindTerminalOutcome("claude", path);
+        True(outcome.IsTerminal);
+        True(!outcome.Succeeded);
+        Equal("boom", outcome.Error);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ProviderOutputParserReportsNotTerminalWithoutMarker()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-outcome-none-{Guid.NewGuid():N}.log");
+    File.WriteAllText(
+        path,
+        "{\"type\":\"item.started\",\"item\":{\"type\":\"agent_message\"}}\n"
+        + "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\"}}");
+    try
+    {
+        var outcome = ProviderOutputParser.FindTerminalOutcome("codex", path);
+        True(!outcome.IsTerminal);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+/// <summary>
+/// The reconciler must stay cheap against a multi-megabyte stdout (the
+/// documented failure shape: 0.5-3MB from long xhigh reasoning turns) by
+/// reading only the tail, not the whole file.
+/// </summary>
+static void ProviderOutputParserFindsMarkerPastLargeTail()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-outcome-large-{Guid.NewGuid():N}.log");
+    using (var writer = new StreamWriter(path))
+    {
+        for (var i = 0; i < 20000; i++)
+        {
+            writer.WriteLine(
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"padding-line-"
+                + i + "-0123456789012345678901234567890123456789\"}}");
+        }
+
+        writer.WriteLine("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":74739737}}");
+    }
+
+    try
+    {
+        True(new FileInfo(path).Length > 1_000_000);
+        var outcome = ProviderOutputParser.FindTerminalOutcome("codex", path);
+        True(outcome.IsTerminal);
+        True(outcome.Succeeded);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+/// <summary>
+/// Reproduces job 20260820T161141Z_43f2fa95's exact shape: stdout ends with
+/// a clean turn.completed, but status.json is stuck "running" because the
+/// worker process that should have recorded it died first (both its
+/// recorded pids are dead). The reconciler must flip it to succeeded and
+/// leave the response collectible.
+/// </summary>
+static void ReconcilerFlipsStuckRunningJobToSucceeded()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-reconcile-ok-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "sess-stuck", PeerStatus.Resumable, "D:\\code\\app", "Stuck", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    var job = runner.Enqueue("codex", "test", "sess-stuck", "D:\\code\\app", false);
+    File.WriteAllText(
+        store.StdoutPath(job.JobId),
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"RESCUED-ANSWER\"}}\n"
+        + "{\"type\":\"turn.completed\",\"usage\":{}}");
+    store.Update(job.JobId, current => current.Status = DispatchJobStatus.Running);
+    runner.MarkWorker(job.JobId, int.MaxValue); // a definitely-dead pid, like the real incident
+
+    var reconciled = runner.Status(job.JobId);
+
+    Equal(DispatchJobStatus.Succeeded, reconciled.Status);
+    True(reconciled.Error is null);
+    var collected = System.Text.Json.JsonSerializer.SerializeToElement(runner.Collect(job.JobId));
+    True(collected.GetProperty("response").GetString()!.Contains("RESCUED-ANSWER"));
+}
+
+/// <summary>
+/// Reproduces job 20260820T170514Z_91f29f44's exact shape: a prior
+/// dead-worker pass already mislabeled the job Failed with the generic
+/// "worker exited" message even though stdout carries a real success
+/// marker. The reconciler must be willing to reconsider that specific
+/// mislabel (and only that one) and flip it to succeeded.
+/// </summary>
+static void ReconcilerRetriesPastMislabeledFailure()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-reconcile-retry-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "sess-mislabel", PeerStatus.Resumable, "D:\\code\\app", "Mislabel", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    var job = runner.Enqueue("codex", "test", "sess-mislabel", "D:\\code\\app", false);
+    File.WriteAllText(
+        store.StdoutPath(job.JobId),
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ALREADY-DONE\"}}\n"
+        + "{\"type\":\"turn.completed\",\"usage\":{}}");
+    runner.MarkWorker(job.JobId, int.MaxValue);
+    store.Update(job.JobId, current =>
+    {
+        current.Status = DispatchJobStatus.Failed;
+        current.Error = DispatchRunner.WorkerDiedMessage;
+        current.FinishedAt = DateTimeOffset.UtcNow;
+    });
+
+    var reconciled = runner.Status(job.JobId);
+
+    Equal(DispatchJobStatus.Succeeded, reconciled.Status);
+    True(reconciled.Error is null);
+}
+
+static void ReconcilerLeavesGenuinelyDeadJobFailed()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-reconcile-dead-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "sess-dead", PeerStatus.Resumable, "D:\\code\\app", "Dead", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    var job = runner.Enqueue("codex", "test", "sess-dead", "D:\\code\\app", false);
+    // The worker died before the provider ever produced a terminal line —
+    // a genuinely unfinished job, not just an unrecorded one.
+    File.WriteAllText(
+        store.StdoutPath(job.JobId),
+        "{\"type\":\"item.started\",\"item\":{\"type\":\"reasoning\"}}");
+    store.Update(job.JobId, current => current.Status = DispatchJobStatus.Running);
+    runner.MarkWorker(job.JobId, int.MaxValue);
+
+    var reconciled = runner.Status(job.JobId);
+
+    Equal(DispatchJobStatus.Failed, reconciled.Status);
+    Equal(DispatchRunner.WorkerDiedMessage, reconciled.Error);
+}
+
+/// <summary>
+/// A job that failed for a real provider reason (nonzero exit, thrown
+/// exception, etc.) must never be reopened by the reconciler even if its
+/// worker pid is later found dead and its stdout happens to contain
+/// something that looks like a marker.
+/// </summary>
+static void ReconcilerNeverReopensGenuineFailure()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-reconcile-genuine-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "sess-genuine", PeerStatus.Resumable, "D:\\code\\app", "Genuine", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    var job = runner.Enqueue("codex", "test", "sess-genuine", "D:\\code\\app", false);
+    File.WriteAllText(
+        store.StdoutPath(job.JobId),
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"irrelevant\"}}\n"
+        + "{\"type\":\"turn.completed\",\"usage\":{}}");
+    runner.MarkWorker(job.JobId, int.MaxValue);
+    store.Update(job.JobId, current =>
+    {
+        current.Status = DispatchJobStatus.Failed;
+        current.Error = "Provider exited with code 1.";
+        current.FinishedAt = DateTimeOffset.UtcNow;
+    });
+
+    var reconciled = runner.Status(job.JobId);
+
+    Equal(DispatchJobStatus.Failed, reconciled.Status);
+    Equal("Provider exited with code 1.", reconciled.Error);
+}
+
+static void ReconcileStuckJobsSweepsAllJobs()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-reconcile-sweep-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "sess-a", PeerStatus.Resumable, "D:\\code\\app", "A", null, null, null, null, null, null),
+        new Peer("codex", "sess-b", PeerStatus.Resumable, "D:\\code\\app", "B", null, null, null, null, null, null),
+        new Peer("codex", "sess-c", PeerStatus.Resumable, "D:\\code\\app", "C", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+
+    var stuckWithMarker = runner.Enqueue("codex", "a", "sess-a", "D:\\code\\app", false);
+    File.WriteAllText(
+        store.StdoutPath(stuckWithMarker.JobId),
+        "{\"type\":\"turn.completed\",\"usage\":{}}");
+    store.Update(stuckWithMarker.JobId, current => current.Status = DispatchJobStatus.Running);
+    runner.MarkWorker(stuckWithMarker.JobId, int.MaxValue);
+
+    var stuckNoMarker = runner.Enqueue("codex", "b", "sess-b", "D:\\code\\app", false);
+    store.Update(stuckNoMarker.JobId, current => current.Status = DispatchJobStatus.Running);
+    runner.MarkWorker(stuckNoMarker.JobId, int.MaxValue);
+
+    var stillRunningLiveWorker = runner.Enqueue("codex", "c", "sess-c", "D:\\code\\app", false);
+    store.Update(stillRunningLiveWorker.JobId, current => current.Status = DispatchJobStatus.Running);
+    runner.MarkWorker(stillRunningLiveWorker.JobId, Environment.ProcessId); // this process is alive
+
+    var reconciled = runner.ReconcileStuckJobs();
+
+    Equal(2, reconciled.Count);
+    Equal(DispatchJobStatus.Succeeded, store.Require(stuckWithMarker.JobId).Status);
+    Equal(DispatchJobStatus.Failed, store.Require(stuckNoMarker.JobId).Status);
+    Equal(DispatchRunner.WorkerDiedMessage, store.Require(stuckNoMarker.JobId).Error);
+    // Never touched: its worker pid (this very test process) is alive.
+    Equal(DispatchJobStatus.Running, store.Require(stillRunningLiveWorker.JobId).Status);
+}
+
+/// <summary>
+/// Direct regression test for the confirmed root cause. `parent` (this
+/// process re-invoked with --detached-probe-parent) is assigned to a
+/// kill-on-close-capable job the same way every live cccg-dispatch.exe Host
+/// observed on this machine already is (IsProcessInJob confirmed True for
+/// all of them). `parent` then spawns two children exactly like the
+/// pre-fix StartDetachedJob (plain Process.Start) and the fix
+/// (DetachedProcessLauncher.TryStartBreakaway). Terminating the job proves
+/// the mechanism: the plain child is silently enrolled in `parent`'s job
+/// and dies with it, even though it was never itself assigned to anything;
+/// the breakaway child must survive the same kill.
+/// </summary>
+static void DetachedProcessLauncherEscapesKillOnCloseJob()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-breakaway-probe-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    var plainPidFile = Path.Combine(root, "plain.pid");
+    var breakawayPidFile = Path.Combine(root, "breakaway.pid");
+    System.Diagnostics.Process? parent = null;
+    System.Diagnostics.Process? plainChild = null;
+    System.Diagnostics.Process? breakawayChild = null;
+    var job = Win32Job.Create();
+    try
+    {
+        var selfExecutable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("The current process executable is unavailable.");
+        var parentInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = selfExecutable,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        if (Path.GetFileNameWithoutExtension(selfExecutable)
+            .Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+        {
+            parentInfo.ArgumentList.Add(Assembly.GetExecutingAssembly().Location);
+        }
+
+        parentInfo.ArgumentList.Add("--detached-probe-parent");
+        parentInfo.ArgumentList.Add(plainPidFile);
+        parentInfo.ArgumentList.Add(breakawayPidFile);
+        parent = System.Diagnostics.Process.Start(parentInfo)!;
+
+        // Assign the parent to the job BEFORE it has had a chance to spawn
+        // its children (it deliberately waits 500ms first) so both children
+        // are created while their direct parent is already a job member.
+        Win32Job.Assign(job, parent.Handle);
+
+        var plainPidText = WaitForFile(plainPidFile, TimeSpan.FromSeconds(10));
+        var breakawayPidText = WaitForFile(breakawayPidFile, TimeSpan.FromSeconds(10));
+        plainChild = System.Diagnostics.Process.GetProcessById(int.Parse(plainPidText));
+
+        if (breakawayPidText == "null")
+        {
+            // The ambient job this whole test process tree happens to run
+            // under today (if any) does not permit breakaway; there is
+            // nothing further to assert about escaping a job that could
+            // never be joined. TryStartBreakaway correctly degraded to
+            // null instead of throwing.
+            return;
+        }
+
+        breakawayChild = System.Diagnostics.Process.GetProcessById(int.Parse(breakawayPidText));
+
+        True(!parent.HasExited);
+        True(!plainChild.HasExited);
+        True(!breakawayChild.HasExited);
+
+        Win32Job.Terminate(job);
+        parent.WaitForExit(2000);
+        Thread.Sleep(500);
+
+        True(parent.HasExited);
+        True(plainChild.HasExited);
+        True(!breakawayChild.HasExited);
+    }
+    finally
+    {
+        Win32Job.Close(job);
+        TryKill(parent);
+        TryKill(plainChild);
+        TryKill(breakawayChild);
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    static string WaitForFile(string path, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (File.Exists(path))
+            {
+                try
+                {
+                    return File.ReadAllText(path).Trim();
+                }
+                catch (IOException)
+                {
+                }
+            }
+
+            Thread.Sleep(50);
+        }
+
+        throw new TimeoutException($"Breakaway probe never wrote '{path}'.");
+    }
+
+    static void TryKill(System.Diagnostics.Process? process)
+    {
+        if (process is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        {
+        }
+    }
 }
 
 static void BindingStorePrefersBoundPeer()
@@ -4213,6 +4716,59 @@ sealed class RecordingProcessLauncher : FakeProcessLauncher
         LastCommand = command;
         return base.Start(command, stdoutPath, stderrPath, stdinPath, out waiter);
     }
+}
+
+/// <summary>
+/// Minimal Windows Job Object wrapper for
+/// DetachedProcessLauncherEscapesKillOnCloseJob only. Production breakaway
+/// logic lives in CCCG.Core.Dispatch.DetachedProcessLauncher; this is just
+/// enough surface (create an empty job, assign a process to it, terminate
+/// it) to stand in for "some ancestor's job object" in the test.
+/// </summary>
+static class Win32Job
+{
+    public static IntPtr Create()
+    {
+        var job = CreateJobObjectW(IntPtr.Zero, null);
+        if (job == IntPtr.Zero)
+        {
+            throw new InvalidOperationException(
+                "CreateJobObjectW failed: " + Marshal.GetLastWin32Error());
+        }
+
+        return job;
+    }
+
+    public static void Assign(IntPtr job, IntPtr processHandle)
+    {
+        if (!AssignProcessToJobObject(job, processHandle))
+        {
+            throw new InvalidOperationException(
+                "AssignProcessToJobObject failed: " + Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static void Terminate(IntPtr job) => TerminateJobObject(job, 1);
+
+    public static void Close(IntPtr job)
+    {
+        if (job != IntPtr.Zero)
+        {
+            CloseHandle(job);
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string? name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
 }
 
 class FakeProcessLauncher : IProcessLauncher

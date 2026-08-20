@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -299,6 +300,12 @@ sealed class WorkerRuntime
             "dispatchWait" => Dispatch(request.Arguments, wait: true),
             "jobStatus" => Serialize(Runner.Status(Required(request.Arguments, "jobId"))),
             "jobCollect" => Serialize(Runner.Collect(Required(request.Arguments, "jobId"))),
+            "reconcileStuckJobs" => Serialize(new
+            {
+                reconciled = Runner.ReconcileStuckJobs()
+                    .Select(job => new { job.JobId, job.Status, job.Error })
+                    .ToArray()
+            }),
             "inboxPost" => Serialize(inbox.Post(
                 Required(request.Arguments, "fromRole"),
                 Required(request.Arguments, "toRole"),
@@ -354,6 +361,25 @@ sealed class WorkerRuntime
     {
         var executable = Environment.ProcessPath
             ?? throw new InvalidOperationException("Cannot locate the dispatch worker executable.");
+
+        // Best-effort: launch the detached run-job worker outside whatever
+        // Windows Job Object (if any) this process's own ancestry belongs
+        // to. A plain Process.Start child is silently enrolled into the
+        // SAME job as its parent (verified: every live cccg-dispatch.exe
+        // Host observed on this machine is itself a job member), and a
+        // kill-on-close job cascades a TerminateProcess to every member —
+        // including a "detached" grandchild several levels down — the
+        // instant a distant ancestor (the launching terminal/IDE/session)
+        // exits. That kill leaves no exception, no WER report, and no trace
+        // in the Application/System event logs; it just erases the job
+        // mid-flight. CREATE_BREAKAWAY_FROM_JOB only succeeds when the
+        // ambient job explicitly permits breakaway, so this always falls
+        // back to the previous unconditional Process.Start on any failure.
+        if (DetachedProcessLauncher.TryStartBreakaway(executable, "run-job", jobId) is int breakawayPid)
+        {
+            return breakawayPid;
+        }
+
         var info = new ProcessStartInfo
         {
             FileName = executable,
