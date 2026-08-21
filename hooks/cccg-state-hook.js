@@ -79,15 +79,22 @@ try {
       const v = versions[versions.length - 1];
       if (v) {
         const dir = path.join(engineRoot, v);
-        const hasManifest = fs.existsSync(path.join(dir, '.bridge-shim-manifest.json'));
-        const hasSidecar = fs.readdirSync(dir).some(n => n.startsWith('claude.anthropic-'));
-        if (!hasManifest || !hasSidecar) {
-          shimWarnings.push(
-            `⚠️ Engine ${v} has NO bridge shim (likely a fresh auto-update). CCD cross-session ` +
-            `messaging is presumed BROKEN on it (gh#86012). Do not dispatch via send_message without a ` +
-            `single-shot transcript-verified test; reinstall via experiments/claude-desktop-bridge-shim ` +
-            `(adapt install-test-shim-*.ps1: new version + SHA-256, PS 5.1 compat, LocalCache path).`
-          );
+        // Engines verified to deliver cross-session messages STOCK (no shim),
+        // by single-shot transcript-verified round-trip on this machine.
+        // 2.1.237: verified 2026-08-21 (upstream fix landed; shim era over).
+        const STOCK_OK = ['2.1.237'];
+        if (!STOCK_OK.includes(v)) {
+          const hasManifest = fs.existsSync(path.join(dir, '.bridge-shim-manifest.json'));
+          const hasSidecar = fs.readdirSync(dir).some(n => n.startsWith('claude.anthropic-'));
+          if (!hasManifest || !hasSidecar) {
+            shimWarnings.push(
+              `⚠️ NEW engine ${v} — CCD cross-session delivery UNVERIFIED on it (gh#86012 history: ` +
+              `some engines shipped broken). Before any send_message dispatching, run ONE single-shot ` +
+              `receipt test (transcript-verified, never retry on failure — a failed delivery jams the ` +
+              `recipient ~1000s). If it fails: shim reinstall procedure in experiments/claude-desktop-bridge-shim; ` +
+              `if it passes: add ${v} to STOCK_OK in hooks/cccg-state-hook.js.`
+            );
+          }
         }
       }
     }
