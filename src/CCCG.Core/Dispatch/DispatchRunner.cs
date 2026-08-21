@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 
 namespace CCCG.Core.Dispatch;
@@ -34,10 +35,32 @@ public sealed class DispatchRunner
     private readonly OwnerRegistry owners;
     private readonly TimeSpan writerPollInterval;
     private readonly TimeSpan writerWaitTimeout;
+    private readonly TimeSpan jobTimeout;
     private readonly TimeSpan deliverWaitTimeout;
     private readonly TimeSpan readBackTimeout;
     private readonly RecursionContext recursion;
     private readonly QuotaLedger quota;
+
+    /// <summary>
+    /// Operator escape hatch for the provider-turn wait ceiling (see
+    /// <see cref="ResolveJobTimeout"/>). There is no correct universal cap
+    /// on how long a real reasoning turn may legitimately run — quota
+    /// exhaustion and provider errors already report themselves through
+    /// their own exit codes — so this exists only as a backstop against a
+    /// truly wedged child process, and a generous default plus this
+    /// override means an operator is never stuck waiting on a rebuild to
+    /// raise it.
+    /// </summary>
+    public const string JobTimeoutEnvVariable = "CCCG_JOB_TIMEOUT_MINUTES";
+
+    /// <summary>
+    /// 8 hours: generous enough that no legitimate xhigh reasoning turn
+    /// observed in practice comes close (the incident this replaces killed
+    /// a genuinely still-working turn at exactly 2h0m), while still
+    /// eventually reaping a child process that is truly hung forever
+    /// instead of leaking it for the life of the machine.
+    /// </summary>
+    public static readonly TimeSpan DefaultJobTimeout = TimeSpan.FromHours(8);
 
     public DispatchRunner(
         DispatchJobStore store,
@@ -52,6 +75,7 @@ public sealed class DispatchRunner
         TimeSpan? writerWaitTimeout = null,
         ILiveInputInjector? injector = null,
         OwnerRegistry? owners = null,
+        TimeSpan? jobTimeout = null,
         TimeSpan? deliverWaitTimeout = null,
         TimeSpan? readBackTimeout = null,
         RecursionContext? recursion = null,
@@ -68,11 +92,58 @@ public sealed class DispatchRunner
         this.injector = injector ?? new WindowsLiveInputInjector();
         this.owners = owners ?? new OwnerRegistry();
         this.writerPollInterval = writerPollInterval ?? TimeSpan.FromMilliseconds(250);
-        this.writerWaitTimeout = writerWaitTimeout ?? TimeSpan.FromHours(2);
-        this.deliverWaitTimeout = deliverWaitTimeout ?? TimeSpan.FromHours(2);
+        this.jobTimeout = jobTimeout ?? ResolveJobTimeout();
+        // writerWaitTimeout (waiting for an independently-running live peer
+        // to stop actively working) and deliverWaitTimeout (waiting for an
+        // owner-daemon-delivered turn's receipt) both bound "how long may a
+        // real provider turn legitimately still be busy" -- the exact same
+        // question jobTimeout answers for the direct-CLI path -- so both
+        // default to the same resolved ceiling instead of their own
+        // independent 2h constant. A peer or an owner-delivered turn can be
+        // just as long an xhigh reasoning turn as a directly-launched one.
+        this.writerWaitTimeout = writerWaitTimeout ?? this.jobTimeout;
+        this.deliverWaitTimeout = deliverWaitTimeout ?? this.jobTimeout;
         this.readBackTimeout = readBackTimeout ?? TimeSpan.FromSeconds(5);
         this.recursion = recursion ?? RecursionContext.FromEnvironment();
         this.quota = quota ?? new QuotaLedger(this.recursion.QuotaRoot);
+    }
+
+    /// <summary>
+    /// Reads <see cref="JobTimeoutEnvVariable"/> (minutes, fractional
+    /// allowed for testing) and falls back to <see cref="DefaultJobTimeout"/>
+    /// for anything unset, unparsable, non-positive, or too large to become
+    /// a valid TimeSpan -- deliberately defensive, since a malformed
+    /// operator override must never crash dispatch or silently become a
+    /// zero/negative wait.
+    /// </summary>
+    public static TimeSpan ResolveJobTimeout(Func<string, string?>? getEnvironmentVariable = null)
+    {
+        getEnvironmentVariable ??= Environment.GetEnvironmentVariable;
+        var raw = getEnvironmentVariable(JobTimeoutEnvVariable);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return DefaultJobTimeout;
+        }
+
+        if (!double.TryParse(
+                raw.Trim(),
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var minutes)
+            || minutes <= 0
+            || double.IsNaN(minutes))
+        {
+            return DefaultJobTimeout;
+        }
+
+        try
+        {
+            return TimeSpan.FromMinutes(minutes);
+        }
+        catch (Exception exception) when (exception is ArgumentException or OverflowException)
+        {
+            return DefaultJobTimeout;
+        }
     }
 
     public DispatchJob Enqueue(
@@ -277,6 +348,17 @@ public sealed class DispatchRunner
             CrossProcessFileGate? lease = null;
             if (selection.Action != DispatchAction.Attach)
             {
+                // Deliberately NOT scaled to jobTimeout: this is a 25ms-poll
+                // acquire spin-loop (CrossProcessFileGate), not a coarse
+                // 250ms wait like writerWaitTimeout/deliverWaitTimeout --
+                // ballooning it to 8h would mean up to ~1.15M open-file
+                // retries against a genuinely wedged lock before anything
+                // is reported, versus today's bounded, diagnosable 2h
+                // "workspace is busy, retry" signal. A caller queued behind
+                // a legitimately long prior turn on the same workspace is a
+                // real but separate concern from this lock's own hygiene;
+                // widening the acquire wait to match is a deliberate future
+                // change, not a side effect of the jobTimeout fix.
                 var gatePath = Path.Combine(
                     store.Root,
                     "..",
@@ -351,7 +433,7 @@ public sealed class DispatchRunner
             job.StartedAt = DateTimeOffset.UtcNow;
             store.Write(job);
 
-            var exit = waiter.Wait(TimeSpan.FromHours(2));
+            var exit = waiter.Wait(jobTimeout);
             job = store.Require(job.JobId);
             job.ExitCode = exit;
             job.FinishedAt = DateTimeOffset.UtcNow;
@@ -744,7 +826,9 @@ public sealed class DispatchRunner
             if (DateTimeOffset.UtcNow >= deadline)
             {
                 throw new TimeoutException(
-                    $"The CCCG owner did not confirm delivery within {deliverWaitTimeout}.");
+                    $"The CCCG owner did not confirm delivery within {deliverWaitTimeout}. "
+                    + $"Override with the {JobTimeoutEnvVariable} environment variable (minutes) "
+                    + "if a longer turn is expected.");
             }
 
             job = store.Require(job.JobId);
@@ -889,7 +973,9 @@ public sealed class DispatchRunner
             if (DateTimeOffset.UtcNow >= deadline)
             {
                 throw new TimeoutException(
-                    $"{provider} session '{sessionId}' stayed live-working longer than {writerWaitTimeout}.");
+                    $"{provider} session '{sessionId}' stayed live-working longer than "
+                    + $"{writerWaitTimeout}. Override with the {JobTimeoutEnvVariable} "
+                    + "environment variable (minutes) if a longer turn is expected.");
             }
 
             Thread.Sleep(writerPollInterval);
@@ -1075,7 +1161,11 @@ public sealed class FileProcessLauncher : IProcessLauncher
                     {
                     }
 
-                    throw new TimeoutException("Dispatch worker exceeded " + timeout + ".");
+                    throw new TimeoutException(
+                        "Dispatch worker exceeded " + timeout
+                        + " (the provider process was killed as a zombie backstop). Override with the "
+                        + DispatchRunner.JobTimeoutEnvVariable
+                        + " environment variable (minutes) if a longer turn is expected.");
                 }
 
                 process.WaitForExit();

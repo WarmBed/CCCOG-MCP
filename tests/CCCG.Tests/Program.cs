@@ -182,6 +182,10 @@ var tests = new (string Name, Action Run)[]
     ("dispatch runners serialize the same managed peer across processes", DispatchRunnersSerializeManagedPeer),
     ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
     ("dispatch runner records success before a post-success binding save can fail", DispatchRunnerRecordsSuccessBeforeBindingSaveCanFail),
+    ("default job timeout is eight hours", DefaultJobTimeoutIsEightHours),
+    ("resolve job timeout respects the CCCG_JOB_TIMEOUT_MINUTES override", ResolveJobTimeoutRespectsEnvOverride),
+    ("resolve job timeout falls back to the default on invalid or non-positive env values", ResolveJobTimeoutFallsBackOnInvalidOrNonPositiveEnv),
+    ("file process launcher waiter times out, kills the child, and names the override in its message", FileProcessLauncherWaiterTimesOutAndKillsWithConfigurableMessage),
     ("provider output parser finds a codex turn.completed marker in the stdout tail", ProviderOutputParserFindsCodexTerminalOutcome),
     ("provider output parser finds a claude error result marker", ProviderOutputParserFindsClaudeErrorOutcome),
     ("provider output parser reports not-terminal when no marker exists yet", ProviderOutputParserReportsNotTerminalWithoutMarker),
@@ -1985,6 +1989,110 @@ static void DispatchStatusFailsDeadWorker()
     var failed = runner.Status(job.JobId);
     Equal(DispatchJobStatus.Failed, failed.Status);
     True(failed.Error?.Contains("worker exited", StringComparison.OrdinalIgnoreCase) == true);
+}
+
+/// <summary>
+/// Regression guard for the incident this replaces: job
+/// 20260820T192504Z_3588b928 (a genuinely still-working xhigh turn) was
+/// killed at exactly 2h0m by the old hardcoded cap. Pin the new default so
+/// a future edit can't silently shrink it back down unnoticed.
+/// </summary>
+static void DefaultJobTimeoutIsEightHours()
+{
+    Equal(TimeSpan.FromHours(8), DispatchRunner.DefaultJobTimeout);
+}
+
+static void ResolveJobTimeoutRespectsEnvOverride()
+{
+    var resolved = DispatchRunner.ResolveJobTimeout(name =>
+        name == DispatchRunner.JobTimeoutEnvVariable ? "5" : null);
+    Equal(TimeSpan.FromMinutes(5), resolved);
+
+    // Fractional minutes: useful for a short-timeout test dispatch without
+    // waiting a full minute.
+    var fractional = DispatchRunner.ResolveJobTimeout(name =>
+        name == DispatchRunner.JobTimeoutEnvVariable ? "0.5" : null);
+    Equal(TimeSpan.FromSeconds(30), fractional);
+}
+
+static void ResolveJobTimeoutFallsBackOnInvalidOrNonPositiveEnv()
+{
+    string?[] invalidValues = ["", "   ", "not-a-number", "0", "-5", "NaN", "Infinity"];
+    foreach (var value in invalidValues)
+    {
+        var resolved = DispatchRunner.ResolveJobTimeout(name =>
+            name == DispatchRunner.JobTimeoutEnvVariable ? value : null);
+        Equal(DispatchRunner.DefaultJobTimeout, resolved);
+    }
+
+    // Unset entirely.
+    Equal(DispatchRunner.DefaultJobTimeout, DispatchRunner.ResolveJobTimeout(_ => null));
+}
+
+/// <summary>
+/// Exercises the real production kill path (FileProcessLauncher.Start plus
+/// ProcessWaiter.Wait, the exact code that killed job
+/// 20260820T192504Z_3588b928's still-working process at the old 2h cap) at
+/// a one-second limit instead of waiting hours: the child must actually be
+/// killed, not just reported as timed out, and the message must carry both
+/// the effective limit and the override env var name so the next person
+/// can self-serve instead of filing another "can only run N hours" report.
+/// </summary>
+static void FileProcessLauncherWaiterTimesOutAndKillsWithConfigurableMessage()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-job-timeout-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    var stdoutPath = Path.Combine(root, "stdout.log");
+    var stderrPath = Path.Combine(root, "stderr.log");
+    try
+    {
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("The current process executable is unavailable.");
+        var childArguments = Path.GetFileNameWithoutExtension(executable)
+            .Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+            ? new[] { System.Reflection.Assembly.GetExecutingAssembly().Location, "--detached-probe-sleep" }
+            : new[] { "--detached-probe-sleep" };
+
+        var launcher = new FileProcessLauncher();
+        launcher.Start(
+            new LaunchCommand(executable, childArguments, root),
+            stdoutPath,
+            stderrPath,
+            stdinPath: null,
+            out var waiter);
+        var childPid = waiter.Pid;
+        True(childPid is > 0);
+
+        var limit = TimeSpan.FromSeconds(1);
+        var exception = Throws<TimeoutException>(() => waiter.Wait(limit));
+
+        True(exception.Message.Contains(limit.ToString(), StringComparison.Ordinal));
+        True(exception.Message.Contains(
+            DispatchRunner.JobTimeoutEnvVariable, StringComparison.Ordinal));
+
+        // The zombie backstop must actually reap the child, not just report.
+        Thread.Sleep(300);
+        True(IsDead(childPid!.Value));
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    static bool IsDead(int pid)
+    {
+        try
+        {
+            return System.Diagnostics.Process.GetProcessById(pid).HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return true;
+        }
+    }
 }
 
 /// <summary>
