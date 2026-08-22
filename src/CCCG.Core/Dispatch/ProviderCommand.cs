@@ -1,7 +1,27 @@
+using System.Globalization;
+
 namespace CCCG.Core.Dispatch;
 
 public static class ProviderCommand
 {
+    /// <summary>
+    /// Operator escape hatch for the grok CLI's --max-turns cap (see
+    /// <see cref="ResolveGrokMaxTurns"/>), mirroring
+    /// DispatchRunner.JobTimeoutEnvVariable's defensive-parse pattern.
+    /// </summary>
+    public const string GrokMaxTurnsEnvVariable = "CCCG_GROK_MAX_TURNS";
+
+    /// <summary>
+    /// Default --max-turns for non-interactive grok runs. Without
+    /// --always-approve + a turn budget, a headless grok agent that needs
+    /// to run any tool (curl, fetch, file read) has nothing to auto-approve
+    /// its request and the turn ends after its first message ("wakes then
+    /// immediately sleeps": stopReason "cancelled", num_turns 1). 30 turns
+    /// is generous for a bounded read-only task while still eventually
+    /// stopping a runaway tool-call loop instead of spinning forever.
+    /// </summary>
+    public const int DefaultGrokMaxTurns = 30;
+
     public const string ClaudeTextOnlySystemPrompt =
         "You are a CCCG text-only peer. Answer only the task in the user message. "
         + "Never use, describe, simulate, or request tools. Never read or write files, memory, settings, network, or external systems. "
@@ -58,7 +78,15 @@ public static class ProviderCommand
             "--output-format", "json",
             "--cwd", cwd,
             "--permission-mode", "acceptEdits",
-            "--no-auto-update"
+            "--no-auto-update",
+            // --permission-mode acceptEdits only covers file edits; a
+            // headless run has no TTY to answer an approval prompt for any
+            // other tool (shell, curl/fetch, ...), so without an explicit
+            // auto-approve the agent stops after its first message the
+            // moment it needs to run one. --max-turns is the matching
+            // safety bound so an auto-approved agent can't loop forever.
+            "--always-approve",
+            "--max-turns", ResolveGrokMaxTurns().ToString(CultureInfo.InvariantCulture)
         };
         if (!string.IsNullOrWhiteSpace(model))
         {
@@ -89,6 +117,26 @@ public static class ProviderCommand
         }
 
         return new LaunchCommand(file, args, cwd);
+    }
+
+    /// <summary>
+    /// Reads <see cref="GrokMaxTurnsEnvVariable"/> and falls back to
+    /// <see cref="DefaultGrokMaxTurns"/> for anything unset, unparsable, or
+    /// non-positive -- a malformed operator override must never crash
+    /// dispatch or hand the CLI a zero/negative turn budget.
+    /// </summary>
+    public static int ResolveGrokMaxTurns(Func<string, string?>? getEnvironmentVariable = null)
+    {
+        getEnvironmentVariable ??= Environment.GetEnvironmentVariable;
+        var raw = getEnvironmentVariable(GrokMaxTurnsEnvVariable);
+        if (!string.IsNullOrWhiteSpace(raw)
+            && int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var turns)
+            && turns > 0)
+        {
+            return turns;
+        }
+
+        return DefaultGrokMaxTurns;
     }
 
     public static LaunchCommand BuildCodex(

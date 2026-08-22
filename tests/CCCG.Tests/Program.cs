@@ -162,6 +162,10 @@ var tests = new (string Name, Action Run)[]
     ("provider command omits Codex model flags when unset", ProviderCommandOmitsCodexModelFlagsWhenUnset),
     ("provider command adds Grok model and effort", ProviderCommandAddsGrokModelAndEffort),
     ("provider command omits Grok model flags when unset", ProviderCommandOmitsGrokModelFlagsWhenUnset),
+    ("provider command enables Grok tool execution on create and resume", ProviderCommandGrokEnablesToolExecution),
+    ("resolve grok max turns respects the CCCG_GROK_MAX_TURNS override", ResolveGrokMaxTurnsRespectsEnvOverride),
+    ("resolve grok max turns falls back to the default on invalid or non-positive env values", ResolveGrokMaxTurnsFallsBackOnInvalidEnv),
+    ("provider output picks the final message from a multi-turn Grok result", ProviderOutputPicksFinalGrokMessage),
     ("dispatch job store round-trips model and effort", DispatchJobStoreRoundTripsModelAndEffort),
     ("dispatch job store ignores missing model fields", DispatchJobStoreIgnoresMissingModelFields),
     ("dispatch job store round-trips caller label", DispatchJobStoreRoundTripsCallerLabel),
@@ -1276,6 +1280,85 @@ static void ProviderCommandOmitsGrokModelFlagsWhenUnset()
     True(cmd.Arguments.Contains("-r"));
     True(cmd.Arguments.Contains("sess-1"));
     True(cmd.Arguments.Contains("--prompt-file"));
+}
+
+/// <summary>
+/// Regression test for "grok wakes then immediately sleeps": job
+/// 20260822T010850Z_7f9e7c9d stopped after its first message
+/// (stopReason "cancelled", num_turns 1) because --permission-mode
+/// acceptEdits only covers file edits, not general tool execution, and a
+/// headless run has no TTY to answer an approval prompt. Both the create
+/// and resume argv must carry --always-approve plus a bounded --max-turns
+/// so the CLI can actually run tools instead of stalling on the first one.
+/// </summary>
+static void ProviderCommandGrokEnablesToolExecution()
+{
+    var resumed = ProviderCommand.BuildGrok(
+        DispatchAction.Resume, "sess-1", "D:\\code\\app", "D:\\tmp\\prompt.txt", grokHome: "D:\\tmp\\grok-home");
+    True(resumed.Arguments.Contains("--always-approve"));
+    var resumedMaxTurnsAt = IndexOf(resumed.Arguments, "--max-turns");
+    True(resumedMaxTurnsAt > 0);
+    Equal(
+        ProviderCommand.DefaultGrokMaxTurns.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        resumed.Arguments[resumedMaxTurnsAt + 1]);
+
+    var created = ProviderCommand.BuildGrok(
+        DispatchAction.Create, null, "D:\\code\\app", "D:\\tmp\\prompt.txt", grokHome: "D:\\tmp\\grok-home");
+    True(created.Arguments.Contains("--always-approve"));
+    True(created.Arguments.Contains("--max-turns"));
+}
+
+static void ResolveGrokMaxTurnsRespectsEnvOverride()
+{
+    var resolved = ProviderCommand.ResolveGrokMaxTurns(name =>
+        name == ProviderCommand.GrokMaxTurnsEnvVariable ? "12" : null);
+    Equal(12, resolved);
+}
+
+static void ResolveGrokMaxTurnsFallsBackOnInvalidEnv()
+{
+    string?[] invalidValues = ["", "   ", "not-a-number", "0", "-5", "3.5"];
+    foreach (var value in invalidValues)
+    {
+        var resolved = ProviderCommand.ResolveGrokMaxTurns(name =>
+            name == ProviderCommand.GrokMaxTurnsEnvVariable ? value : null);
+        Equal(ProviderCommand.DefaultGrokMaxTurns, resolved);
+    }
+
+    Equal(ProviderCommand.DefaultGrokMaxTurns, ProviderCommand.ResolveGrokMaxTurns(_ => null));
+}
+
+/// <summary>
+/// grok's --output-format json prints exactly one JSON object at the very
+/// end of the whole invocation (unlike codex's per-event JSONL stream), so
+/// unlike the codex extractor there is no "list of turns to walk" -- the
+/// single object's "text"/"thought" fields already are whatever the agent
+/// said last, after all intermediate tool-using turns. Verified against a
+/// real multi-turn run (job re-dispatched through worker 0.8.6) before
+/// trusting this fixture shape rather than assuming codex's symmetry.
+/// </summary>
+static void ProviderOutputPicksFinalGrokMessage()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-grok-multiturn-{Guid.NewGuid():N}.json");
+    try
+    {
+        File.WriteAllText(path, """
+            {
+              "text": "FINAL-ANSWER-AFTER-TOOL-USE",
+              "stopReason": "end_turn",
+              "sessionId": "11111111-1111-4111-8111-111111111111",
+              "thought": "final reasoning snippet",
+              "usage": { "input_tokens": 500, "output_tokens": 300 },
+              "num_turns": 4,
+              "total_cost_usd": 0.25
+            }
+            """);
+        Equal("FINAL-ANSWER-AFTER-TOOL-USE", ProviderOutputParser.CollectResponse("grok", path));
+    }
+    finally
+    {
+        File.Delete(path);
+    }
 }
 
 static void DispatchJobStoreRoundTripsModelAndEffort()
