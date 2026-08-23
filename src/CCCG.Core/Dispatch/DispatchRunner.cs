@@ -418,9 +418,26 @@ public sealed class DispatchRunner
             {
                 Environment = recursion.ProviderEnvironment(selection.Provider)
             };
-            var stdin = selection.Provider is "codex" or "claude"
-                ? store.PromptPath(job.JobId)
-                : null;
+
+            // Observability: record the exact argv this job launched with,
+            // before the launch itself (so it's captured even if Start
+            // throws). A prior investigation into "grok wakes then
+            // immediately sleeps" burned a full round trip because there
+            // was no way to confirm post-hoc whether a suspect flag change
+            // had actually reached the spawned process.
+            job.ProviderArgv = new[] { command.FileName }.Concat(command.Arguments).ToArray();
+            store.Write(job);
+
+            // grok reads its prompt from --prompt-file, not stdin, and a
+            // spawn-chain reproduction (breakaway -> stdin-pipe relay ->
+            // grok.exe with stdin unredirected, matching this worker's
+            // actual process tree) never reproduced any effect from leaving
+            // grok's stdin unredirected. Left as null, same as before.
+            var stdin = selection.Provider switch
+            {
+                "codex" or "claude" => store.PromptPath(job.JobId),
+                _ => null
+            };
             var pid = launcher.Start(
                 command,
                 store.StdoutPath(job.JobId),
@@ -443,6 +460,13 @@ public sealed class DispatchRunner
                 job.Error = "Provider exited with code " + exit + ".";
                 store.Write(job);
                 return job;
+            }
+
+            if (selection.Provider == "grok")
+            {
+                job.ProviderStopReason = ProviderOutputParser.FindGrokStopReason(
+                    store.StdoutPath(job.JobId));
+                store.Write(job);
             }
 
             var providerError = ProviderOutputParser.FindError(

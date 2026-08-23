@@ -194,6 +194,9 @@ var tests = new (string Name, Action Run)[]
     ("provider output parser finds a claude error result marker", ProviderOutputParserFindsClaudeErrorOutcome),
     ("provider output parser reports not-terminal when no marker exists yet", ProviderOutputParserReportsNotTerminalWithoutMarker),
     ("provider output parser finds the marker past megabytes of unrelated tail content", ProviderOutputParserFindsMarkerPastLargeTail),
+    ("provider output parser flags a grok turn cancelled by its own permission engine as an error", ProviderOutputParserFlagsGrokCancelledStopReason),
+    ("provider output parser treats a grok end_turn stopReason as no error", ProviderOutputParserAcceptsGrokEndTurnStopReason),
+    ("provider output parser finds a grok cancelled stopReason as a terminal failure, not a success", ProviderOutputParserFindsGrokCancelledTerminalOutcome),
     ("reconciler flips a stuck running job with a completion marker to succeeded", ReconcilerFlipsStuckRunningJobToSucceeded),
     ("reconciler retries a job already mislabeled failed by a past dead-worker pass", ReconcilerRetriesPastMislabeledFailure),
     ("reconciler leaves a genuinely unfinished dead-worker job failed", ReconcilerLeavesGenuinelyDeadJobFailed),
@@ -1524,6 +1527,9 @@ static void ProviderOutputNormalizesGrok()
             }
             """);
         Equal("GROK-NORMALIZED-OK", ProviderOutputParser.CollectResponse("grok", path));
+        // No "stopReason" field at all (older/partial output shape) must not
+        // be misread as a failure -- only a present, non-end_turn value is.
+        True(ProviderOutputParser.FindError("grok", path) is null);
     }
     finally
     {
@@ -2245,6 +2251,76 @@ static void ProviderOutputParserFindsCodexTerminalOutcome()
         True(outcome.IsTerminal);
         True(outcome.Succeeded);
         True(outcome.Error is null);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ProviderOutputParserFlagsGrokCancelledStopReason()
+{
+    // Real shape captured from a job whose run_terminal_command call was
+    // cancelled by grok's own permission engine: the process still exits 0
+    // and writes a well-formed JSON object, so exit code and JSON-parses
+    // alone can't tell this apart from a real success.
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-grok-cancelled-{Guid.NewGuid():N}.json");
+    File.WriteAllText(path, """
+        {
+          "text": "?" ,
+          "stopReason": "cancelled",
+          "sessionId": "11111111-1111-4111-8111-111111111111"
+        }
+        """);
+    try
+    {
+        var error = ProviderOutputParser.FindError("grok", path);
+        True(error is not null);
+        True(error!.Contains("cancelled", StringComparison.Ordinal));
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ProviderOutputParserAcceptsGrokEndTurnStopReason()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-grok-endturn-{Guid.NewGuid():N}.json");
+    File.WriteAllText(path, """
+        {
+          "text": "all done",
+          "stopReason": "end_turn",
+          "sessionId": "11111111-1111-4111-8111-111111111111"
+        }
+        """);
+    try
+    {
+        True(ProviderOutputParser.FindError("grok", path) is null);
+        Equal("end_turn", ProviderOutputParser.FindGrokStopReason(path));
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void ProviderOutputParserFindsGrokCancelledTerminalOutcome()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"cccg-grok-outcome-cancelled-{Guid.NewGuid():N}.json");
+    File.WriteAllText(path, """
+        {
+          "text": "?",
+          "stopReason": "cancelled",
+          "sessionId": "11111111-1111-4111-8111-111111111111"
+        }
+        """);
+    try
+    {
+        var outcome = ProviderOutputParser.FindTerminalOutcome("grok", path);
+        True(outcome.IsTerminal);
+        True(!outcome.Succeeded);
+        True(outcome.Error is not null && outcome.Error.Contains("cancelled", StringComparison.Ordinal));
     }
     finally
     {

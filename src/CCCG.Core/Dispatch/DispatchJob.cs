@@ -98,6 +98,27 @@ public sealed class DispatchJob
 
     [JsonPropertyName("peerTurnsAfter")]
     public int? PeerTurnsAfter { get; set; }
+
+    /// <summary>
+    /// The exact argv (file name plus arguments) this job launched the
+    /// provider with, recorded before launch so it survives even if Start
+    /// throws. Exists because a prior investigation into "grok wakes then
+    /// immediately sleeps" burned a full round trip with no way to confirm
+    /// post-hoc whether a suspect flag change had actually reached the
+    /// spawned process.
+    /// </summary>
+    [JsonPropertyName("providerArgv")]
+    public string[]? ProviderArgv { get; set; }
+
+    /// <summary>
+    /// The provider's own turn-ending stopReason marker for this job, when
+    /// the provider's stdout schema carries one (currently grok's "stopReason").
+    /// Recorded even on a "succeeded" job so a cancelled-but-exit-0 turn
+    /// (see ProviderOutputParser.FindError's grok branch) leaves a visible
+    /// trail instead of looking identical to a real success.
+    /// </summary>
+    [JsonPropertyName("providerStopReason")]
+    public string? ProviderStopReason { get; set; }
 }
 
 public sealed record LaunchCommand(

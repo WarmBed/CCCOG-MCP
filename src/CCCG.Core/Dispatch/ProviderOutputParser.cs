@@ -178,10 +178,35 @@ public static class ProviderOutputParser
         return Truncate(File.ReadAllText(stdoutPath), maxChars);
     }
 
+    /// <summary>
+    /// stopReason values grok's CLI is known to emit for a turn that actually
+    /// finished answering. Anything else -- most importantly "cancelled",
+    /// emitted when a headless run's own permission engine cancels a tool
+    /// call it can't get approval for (see ProviderCommand's --always-approve
+    /// comment) -- means the job's process still exited 0, but the agent
+    /// never actually did the requested work. Before this check existed,
+    /// DispatchRunner had no way to tell the two apart: a cancelled turn was
+    /// recorded as a normal "succeeded" job, silently handing the caller a
+    /// half-finished answer with no signal anything went wrong.
+    /// </summary>
+    private static readonly HashSet<string> GrokSuccessfulStopReasons = new(StringComparer.Ordinal)
+    {
+        "end_turn",
+    };
+
     public static string? FindError(string provider, string stdoutPath)
     {
-        if (!provider.Equals("claude", StringComparison.OrdinalIgnoreCase)
-            || !File.Exists(stdoutPath))
+        if (!File.Exists(stdoutPath))
+        {
+            return null;
+        }
+
+        if (provider.Equals("grok", StringComparison.OrdinalIgnoreCase))
+        {
+            return FindGrokStopReasonError(stdoutPath);
+        }
+
+        if (!provider.Equals("claude", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
@@ -209,6 +234,43 @@ public static class ProviderOutputParser
         }
 
         return null;
+    }
+
+    private static string? FindGrokStopReasonError(string stdoutPath)
+    {
+        var reason = FindGrokStopReason(stdoutPath);
+        return reason is null || GrokSuccessfulStopReasons.Contains(reason)
+            ? null
+            : $"Grok turn did not complete (stopReason: {reason}).";
+    }
+
+    /// <summary>
+    /// Raw stopReason value for observability, independent of whether it's
+    /// one this codebase currently treats as a failure. Recorded on every
+    /// grok job (see DispatchJob.ProviderStopReason) so a future stopReason
+    /// this code doesn't yet recognize as bad still leaves a visible trail
+    /// instead of only surfacing once someone happens to open the raw stdout.
+    /// </summary>
+    public static string? FindGrokStopReason(string stdoutPath)
+    {
+        if (!File.Exists(stdoutPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(stdoutPath));
+            var root = document.RootElement;
+            return root.TryGetProperty("stopReason", out var stopReason)
+                && stopReason.ValueKind == JsonValueKind.String
+                    ? stopReason.GetString()
+                    : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -292,14 +354,23 @@ public static class ProviderOutputParser
         {
             // grok's CLI writes one JSON object at the very end of the turn,
             // not JSONL, so a parseable object with a "text" field is itself
-            // the terminal marker.
+            // the terminal marker -- but a present "text" field only means
+            // the process ran to completion, not that the turn actually
+            // finished answering. stopReason carries that distinction (see
+            // FindGrokStopReasonError); a cancelled turn must be reported as
+            // a failure here too, or the dead-worker reconciler resurrects a
+            // half-finished job as "succeeded" the same way the primary
+            // FindError path used to.
             try
             {
                 using var document = JsonDocument.Parse(File.ReadAllText(stdoutPath));
                 if (document.RootElement.TryGetProperty("text", out var text)
                     && text.ValueKind == JsonValueKind.String)
                 {
-                    return TerminalOutcome.Success();
+                    var stopReasonError = FindGrokStopReasonError(stdoutPath);
+                    return stopReasonError is null
+                        ? TerminalOutcome.Success()
+                        : TerminalOutcome.Failure(stopReasonError);
                 }
             }
             catch (JsonException)
