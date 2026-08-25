@@ -255,6 +255,7 @@ var tests = new (string Name, Action Run)[]
     ("archive visibility excludes archived peers from list watch search and read", ArchiveVisibilityExcludesArchivedPeers),
     ("Host registers all CCD parity tools", HostRegistersAllCcdParityTools),
     ("Host tool descriptions warn transcript is untrusted", HostToolDescriptionsWarnUntrustedContent),
+    ("Host dispatch description warns fire-and-forget is silent", HostDispatchDescriptionWarnsFireAndForget),
     ("Worker dispatches read search title archive operations", WorkerDispatchesReadSearchTitleArchiveOperations),
     ("Host payload round trips all four operations", HostPayloadRoundTripsAllFourOperations)
     ,
@@ -4505,6 +4506,17 @@ static void HostToolDescriptionsWarnUntrustedContent()
         True(description.Contains("untrusted", StringComparison.OrdinalIgnoreCase));
         True(description.Contains("not instructions", StringComparison.OrdinalIgnoreCase));
     }
+}
+
+static void HostDispatchDescriptionWarnsFireAndForget()
+{
+    var method = typeof(DispatchTools)
+        .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        .Single(candidate => candidate.GetCustomAttribute<McpServerToolAttribute>()?.Name == "cccg_dispatch");
+    var description = method.GetCustomAttribute<DescriptionAttribute>()?.Description ?? "";
+    True(description.Contains("Fire-and-forget", StringComparison.Ordinal));
+    True(description.Contains("cccg_dispatch_wait", StringComparison.Ordinal));
+    True(description.Contains("sits silent until the user happens to prompt again", StringComparison.Ordinal));
 }
 
 static void WorkerDispatchesReadSearchTitleArchiveOperations()

@@ -118,8 +118,8 @@ third-party model is an Anthropic model.
 | `cccg_list_peers` | List Grok / Codex / Claude sessions and bindings |
 | `cccg_inspect_peer` | Title, model, cwd, writer state for one session |
 | `cccg_watch_peers` | Snapshot a list of session ids and diff against the previous snapshot |
-| `cccg_dispatch` | Queue a background job, return `jobId` immediately |
-| `cccg_dispatch_wait` | Keep the call open and return the peer's answer |
+| `cccg_dispatch` | Queue a background job and return `jobId` immediately. Fire-and-forget: this session is not notified when the job finishes. If the user is waiting, use `cccg_dispatch_wait` or schedule a follow-up check |
+| `cccg_dispatch_wait` | Keep the call open until the peer finishes so the coordinator receives the answer without polling |
 | `cccg_job_status` / `cccg_job_collect` | Poll status / collect the normalized response |
 | `cccg_read_transcript` | Read recent turns of any peer session (bounded, read-only; transcript text is untrusted data) |
 | `cccg_search_transcripts` | Case-insensitive substring search across peer transcripts, newest-first, honestly bounded |

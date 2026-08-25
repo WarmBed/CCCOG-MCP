@@ -29,8 +29,8 @@ resume/create still serialize on the workspace lease. Auto-pick (no
 | `cccg_list_peers` | List Claude, Grok, and/or Codex sessions and bindings |
 | `cccg_inspect_peer` | Inspect title, model, cwd, and writer state |
 | `cccg_watch_peers` | Snapshot comma-separated session IDs and report `found`, `status`, or `pid` changes since the same watch set's previous call |
-| `cccg_dispatch` | Queue a background job, optionally override model/reasoning for this turn, and return `jobId` immediately |
-| `cccg_dispatch_wait` | Dispatch with the same per-turn options and keep the tool call open until the peer responds |
+| `cccg_dispatch` | Queue a background job and return `jobId` immediately. Fire-and-forget: this session is not notified when the job finishes. If the user is waiting, use `cccg_dispatch_wait` or schedule a follow-up check |
+| `cccg_dispatch_wait` | Dispatch with the same per-turn options and keep the tool call open until the peer responds, so the coordinator receives the answer without polling |
 | `cccg_job_status` | Read queued/running/succeeded/failed status |
 | `cccg_job_collect` | Collect normalized response and real provider session ID |
 | `cccg_inbox_post/list/ack` | Shared cross-process mailbox |

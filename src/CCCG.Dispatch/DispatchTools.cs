@@ -69,7 +69,7 @@ public sealed class DispatchTools
         Invoke("watchPeers", new { sessionIds, provider });
 
     [McpServerTool(Name = "cccg_dispatch"),
-     Description("Queue work and return a jobId immediately. Same-session work is serialized across all Claude Desktop sessions.")]
+     Description("Queue work and return a jobId immediately. Fire-and-forget: CCCG will not notify this session when the job finishes. If the user is waiting, use cccg_dispatch_wait, or schedule a follow-up (wakeup/reminder, or cccg_job_status/cccg_job_collect) before ending the turn — otherwise the result sits silent until the user happens to prompt again.")]
     public string Dispatch(
         [Description("Task for the peer.")] string prompt,
         [Description("Provider: grok, codex, or claude.")] string provider = "grok",
