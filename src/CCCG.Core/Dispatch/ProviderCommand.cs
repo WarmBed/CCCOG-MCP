@@ -22,6 +22,41 @@ public static class ProviderCommand
     /// </summary>
     public const int DefaultGrokMaxTurns = 30;
 
+    /// <summary>
+    /// Operator escape hatch for how many times DispatchRunner automatically
+    /// re-resumes a grok job whose turn was cancelled by grok's own
+    /// permission engine (stopReason other than "end_turn" -- see
+    /// ProviderOutputParser.FindError's grok branch). This is the same
+    /// intermittent failure --always-approve/--max-turns above target: grok
+    /// exits 0 having done nothing useful. A caller shouldn't have to notice
+    /// the job failed and manually redispatch for what history shows is
+    /// usually a transient hiccup, not a real task failure.
+    /// </summary>
+    public const string GrokCancelRetriesEnvVariable = "CCCG_GROK_CANCEL_RETRIES";
+
+    /// <summary>
+    /// Default number of automatic retries for a cancelled grok turn (on top
+    /// of the original attempt, so 2 means up to 3 total attempts). Kept
+    /// small: each retry is a real, billed grok call, and a genuinely broken
+    /// task (not a transient cancellation) should surface as failed rather
+    /// than silently eat retries.
+    /// </summary>
+    public const int DefaultGrokCancelRetries = 2;
+
+    public static int ResolveGrokCancelRetries(Func<string, string?>? getEnvironmentVariable = null)
+    {
+        getEnvironmentVariable ??= Environment.GetEnvironmentVariable;
+        var raw = getEnvironmentVariable(GrokCancelRetriesEnvVariable);
+        if (!string.IsNullOrWhiteSpace(raw)
+            && int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var retries)
+            && retries >= 0)
+        {
+            return retries;
+        }
+
+        return DefaultGrokCancelRetries;
+    }
+
     public const string ClaudeTextOnlySystemPrompt =
         "You are a CCCG text-only peer. Answer only the task in the user message. "
         + "Never use, describe, simulate, or request tools. Never read or write files, memory, settings, network, or external systems. "

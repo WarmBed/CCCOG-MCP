@@ -119,6 +119,16 @@ public sealed class DispatchJob
     /// </summary>
     [JsonPropertyName("providerStopReason")]
     public string? ProviderStopReason { get; set; }
+
+    /// <summary>
+    /// How many automatic re-attempts DispatchRunner made after grok's own
+    /// permission engine cancelled a turn (see ProviderCommand's
+    /// GrokCancelRetriesEnvVariable). Absent/null means no retry was needed
+    /// -- the first attempt either succeeded or failed for a non-retryable
+    /// reason. A job can succeed with RetryCount > 0.
+    /// </summary>
+    [JsonPropertyName("retryCount")]
+    public int? RetryCount { get; set; }
 }
 
 public sealed record LaunchCommand(

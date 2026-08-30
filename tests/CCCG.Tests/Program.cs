@@ -157,6 +157,9 @@ var tests = new (string Name, Action Run)[]
     ("dispatch deliver succeeds and posts a placeholder for an empty provider reply", DispatchDeliverEmptyReplySucceedsWithPlaceholder),
     ("grok resume read-back confirms the recorded turn", GrokResumeReadBackPasses),
     ("grok resume read-back fails when no turn is recorded", GrokResumeReadBackFails),
+    ("grok dispatch retries a cancelled turn and succeeds on the next attempt", GrokDispatchRetriesCancelledTurnThenSucceeds),
+    ("grok dispatch fails after exhausting cancelled-turn retries", GrokDispatchFailsAfterExhaustingCancelledRetries),
+    ("grok dispatch does not retry a non-cancellation error", GrokDispatchDoesNotRetryNonCancellationError),
     ("provider command resumes grok codex and claude", ProviderCommandResumesPeers),
     ("provider command adds Codex model and effort", ProviderCommandAddsCodexModelAndEffort),
     ("provider command omits Codex model flags when unset", ProviderCommandOmitsCodexModelFlagsWhenUnset),
@@ -4726,6 +4729,114 @@ static void GrokResumeReadBackFails()
     Equal(4, done.PeerTurnsAfter);
 }
 
+static void GrokDispatchRetriesCancelledTurnThenSucceeds()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-grok-retry-ok-{Guid.NewGuid():N}");
+    var count = 4;
+    var starts = 0;
+    const string cancelled = """{"text":"partial","stopReason":"cancelled","sessionId":"idle"}""";
+    const string succeeded = """{"text":"done","stopReason":"end_turn","sessionId":"idle"}""";
+    var launcher = new SequencedGrokLauncher(
+        new[] { cancelled, cancelled, succeeded },
+        onEachStart: () =>
+        {
+            starts++;
+            if (starts >= 3)
+            {
+                count = 5;
+            }
+        });
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var runner = new DispatchRunner(
+        store,
+        _ =>
+        [
+            new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, count)
+        ],
+        launcher,
+        owners: new OwnerRegistry(Path.Combine(root, "owners")),
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        readBackTimeout: TimeSpan.FromSeconds(2));
+    try
+    {
+        var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Succeeded, done.Status);
+        Equal(2, done.RetryCount);
+        Equal("end_turn", done.ProviderStopReason);
+        Equal(3, launcher.CallCount);
+
+        var jobDirectory = store.JobDirectory(job.JobId);
+        Equal(cancelled, File.ReadAllText(Path.Combine(jobDirectory, "stdout.attempt1.log")));
+        Equal(cancelled, File.ReadAllText(Path.Combine(jobDirectory, "stdout.attempt2.log")));
+        Equal(succeeded, File.ReadAllText(store.StdoutPath(job.JobId)));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void GrokDispatchFailsAfterExhaustingCancelledRetries()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-grok-retry-exhausted-{Guid.NewGuid():N}");
+    const string cancelled = """{"text":"partial","stopReason":"cancelled","sessionId":"idle"}""";
+    var launcher = new SequencedGrokLauncher(new[] { cancelled, cancelled, cancelled, cancelled });
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var runner = new DispatchRunner(
+        store,
+        _ =>
+        [
+            new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, 4)
+        ],
+        launcher,
+        owners: new OwnerRegistry(Path.Combine(root, "owners")),
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        readBackTimeout: TimeSpan.FromMilliseconds(200));
+    try
+    {
+        Environment.SetEnvironmentVariable(ProviderCommand.GrokCancelRetriesEnvVariable, "2");
+        var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Failed, done.Status);
+        True(done.Error?.Contains("stopReason: cancelled", StringComparison.Ordinal) == true);
+        Equal(2, done.RetryCount);
+        // DefaultGrokCancelRetries=2 means 3 total attempts (1 original + 2
+        // retries); the loop must not launch a 4th time once exhausted.
+        Equal(3, launcher.CallCount);
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable(ProviderCommand.GrokCancelRetriesEnvVariable, null);
+        TryDelete(root);
+    }
+}
+
+static void GrokDispatchDoesNotRetryNonCancellationError()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-claude-no-retry-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var launcher = new FakeProcessLauncher(
+        """{"type":"result","is_error":true,"session_id":"s1","result":"boom"}""");
+    var runner = new DispatchRunner(
+        store,
+        _ => Array.Empty<Peer>(),
+        launcher,
+        claudeCommand: "claude.exe");
+    try
+    {
+        var job = runner.Enqueue("claude", "hello", cwd: "D:\\code\\app");
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Failed, done.Status);
+        Equal("boom", done.Error);
+        True(done.RetryCount is null);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
 static T Throws<T>(Action action) where T : Exception
 {
     try
@@ -5073,6 +5184,45 @@ class FakeProcessLauncher : IProcessLauncher
     private sealed class ImmediateWaiter : IProcessWaiter
     {
         public int? Pid => 4242;
+
+        public int Wait(TimeSpan timeout) => 0;
+    }
+}
+
+sealed class SequencedGrokLauncher : IProcessLauncher
+{
+    private readonly string[] stdouts;
+    private readonly Action? onEachStart;
+    private int callCount;
+
+    public SequencedGrokLauncher(string[] stdouts, Action? onEachStart = null)
+    {
+        this.stdouts = stdouts;
+        this.onEachStart = onEachStart;
+    }
+
+    public int CallCount => callCount;
+
+    public int Start(
+        LaunchCommand command,
+        string stdoutPath,
+        string stderrPath,
+        string? stdinPath,
+        out IProcessWaiter waiter)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(stdoutPath)!);
+        var index = Math.Min(callCount, stdouts.Length - 1);
+        File.WriteAllText(stdoutPath, stdouts[index]);
+        File.WriteAllText(stderrPath, "");
+        callCount++;
+        onEachStart?.Invoke();
+        waiter = new ImmediateWaiter();
+        return 9000 + callCount;
+    }
+
+    private sealed class ImmediateWaiter : IProcessWaiter
+    {
+        public int? Pid => null;
 
         public int Wait(TimeSpan timeout) => 0;
     }

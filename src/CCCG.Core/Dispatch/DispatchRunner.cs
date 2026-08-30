@@ -387,11 +387,28 @@ public sealed class DispatchRunner
                 job.PeerTurnsBefore = peerTurnsBefore;
             }
 
+            // A grok turn cancelled by grok's own permission engine (exit 0,
+            // stopReason other than "end_turn" -- see
+            // ProviderOutputParser.FindError's grok branch) is usually a
+            // transient hiccup, not a real task failure: automatically
+            // re-resume up to ResolveGrokCancelRetries() times before giving
+            // up, instead of making every caller notice the failure and
+            // manually redispatch. Only grok gets this treatment -- this
+            // codebase has no evidence of an equivalent "exited 0 but did
+            // nothing" failure mode for codex/claude, so retrying them here
+            // would just double-bill a genuinely failed task.
+            var grokCancelRetriesRemaining = selection.Provider == "grok"
+                ? ProviderCommand.ResolveGrokCancelRetries()
+                : 0;
+            var attemptAction = selection.Action;
+
+            while (true)
+            {
             var command = selection.Provider switch
             {
                 "grok" => ProviderCommand.BuildGrok(
-                    selection.Action,
-                    selection.Action == DispatchAction.Create ? null : selection.SessionId,
+                    attemptAction,
+                    attemptAction == DispatchAction.Create ? null : selection.SessionId,
                     selection.Cwd ?? Environment.CurrentDirectory,
                     store.PromptPath(job.JobId),
                     grokHome,
@@ -472,9 +489,36 @@ public sealed class DispatchRunner
             var providerError = ProviderOutputParser.FindError(
                 selection.Provider,
                 store.StdoutPath(job.JobId));
-            if (!string.IsNullOrWhiteSpace(providerError))
+            if (string.IsNullOrWhiteSpace(providerError))
+            {
+                break;
+            }
+
+            var isCancelledGrokTurn = selection.Provider == "grok"
+                && job.ProviderStopReason is not null
+                && !string.Equals(job.ProviderStopReason, "end_turn", StringComparison.Ordinal);
+            if (!isCancelledGrokTurn || grokCancelRetriesRemaining <= 0)
             {
                 throw new InvalidDataException(providerError);
+            }
+
+            // Preserve this attempt's raw output before the next attempt
+            // overwrites stdout.log/stderr.log at the same job-id path --
+            // otherwise a job that still fails after exhausting retries
+            // would only ever show the LAST attempt's evidence, losing the
+            // cancelled turns that actually explain what happened.
+            grokCancelRetriesRemaining--;
+            job.RetryCount = (job.RetryCount ?? 0) + 1;
+            PreserveAttemptOutput(store.StdoutPath(job.JobId), job.RetryCount.Value);
+            PreserveAttemptOutput(store.StderrPath(job.JobId), job.RetryCount.Value);
+            store.Write(job);
+
+            // The session grok's CLI wrote to already exists on disk
+            // regardless of whether this attempt started as Create -- every
+            // subsequent attempt resumes it rather than repeating Create
+            // (which would either collide on --session-id or spawn a second,
+            // unrelated session).
+            attemptAction = DispatchAction.Resume;
             }
 
             var resolvedSessionId = selection.SessionId
@@ -911,6 +955,36 @@ public sealed class DispatchRunner
         listPeers("grok").FirstOrDefault(peer =>
                 string.Equals(peer.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
             ?.MessageCount;
+
+    /// <summary>
+    /// Copies a job's stdout/stderr file to an attempt-numbered sibling
+    /// (e.g. "stdout.attempt1.log") before a retry overwrites the original
+    /// path. Best-effort: a missing source file (a stage that never wrote
+    /// one) or a copy failure must never abort the retry it's just
+    /// documenting.
+    /// </summary>
+    private static void PreserveAttemptOutput(string path, int attemptNumber)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            var directory = Path.GetDirectoryName(path)!;
+            var name = Path.GetFileNameWithoutExtension(path);
+            var extension = Path.GetExtension(path);
+            var snapshot = Path.Combine(directory, $"{name}.attempt{attemptNumber}{extension}");
+            File.Copy(path, snapshot, overwrite: true);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
 
     private int? WaitForGrokTurnIncrease(string sessionId, int before)
     {
