@@ -205,6 +205,12 @@ var tests = new (string Name, Action Run)[]
     ("reconciler leaves a genuinely unfinished dead-worker job failed", ReconcilerLeavesGenuinelyDeadJobFailed),
     ("reconciler never reopens a job that failed for a real provider reason", ReconcilerNeverReopensGenuineFailure),
     ("reconcile stuck jobs sweeps every job on disk exactly once", ReconcileStuckJobsSweepsAllJobs),
+    ("dispatch runner stamps the worker version on the job it runs", DispatchRunnerStampsWorkerVersion),
+    ("grok dispatch sums provider cost across retried attempts", GrokDispatchAccumulatesCostAcrossRetries),
+    ("job store prunes only expired terminal job directories", PruneTerminalJobsRemovesOnlyExpiredTerminalJobs),
+    ("inbox prune drops acked notes after read retention and everything after the hard cap", InboxPruneDropsExpiredByPolicy),
+    ("maintain reconciles then prunes and honors a zero retention as disabled", MaintainReportsCountsAndHonorsRetentionEnv),
+    ("resolve retention days falls back on invalid values and honors zero", ResolveRetentionDaysParsesDefensively),
     ("detached process launcher escapes a kill-on-close job object", DetachedProcessLauncherEscapesKillOnCloseJob),
     ("binding store marks and prefers the bound peer", BindingStorePrefersBoundPeer),
     ("inbox ledger posts lists and acks for Claude", InboxLedgerRoundTrips),
@@ -4810,6 +4816,233 @@ static void GrokDispatchFailsAfterExhaustingCancelledRetries()
         Environment.SetEnvironmentVariable(ProviderCommand.GrokCancelRetriesEnvVariable, null);
         TryDelete(root);
     }
+}
+
+static void DispatchRunnerStampsWorkerVersion()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-worker-version-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var peers = new[]
+    {
+        new Peer("codex", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(
+        store,
+        _ => peers,
+        new FakeProcessLauncher("DISPATCH-OK"),
+        owners: new OwnerRegistry(Path.Combine(root, "owners")),
+        workerVersion: "9.9.9-test");
+    try
+    {
+        var job = runner.Enqueue("codex", "hello", "old", "D:\\code\\app", allowNew: false);
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Succeeded, done.Status);
+        Equal("9.9.9-test", done.WorkerVersion);
+        Equal("9.9.9-test", store.Require(job.JobId).WorkerVersion);
+        var collected = System.Text.Json.JsonSerializer.Serialize(runner.Collect(job.JobId));
+        True(collected.Contains("\"WorkerVersion\":\"9.9.9-test\"", StringComparison.Ordinal));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void GrokDispatchAccumulatesCostAcrossRetries()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-grok-cost-{Guid.NewGuid():N}");
+    var count = 4;
+    var starts = 0;
+    const string first = """{"text":"partial","stopReason":"cancelled","sessionId":"idle","total_cost_usd":0.01}""";
+    const string second = """{"text":"partial","stopReason":"cancelled","sessionId":"idle","total_cost_usd":0.02}""";
+    const string third = """{"text":"done","stopReason":"end_turn","sessionId":"idle","total_cost_usd":0.03}""";
+    var launcher = new SequencedGrokLauncher(
+        new[] { first, second, third },
+        onEachStart: () =>
+        {
+            starts++;
+            if (starts >= 3)
+            {
+                count = 5;
+            }
+        });
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var runner = new DispatchRunner(
+        store,
+        _ =>
+        [
+            new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, count)
+        ],
+        launcher,
+        owners: new OwnerRegistry(Path.Combine(root, "owners")),
+        writerPollInterval: TimeSpan.FromMilliseconds(20),
+        readBackTimeout: TimeSpan.FromSeconds(2));
+    try
+    {
+        var job = runner.Enqueue("grok", "hello", "idle", "D:\\code\\app", allowNew: false);
+        var done = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Succeeded, done.Status);
+        Equal(2, done.RetryCount);
+        True(done.ProviderCostUsd is double cost && Math.Abs(cost - 0.06) < 1e-9);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void PruneTerminalJobsRemovesOnlyExpiredTerminalJobs()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-prune-jobs-{Guid.NewGuid():N}");
+    try
+    {
+        var store = new DispatchJobStore(root);
+        var now = DateTimeOffset.UtcNow;
+        DispatchJob Make(string id, string status, DateTimeOffset created, DateTimeOffset? finished)
+        {
+            var job = new DispatchJob
+            {
+                JobId = id,
+                Provider = "grok",
+                Status = status,
+                CreatedAt = created,
+                FinishedAt = finished
+            };
+            store.Write(job);
+            File.WriteAllText(store.StdoutPath(id), "x");
+            return job;
+        }
+
+        Make("old-succeeded", DispatchJobStatus.Succeeded, now.AddDays(-45), now.AddDays(-40));
+        Make("old-failed-nofinish", DispatchJobStatus.Failed, now.AddDays(-40), null);
+        Make("recent-succeeded", DispatchJobStatus.Succeeded, now.AddDays(-2), now.AddDays(-1));
+        Make("old-running", DispatchJobStatus.Running, now.AddDays(-40), null);
+        Make("old-queued", DispatchJobStatus.Queued, now.AddDays(-40), null);
+
+        var pruned = store.PruneTerminalJobs(TimeSpan.FromDays(30), now);
+        Equal(2, pruned);
+        True(!Directory.Exists(store.JobDirectory("old-succeeded")));
+        True(!Directory.Exists(store.JobDirectory("old-failed-nofinish")));
+        True(Directory.Exists(store.JobDirectory("recent-succeeded")));
+        True(Directory.Exists(store.JobDirectory("old-running")));
+        True(Directory.Exists(store.JobDirectory("old-queued")));
+        Equal(0, store.PruneTerminalJobs(TimeSpan.FromDays(30), now));
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void InboxPruneDropsExpiredByPolicy()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-inbox-prune-{Guid.NewGuid():N}");
+    try
+    {
+        var inbox = new InboxLedger(root);
+        var acked = inbox.Post("codex", "claude", "Done", fromProvider: "codex", jobId: "j1");
+        inbox.Ack(acked.Id);
+        inbox.Post("codex", "claude", "Still pending", fromProvider: "codex", jobId: "j2");
+        inbox.Post("system", "claude", "audit line");
+        var posted = DateTimeOffset.UtcNow;
+
+        // Younger than every window: nothing goes.
+        Equal(0, inbox.Prune(TimeSpan.FromDays(14), TimeSpan.FromDays(90), posted.AddDays(1)));
+        Equal(3, inbox.List().Count);
+
+        // Past read retention: only the acked note goes; pending + audit stay.
+        Equal(1, inbox.Prune(TimeSpan.FromDays(14), TimeSpan.FromDays(90), posted.AddDays(20)));
+        var remaining = inbox.List();
+        Equal(2, remaining.Count);
+        True(remaining.All(note => note.Status == "pending"));
+
+        // Past the hard cap: everything goes, acked or not.
+        Equal(2, inbox.Prune(TimeSpan.FromDays(14), TimeSpan.FromDays(90), posted.AddDays(100)));
+        Equal(0, inbox.List().Count);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void MaintainReportsCountsAndHonorsRetentionEnv()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-maintain-{Guid.NewGuid():N}");
+    var previousJobs = Environment.GetEnvironmentVariable(DispatchRunner.JobRetentionEnvVariable);
+    var previousRead = Environment.GetEnvironmentVariable(DispatchRunner.InboxReadRetentionEnvVariable);
+    try
+    {
+        var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+        var inbox = new InboxLedger(Path.Combine(root, "inbox"));
+        var now = DateTimeOffset.UtcNow;
+
+        // One expired terminal job, one dead-worker job with a terminal
+        // marker still on disk (reconcilable), one acked inbox note.
+        store.Write(new DispatchJob
+        {
+            JobId = "expired",
+            Provider = "grok",
+            Status = DispatchJobStatus.Succeeded,
+            CreatedAt = now.AddDays(-45),
+            FinishedAt = now.AddDays(-40)
+        });
+        var peers = new[]
+        {
+            new Peer("codex", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
+        };
+        var runner = new DispatchRunner(
+            store,
+            _ => peers,
+            new FakeProcessLauncher("unused"),
+            inbox: inbox,
+            owners: new OwnerRegistry(Path.Combine(root, "owners")));
+        var stuck = runner.Enqueue("codex", "test", "old", "D:\\code\\app", false);
+        runner.MarkWorker(stuck.JobId, int.MaxValue);
+        File.WriteAllText(store.StdoutPath(stuck.JobId), "{\"type\":\"turn.completed\",\"usage\":{}}\n");
+        var note = inbox.Post("codex", "claude", "Done", fromProvider: "codex");
+        inbox.Ack(note.Id);
+
+        // Retention disabled: reconcile still runs, nothing is pruned.
+        Environment.SetEnvironmentVariable(DispatchRunner.JobRetentionEnvVariable, "0");
+        Environment.SetEnvironmentVariable(DispatchRunner.InboxReadRetentionEnvVariable, "0");
+        var first = runner.Maintain(now);
+        Equal(1, first.ReconciledJobs);
+        Equal(0, first.PrunedJobs);
+        Equal(0, first.PrunedInboxMessages);
+        Equal(DispatchJobStatus.Succeeded, store.Require(stuck.JobId).Status);
+        True(Directory.Exists(store.JobDirectory("expired")));
+
+        // Defaults restored: the expired job goes; the just-acked note is
+        // still inside read retention so it stays.
+        Environment.SetEnvironmentVariable(DispatchRunner.JobRetentionEnvVariable, null);
+        Environment.SetEnvironmentVariable(DispatchRunner.InboxReadRetentionEnvVariable, null);
+        var second = runner.Maintain(now);
+        Equal(0, second.ReconciledJobs);
+        Equal(1, second.PrunedJobs);
+        Equal(0, second.PrunedInboxMessages);
+        True(!Directory.Exists(store.JobDirectory("expired")));
+        True(Directory.Exists(store.JobDirectory(stuck.JobId)));
+
+        // Far enough in the future, the acked note expires too.
+        var third = runner.Maintain(now.AddDays(20));
+        Equal(1, third.PrunedInboxMessages);
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable(DispatchRunner.JobRetentionEnvVariable, previousJobs);
+        Environment.SetEnvironmentVariable(DispatchRunner.InboxReadRetentionEnvVariable, previousRead);
+        TryDelete(root);
+    }
+}
+
+static void ResolveRetentionDaysParsesDefensively()
+{
+    Equal(30, DispatchRunner.ResolveRetentionDays("X", 30, _ => null));
+    Equal(30, DispatchRunner.ResolveRetentionDays("X", 30, _ => "abc"));
+    Equal(30, DispatchRunner.ResolveRetentionDays("X", 30, _ => "-5"));
+    Equal(0, DispatchRunner.ResolveRetentionDays("X", 30, _ => "0"));
+    Equal(7, DispatchRunner.ResolveRetentionDays("X", 30, _ => " 7 "));
 }
 
 static void GrokDispatchDoesNotRetryNonCancellationError()

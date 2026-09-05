@@ -129,6 +129,27 @@ public sealed class DispatchJob
     /// </summary>
     [JsonPropertyName("retryCount")]
     public int? RetryCount { get; set; }
+
+    /// <summary>
+    /// Informational version of the dispatch worker binary that actually
+    /// ran this job (cccg-dispatch-worker's AssemblyInformationalVersion),
+    /// stamped when Run() takes the job. Exists because "which worker build
+    /// ran it?" was unanswerable post-hoc: worker-current.json only says
+    /// what is installed NOW, not what a given past job executed under, and
+    /// a version-timing question once cost hours of reflection-probing.
+    /// </summary>
+    [JsonPropertyName("workerVersion")]
+    public string? WorkerVersion { get; set; }
+
+    /// <summary>
+    /// Provider-reported USD cost summed across every attempt of this job
+    /// (grok's "total_cost_usd"; codex exec --json exposes no cost in this
+    /// codebase's evidence, so it stays null there). Accumulated, not
+    /// last-attempt-only, so an auto-retried job shows what it really
+    /// billed rather than only the successful attempt's slice.
+    /// </summary>
+    [JsonPropertyName("providerCostUsd")]
+    public double? ProviderCostUsd { get; set; }
 }
 
 public sealed record LaunchCommand(

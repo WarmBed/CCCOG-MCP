@@ -125,6 +125,57 @@ public sealed class DispatchJobStore
         return ids;
     }
 
+    /// <summary>
+    /// Deletes the on-disk directory of every job that is already terminal
+    /// (succeeded/failed) and finished more than <paramref name="maxAge"/>
+    /// ago. Queued/running jobs, unreadable directories, and directories
+    /// another process is holding open are always left alone. Returns how
+    /// many were removed. Exists because the job store grew unbounded (300+
+    /// dirs / ~290MB of xhigh stdout logs within a month) and nothing ever
+    /// reclaimed it.
+    /// </summary>
+    public int PruneTerminalJobs(TimeSpan maxAge, DateTimeOffset? now = null)
+    {
+        var cutoff = (now ?? DateTimeOffset.UtcNow) - maxAge;
+        var pruned = 0;
+        foreach (var jobId in ListJobIds())
+        {
+            DispatchJob job;
+            try
+            {
+                job = Require(jobId);
+            }
+            catch (Exception exception) when (exception is IOException or InvalidDataException or InvalidOperationException)
+            {
+                continue;
+            }
+
+            if (job.Status is not (DispatchJobStatus.Succeeded or DispatchJobStatus.Failed))
+            {
+                continue;
+            }
+
+            var finished = job.FinishedAt ?? job.CreatedAt;
+            if (finished >= cutoff)
+            {
+                continue;
+            }
+
+            try
+            {
+                Directory.Delete(JobDirectory(jobId), recursive: true);
+                pruned++;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                // A reader still holding status.json.lock, or a stdout pump
+                // still flushing: not this sweep's problem, next one gets it.
+            }
+        }
+
+        return pruned;
+    }
+
     public string CollectExcerpt(string jobId, int maxChars = 8000)
     {
         var path = StdoutPath(jobId);

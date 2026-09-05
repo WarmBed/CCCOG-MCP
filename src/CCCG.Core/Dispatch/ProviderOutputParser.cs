@@ -251,6 +251,35 @@ public static class ProviderOutputParser
     /// this code doesn't yet recognize as bad still leaves a visible trail
     /// instead of only surfacing once someone happens to open the raw stdout.
     /// </summary>
+    /// <summary>
+    /// grok's self-reported "total_cost_usd" for one attempt's stdout, or
+    /// null when absent/unparseable. Read per attempt (before a retry
+    /// overwrites stdout.log) so DispatchJob.ProviderCostUsd can sum what
+    /// the job really billed.
+    /// </summary>
+    public static double? FindGrokCostUsd(string stdoutPath)
+    {
+        if (!File.Exists(stdoutPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(stdoutPath));
+            var root = document.RootElement;
+            return root.TryGetProperty("total_cost_usd", out var cost)
+                && cost.ValueKind == JsonValueKind.Number
+                && cost.TryGetDouble(out var value)
+                    ? value
+                    : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     public static string? FindGrokStopReason(string stdoutPath)
     {
         if (!File.Exists(stdoutPath))

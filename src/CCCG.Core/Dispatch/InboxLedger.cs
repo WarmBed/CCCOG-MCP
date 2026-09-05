@@ -107,6 +107,65 @@ public sealed class InboxLedger
             .ToList();
     }
 
+    /// <summary>
+    /// Age-based retention for the append-only mailbox, which otherwise
+    /// grows forever (and every Ack rewrites the whole file, so unbounded
+    /// growth also makes acks slower). Policy: an acked ("read") message is
+    /// dropped once older than <paramref name="readMaxAge"/>; anything at all
+    /// is dropped once older than <paramref name="hardMaxAge"/>, which
+    /// doubles as the longer retention for fromRole=system audit lines that
+    /// nobody acks. Returns how many lines were removed.
+    /// </summary>
+    public int Prune(TimeSpan readMaxAge, TimeSpan hardMaxAge, DateTimeOffset? now = null)
+    {
+        var current = now ?? DateTimeOffset.UtcNow;
+        var readCutoff = current - readMaxAge;
+        var hardCutoff = current - hardMaxAge;
+        using (CrossProcessFileGate.Acquire(lockPath, TimeSpan.FromSeconds(30)))
+        {
+            if (!File.Exists(path))
+            {
+                return 0;
+            }
+
+            var kept = new List<string>();
+            var removed = 0;
+            foreach (var line in File.ReadLines(path))
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                var item = JsonSerializer.Deserialize<InboxMessage>(line, JsonOptions);
+                if (item is null)
+                {
+                    continue;
+                }
+
+                var expired = item.CreatedAt < hardCutoff
+                    || (item.Status == "read" && item.CreatedAt < readCutoff);
+                if (expired)
+                {
+                    removed++;
+                    continue;
+                }
+
+                kept.Add(JsonSerializer.Serialize(item, JsonOptions));
+            }
+
+            if (removed > 0)
+            {
+                CrossProcessFileGate.AtomicWriteAllText(
+                    path,
+                    string.Join(Environment.NewLine, kept)
+                    + (kept.Count > 0 ? Environment.NewLine : string.Empty));
+            }
+
+            return removed;
+        }
+    }
+
     public InboxMessage? Ack(string messageId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(messageId);

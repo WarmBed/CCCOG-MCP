@@ -16,6 +16,21 @@ var runtime = new WorkerRuntime();
 if (args is ["run-job", var jobId])
 {
     runtime.Runner.Run(jobId);
+    // Piggyback housekeeping on every detached job: this is the one
+    // long-lived worker process that runs without anyone polling, so it is
+    // the natural place to rescue dead-worker jobs and reclaim disk even
+    // when no Host timer is alive. Strictly best-effort -- the job's own
+    // outcome is already recorded above and must never be undone by a
+    // sweep failure.
+    try
+    {
+        runtime.Runner.Maintain();
+    }
+    catch (Exception exception) when (exception is not OutOfMemoryException)
+    {
+        Console.Error.WriteLine("cccg-dispatch-worker: post-job maintenance skipped: " + exception.Message);
+    }
+
     return;
 }
 
@@ -260,7 +275,8 @@ sealed class WorkerRuntime
                 _ => grok.List(limit: 100).Peers
             },
             bindings: bindings,
-            inbox: inbox);
+            inbox: inbox,
+            workerVersion: WorkerVersion);
         watcher = new PeerWatcher(TryInspect);
     }
 
@@ -306,6 +322,7 @@ sealed class WorkerRuntime
                     .Select(job => new { job.JobId, job.Status, job.Error })
                     .ToArray()
             }),
+            "maintain" => Serialize(Runner.Maintain()),
             "inboxPost" => Serialize(inbox.Post(
                 Required(request.Arguments, "fromRole"),
                 Required(request.Arguments, "toRole"),

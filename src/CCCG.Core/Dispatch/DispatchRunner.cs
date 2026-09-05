@@ -40,6 +40,7 @@ public sealed class DispatchRunner
     private readonly TimeSpan readBackTimeout;
     private readonly RecursionContext recursion;
     private readonly QuotaLedger quota;
+    private readonly string? workerVersion;
 
     /// <summary>
     /// Operator escape hatch for the provider-turn wait ceiling (see
@@ -79,9 +80,11 @@ public sealed class DispatchRunner
         TimeSpan? deliverWaitTimeout = null,
         TimeSpan? readBackTimeout = null,
         RecursionContext? recursion = null,
-        QuotaLedger? quota = null)
+        QuotaLedger? quota = null,
+        string? workerVersion = null)
     {
         this.store = store;
+        this.workerVersion = workerVersion;
         this.listPeers = listPeers;
         this.launcher = launcher ?? new FileProcessLauncher();
         this.grokHome = grokHome;
@@ -283,7 +286,11 @@ public sealed class DispatchRunner
 
     public DispatchJob Run(string jobId)
     {
-        var job = store.Update(jobId, current => current.WorkerPid = Environment.ProcessId);
+        var job = store.Update(jobId, current =>
+        {
+            current.WorkerPid = Environment.ProcessId;
+            current.WorkerVersion = workerVersion ?? current.WorkerVersion;
+        });
         if (IsTerminal(job.Status))
         {
             return job;
@@ -483,6 +490,13 @@ public sealed class DispatchRunner
             {
                 job.ProviderStopReason = ProviderOutputParser.FindGrokStopReason(
                     store.StdoutPath(job.JobId));
+                // Summed per attempt: a retried job must show what it really
+                // billed, not only the successful attempt's slice.
+                if (ProviderOutputParser.FindGrokCostUsd(store.StdoutPath(job.JobId)) is double attemptCost)
+                {
+                    job.ProviderCostUsd = (job.ProviderCostUsd ?? 0d) + attemptCost;
+                }
+
                 store.Write(job);
             }
 
@@ -667,6 +681,77 @@ public sealed class DispatchRunner
         return reconciled;
     }
 
+    /// <summary>Retention for terminal job directories (days; 0 disables).</summary>
+    public const string JobRetentionEnvVariable = "CCCG_JOB_RETENTION_DAYS";
+
+    /// <summary>Retention for acked inbox messages (days; 0 disables inbox pruning).</summary>
+    public const string InboxReadRetentionEnvVariable = "CCCG_INBOX_READ_RETENTION_DAYS";
+
+    /// <summary>Hard cap for any inbox message, acked or not (days).</summary>
+    public const string InboxMaxRetentionEnvVariable = "CCCG_INBOX_MAX_RETENTION_DAYS";
+
+    public const int DefaultJobRetentionDays = 30;
+    public const int DefaultInboxReadRetentionDays = 14;
+    public const int DefaultInboxMaxRetentionDays = 90;
+
+    /// <summary>
+    /// One periodic housekeeping pass: rescue dead-worker jobs (see
+    /// <see cref="ReconcileStuckJobs"/>), then reclaim disk from terminal
+    /// jobs and acked mailbox lines past their retention. Cheap, idempotent,
+    /// and safe to run from any worker or Host at any time -- it exists
+    /// because reconciliation used to happen only at Host startup or when
+    /// someone happened to poll a job's status, which let a finished job sit
+    /// mislabeled "running" for 37 hours. Run at the end of every detached
+    /// run-job worker and on a Host timer, so it fires with or without a
+    /// human looking.
+    /// </summary>
+    public MaintenanceSummary Maintain(DateTimeOffset? now = null)
+    {
+        var reconciled = ReconcileStuckJobs().Count;
+
+        var jobRetentionDays = ResolveRetentionDays(JobRetentionEnvVariable, DefaultJobRetentionDays);
+        var prunedJobs = jobRetentionDays > 0
+            ? store.PruneTerminalJobs(TimeSpan.FromDays(jobRetentionDays), now)
+            : 0;
+
+        var prunedInbox = 0;
+        var readRetentionDays = ResolveRetentionDays(InboxReadRetentionEnvVariable, DefaultInboxReadRetentionDays);
+        if (inbox is not null && readRetentionDays > 0)
+        {
+            var maxRetentionDays = Math.Max(
+                readRetentionDays,
+                ResolveRetentionDays(InboxMaxRetentionEnvVariable, DefaultInboxMaxRetentionDays));
+            prunedInbox = inbox.Prune(
+                TimeSpan.FromDays(readRetentionDays),
+                TimeSpan.FromDays(maxRetentionDays),
+                now);
+        }
+
+        return new MaintenanceSummary(reconciled, prunedJobs, prunedInbox);
+    }
+
+    /// <summary>
+    /// Defensive env-var read shared by the retention knobs: unset,
+    /// unparsable, or negative falls back to the default; 0 is honored as
+    /// "disabled" so an operator can switch a sweep off without a rebuild.
+    /// </summary>
+    public static int ResolveRetentionDays(
+        string variable,
+        int fallback,
+        Func<string, string?>? getEnvironmentVariable = null)
+    {
+        getEnvironmentVariable ??= Environment.GetEnvironmentVariable;
+        var raw = getEnvironmentVariable(variable);
+        if (!string.IsNullOrWhiteSpace(raw)
+            && int.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var days)
+            && days >= 0)
+        {
+            return days;
+        }
+
+        return fallback;
+    }
+
     /// <summary>
     /// True for a job whose outcome the dead-worker reconciler is allowed to
     /// (re)decide: anything not yet terminal, plus a job already marked
@@ -733,6 +818,10 @@ public sealed class DispatchRunner
             job.Reason,
             job.ExitCode,
             job.Error,
+            job.WorkerVersion,
+            job.ProviderStopReason,
+            job.RetryCount,
+            job.ProviderCostUsd,
             response = ProviderOutputParser.CollectResponse(
                 job.Provider,
                 store.StdoutPath(jobId))
@@ -1150,6 +1239,9 @@ public sealed class DispatchRunner
         }
     }
 }
+
+/// <summary>Result of one <see cref="DispatchRunner.Maintain"/> pass.</summary>
+public sealed record MaintenanceSummary(int ReconciledJobs, int PrunedJobs, int PrunedInboxMessages);
 
 public sealed class FileProcessLauncher : IProcessLauncher
 {
