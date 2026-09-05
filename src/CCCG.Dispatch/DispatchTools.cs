@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Reflection;
 using System.Text.Json;
 using ModelContextProtocol.Server;
 
@@ -157,8 +158,45 @@ public sealed class DispatchTools
         Invoke("inboxAck", new { messageId });
 
     [McpServerTool(Name = "cccg_runtime_status"),
-     Description("Show the active versioned worker. Existing MCP connections pick up a newly installed worker on their next call.")]
-    public string RuntimeStatus() => Invoke("runtimeStatus", new { });
+     Description("Show the active versioned worker AND the Host (MCP server) version this session is connected to. Existing MCP connections pick up a newly installed worker on their next call; a newly installed Host only reaches sessions that (re)connect after the install.")]
+    public string RuntimeStatus()
+    {
+        var host = new Dictionary<string, object?>
+        {
+            ["hostVersion"] = HostVersion,
+            ["hostExecutable"] = Environment.ProcessPath,
+            ["hostPid"] = Environment.ProcessId
+        };
+        try
+        {
+            using var worker = JsonDocument.Parse(backend.Invoke("runtimeStatus", new { }));
+            foreach (var property in worker.RootElement.EnumerateObject())
+            {
+                host[property.Name] = property.Value.Clone();
+            }
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            host["workerError"] = exception.Message;
+        }
+
+        return JsonSerializer.Serialize(host);
+    }
+
+    /// <summary>
+    /// The Host binary's own informational version (set by
+    /// scripts/install-dispatch-host.ps1 via -p:Version). Reported so a
+    /// session can tell which Host build it is actually talking to -- the
+    /// mixed-vintage incident (an 8/16 cccg-dispatch.dll next to an 8/21
+    /// CCCG.Core.dll, both live) was invisible precisely because nothing
+    /// exposed this.
+    /// </summary>
+    private static readonly string HostVersion =
+        typeof(DispatchTools).Assembly
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion
+        ?? typeof(DispatchTools).Assembly.GetName().Version?.ToString()
+        ?? "unknown";
 
     private string Invoke(string operation, object arguments)
     {

@@ -2,8 +2,16 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <AssemblyName>cccg-dispatch</AssemblyName>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <OutputPath>..\..\artifacts\cccg-dispatch\win-x64-full\</OutputPath>
+    <!--
+      Deliberately NO OutputPath override. This project used to build
+      straight into artifacts\cccg-dispatch\win-x64-full\, the very
+      directory every live Claude session's MCP Host was running from, so
+      any `dotnet build` partially overwrote a running install (locked
+      files stayed old, unlocked ones went new) and produced a mixed-vintage
+      binary. Installs now go through scripts\install-dispatch-host.ps1,
+      which publishes to a versioned directory and re-points the
+      host-current junction; a plain build only touches bin\.
+    -->
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\CCCG.Core\CCCG.Core.csproj" />
