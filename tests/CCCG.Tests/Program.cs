@@ -188,6 +188,8 @@ var tests = new (string Name, Action Run)[]
     ("dispatch runner starts a resumable job and collects success", DispatchRunnerCollectsSuccess),
     ("dispatch runners serialize the same managed peer across processes", DispatchRunnersSerializeManagedPeer),
     ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
+    ("dispatch status treats a worker pid this user cannot open as dead", DispatchStatusTreatsInaccessiblePidAsDeadWorker),
+    ("reconcile sweep survives one job whose stale pid now belongs to a protected process", ReconcileSweepSurvivesInaccessiblePid),
     ("dispatch runner records success before a post-success binding save can fail", DispatchRunnerRecordsSuccessBeforeBindingSaveCanFail),
     ("default job timeout is eight hours", DefaultJobTimeoutIsEightHours),
     ("resolve job timeout respects the CCCG_JOB_TIMEOUT_MINUTES override", ResolveJobTimeoutRespectsEnvOverride),
@@ -2088,6 +2090,69 @@ static void DispatchStatusFailsDeadWorker()
     var failed = runner.Status(job.JobId);
     Equal(DispatchJobStatus.Failed, failed.Status);
     True(failed.Error?.Contains("worker exited", StringComparison.OrdinalIgnoreCase) == true);
+}
+
+/// <summary>
+/// PID 4 is the Windows System process: it always exists and opening it
+/// from a user process throws Win32Exception "access denied" on .NET 8
+/// (verified on this machine 2026-09-06). A worker PID recycled to such a
+/// process cannot be ours -- workers run unprotected as this user -- so it
+/// must read as dead, not as an exception. Job 20260814T143717Z_573e839f's
+/// stale pid 10484 hit exactly this and made every reconcile sweep throw
+/// for three weeks, leaving 11 dead-worker jobs unreconciled.
+/// </summary>
+static void DispatchStatusTreatsInaccessiblePidAsDeadWorker()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-protected-pid-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    try
+    {
+        var job = runner.Enqueue("codex", "test", "old", "D:\\code\\app", false);
+        runner.MarkWorker(job.JobId, 4);
+        var failed = runner.Status(job.JobId);
+        Equal(DispatchJobStatus.Failed, failed.Status);
+        Equal(DispatchRunner.WorkerDiedMessage, failed.Error);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void ReconcileSweepSurvivesInaccessiblePid()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-sweep-protected-pid-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(root);
+    var peers = new[]
+    {
+        new Peer("codex", "old", PeerStatus.Resumable, "D:\\code\\app", "Old", null, null, null, null, null, null)
+    };
+    var runner = new DispatchRunner(store, _ => peers, new FakeProcessLauncher("unused"));
+    try
+    {
+        // One job poisoned with a protected pid, one ordinary dead-worker
+        // job carrying a terminal marker: the sweep must get past the first
+        // and rescue the second instead of throwing on the first.
+        var poisoned = runner.Enqueue("codex", "a", "old", "D:\\code\\app", false);
+        runner.MarkWorker(poisoned.JobId, 4);
+        var rescued = runner.Enqueue("codex", "b", "old", "D:\\code\\app", false);
+        runner.MarkWorker(rescued.JobId, int.MaxValue);
+        File.WriteAllText(store.StdoutPath(rescued.JobId), "{\"type\":\"turn.completed\",\"usage\":{}}\n");
+
+        var reconciled = runner.ReconcileStuckJobs();
+        Equal(2, reconciled.Count);
+        Equal(DispatchJobStatus.Failed, store.Require(poisoned.JobId).Status);
+        Equal(DispatchJobStatus.Succeeded, store.Require(rescued.JobId).Status);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
 }
 
 /// <summary>

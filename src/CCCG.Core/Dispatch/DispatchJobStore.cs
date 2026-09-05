@@ -145,7 +145,10 @@ public sealed class DispatchJobStore
             {
                 job = Require(jobId);
             }
-            catch (Exception exception) when (exception is IOException or InvalidDataException or InvalidOperationException)
+            catch (Exception exception) when (exception is IOException
+                or InvalidDataException
+                or InvalidOperationException
+                or UnauthorizedAccessException)
             {
                 continue;
             }

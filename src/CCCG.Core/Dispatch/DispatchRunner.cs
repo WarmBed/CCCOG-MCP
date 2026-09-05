@@ -657,10 +657,15 @@ public sealed class DispatchRunner
             {
                 before = store.Require(jobId);
             }
-            catch (Exception exception) when (exception is IOException or InvalidDataException)
+            catch (Exception exception) when (exception is IOException
+                or InvalidDataException
+                or InvalidOperationException
+                or UnauthorizedAccessException)
             {
                 // A job directory mid-write (e.g. Create() has not yet
-                // finished its first Write) is not this sweep's concern.
+                // finished its first Write), already deleted by a
+                // concurrent prune, or unreadable is not this sweep's
+                // concern; one bad directory must never abort the sweep.
                 continue;
             }
 
@@ -1226,6 +1231,17 @@ public sealed class DispatchRunner
     private static bool IsTerminal(string status) =>
         status is DispatchJobStatus.Succeeded or DispatchJobStatus.Failed;
 
+    /// <summary>
+    /// Whether the recorded worker PID still refers to a live process. A
+    /// PID this user cannot open (Win32Exception "access denied" from
+    /// HasExited) cannot be one of our workers -- they run unprotected as
+    /// this user -- so it means the OS recycled the number to a protected
+    /// or foreign process after our worker died: report dead. Before this
+    /// case was handled, a single recycled PID anywhere in the job store
+    /// made the whole reconcile sweep throw, which is how a finished job
+    /// once sat mislabeled "running" for 37 hours through several Host
+    /// startups.
+    /// </summary>
     private static bool ProcessIsAlive(int processId)
     {
         try
@@ -1233,7 +1249,9 @@ public sealed class DispatchRunner
             using var process = Process.GetProcessById(processId);
             return !process.HasExited;
         }
-        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        catch (Exception exception) when (exception is ArgumentException
+            or InvalidOperationException
+            or System.ComponentModel.Win32Exception)
         {
             return false;
         }
