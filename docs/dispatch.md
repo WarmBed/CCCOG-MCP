@@ -34,7 +34,77 @@ resume/create still serialize on the workspace lease. Auto-pick (no
 | `cccg_job_status` | Read queued/running/succeeded/failed status |
 | `cccg_job_collect` | Collect normalized response and real provider session ID |
 | `cccg_inbox_post/list/ack` | Shared cross-process mailbox |
-| `cccg_runtime_status` | Show the active versioned Worker and hot-update mode |
+| `cccg_runtime_status` | Show the active versioned Worker plus the Host version/executable this session is actually connected to |
+
+## Job record fields
+
+Every job's `status.json` (and `cccg_job_collect`) carries, in addition to
+status/error/exit code:
+
+| Field | Meaning |
+|---|---|
+| `providerArgv` | The exact argv the provider was launched with, recorded before launch |
+| `workerVersion` | Informational version of the Worker binary that ran the job (not merely what is installed now) |
+| `providerStopReason` | Grok's own turn-ending marker (`end_turn`, `cancelled`, …) |
+| `retryCount` | How many automatic re-attempts were made (absent when none) |
+| `providerCostUsd` | Grok's `total_cost_usd` summed across every attempt |
+
+These exist because the questions "which flags actually reached the
+process?", "which worker build ran this?", "did the turn really finish?"
+and "what did the retries cost?" were all unanswerable after the fact
+during the 2026-08 grok-cancellation investigation.
+
+## Automatic retry of cancelled Grok turns
+
+A Grok run whose own permission engine cancels a tool call exits 0 with
+`stopReason: "cancelled"` and only the opening sentence of an answer. CCCG
+treats any `stopReason` other than `end_turn` as a failure (never as
+"succeeded") and automatically re-resumes the same session up to
+`CCCG_GROK_CANCEL_RETRIES` times (default 2, i.e. 3 attempts total) before
+reporting the job failed. Each superseded attempt's output is kept as
+`stdout.attemptN.log` / `stderr.attemptN.log` next to the job's final
+`stdout.log`. Codex and Claude are never retried this way.
+
+Root cause of the cancellation itself is still open. Ruled out by
+reproduction on this machine: stdin handle state, missing console, spawn
+flags, PATH/hook failures, cwd, and the `--always-approve` flag. The one
+remaining correlation is session age (every observed cancellation was in a
+session with thousands of recorded turns; every fresh-session reproduction
+succeeded). When it recurs, `providerStopReason`, `retryCount` and
+`peerTurnsBefore` on the job record are the first things to read.
+
+## Housekeeping
+
+`DispatchRunner.Maintain` runs one sweep: rescue dead-worker jobs
+(reconciliation), delete terminal job directories past retention, and drop
+expired mailbox lines. It runs
+
+- at the end of every detached `run-job` Worker (so it fires even when no
+  human is polling),
+- at Host startup, and
+- on a Host timer every `CCCG_MAINTENANCE_INTERVAL_MINUTES` (default 15;
+  `0` disables the timer).
+
+Retention knobs (days; `0` disables that sweep):
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `CCCG_JOB_RETENTION_DAYS` | 30 | Succeeded/failed job directories, by `finishedAt` |
+| `CCCG_INBOX_READ_RETENTION_DAYS` | 14 | Acked (`read`) mailbox notes |
+| `CCCG_INBOX_MAX_RETENTION_DAYS` | 90 | Any mailbox note, acked or not (audit lines included) |
+
+Queued/running jobs are never touched.
+
+## Completion surfacing
+
+`cccg_dispatch` is fire-and-forget and CCCG cannot wake an idle Claude
+session. What it does instead: the `UserPromptSubmit` state hook
+(`hooks/cccg-state-hook.js`) keeps a per-session cursor in
+`dispatch\watch\hook-<session>.json` and, on the session's next turn,
+lists every job that reached a terminal status since that cursor, plus any
+unread mailbox note addressed to `claude`. A session's first turn only
+sets the baseline. If the user is actively waiting on a result, still use
+`cccg_dispatch_wait`.
 
 ## Per-dispatch model
 
@@ -55,7 +125,8 @@ passed through without aliases or an allow-list.
   or owner delivery. CCCG does not silently ignore Claude overrides.
 
 `cccg_job_collect` keeps all existing field names and additively returns
-`model` and `reasoningEffort` from the job.
+`model`, `reasoningEffort`, `workerVersion`, `providerStopReason`,
+`retryCount` and `providerCostUsd` from the job.
 
 ## Session identity
 
@@ -98,11 +169,21 @@ changes its unfinished job to `failed` instead of leaving it stuck forever.
 
 ## Hot update
 
-Claude connects to the stable MCP Host:
+Claude connects to the MCP Host through a stable junction path:
 
 ```text
-artifacts\cccg-dispatch\win-x64-full\cccg-dispatch.exe
+%LOCALAPPDATA%\CCCG\dispatch\host-current\cccg-dispatch.exe
 ```
+
+`host-current` is a directory junction that
+`scripts\install-dispatch-host.ps1 -Version <v>` re-points at an immutable
+`%LOCALAPPDATA%\CCCG\dispatch\hosts\<v>\`. Sessions already running keep
+executing their old versioned directory untouched; sessions that (re)connect
+afterwards get the new one, and `cccg_runtime_status` reports which. Never
+build into or overwrite a directory a live Host runs from: the earlier
+layout (the Host built straight into `artifacts\cccg-dispatch\win-x64-full\`
+and every `.mcp.json` pointing there) let a plain `dotnet build` partially
+overwrite a running install and produced a mixed-vintage binary.
 
 The Host owns the fixed MCP tool contract. Every tool call verifies and starts
 the Worker selected by:
@@ -125,8 +206,9 @@ changing an MCP tool schema still requires an MCP reconnect because
 This batch changes the Host schema by adding `model` / `reasoningEffort` to
 both dispatch tools and adding `cccg_watch_peers`. Deploy in this order:
 
-1. install and activate the new Worker;
-2. install the rebuilt Host at the stable `cccg-dispatch.exe` path;
+1. install and activate the new Worker (`install-dispatch-worker.ps1`);
+2. install the rebuilt Host (`install-dispatch-host.ps1`), which re-points
+   the `host-current` junction;
 3. reconnect the `cccg-dispatch` MCP server (or restart Claude Desktop) so it
    negotiates the new tool schema once.
 
@@ -145,13 +227,16 @@ restarted once. Future Worker-only updates are hot.
 
 ```powershell
 dotnet build .\src\CCCG.Dispatch.Worker\CCCG.Dispatch.Worker.csproj -c Release
-dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release -p:OutputPath=..\..\artifacts\build-validation\dispatch\
+dotnet build .\src\CCCG.Dispatch\CCCG.Dispatch.csproj -c Release
 dotnet run --project .\tests\CCCG.Tests\CCCG.Tests.csproj -c Release
 .\scripts\install-dispatch-worker.ps1 -Version <version>
+.\scripts\install-dispatch-host.ps1 -Version <version>
 ```
 
-The alternate Host output path avoids overwriting the stable Host executable
-while Claude Desktop has it open.
+A plain Host build now only writes to `src\CCCG.Dispatch\bin\`; nothing a
+live session runs from is ever overwritten. The test suite's Worker RPC
+tests run `dotnet run --no-restore` against the Worker project, so restore
+it first when testing from a fresh copy.
 
 Do not build `CCCG.sln` in this checkout; it references an absent
 `experiments\` project.

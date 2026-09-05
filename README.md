@@ -126,7 +126,7 @@ third-party model is an Anthropic model.
 | `cccg_set_title` | Rename a closed session where a provider-safe write exists (currently honest `unsupported` everywhere — no provider has a safe rename contract) |
 | `cccg_archive_peer` | Reversible move of a closed session into `cccg-archive\` with a hash manifest; archived sessions vanish from list/watch/search |
 | `cccg_inbox_post` / `list` / `ack` | Shared cross-process mailbox |
-| `cccg_runtime_status` | Active versioned worker and hot-update mode |
+| `cccg_runtime_status` | Active versioned worker, plus the Host version this session is connected to |
 
 ### Recursion guardrails
 
