@@ -129,6 +129,14 @@ public sealed class DispatchTools
     public string JobCollect([Description("Dispatch job id.")] string jobId) =>
         Invoke("jobCollect", new { jobId });
 
+    [McpServerTool(Name = "cccg_job_cancel"),
+     Description("Withdraw a job that is still queued (e.g. a duplicate instruction waiting behind a busy peer session) so its provider turn never starts. Refused once the provider is running or the job has finished: CCCG never kills a provider process. Re-dispatch is the only undo.")]
+    public string JobCancel(
+        [Description("Dispatch job id (must still be queued).")] string jobId,
+        [Description("Optional short reason, recorded on the job.")] string? reason = null,
+        [Description("Optional display label for the caller session.")] string? callerLabel = null) =>
+        Invoke("jobCancel", new { jobId, reason, callerLabel });
+
     [McpServerTool(Name = "cccg_inbox_post"), Description("Post a short shared mailbox note.")]
     public string InboxPost(
         [Description("Recipient role: claude, grok, or codex.")] string toRole,

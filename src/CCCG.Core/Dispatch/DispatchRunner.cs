@@ -284,6 +284,42 @@ public sealed class DispatchRunner
     public DispatchJob MarkWorker(string jobId, int workerPid) =>
         store.Update(jobId, job => job.WorkerPid = workerPid);
 
+    public const string CancelledMessage = "Cancelled before delivery.";
+
+    /// <summary>
+    /// Withdraws a job that is still queued -- i.e. whose provider turn has
+    /// not started. The detached worker waiting on the workspace lease for
+    /// it re-reads the job once it holds the lease and skips a terminal one,
+    /// so marking it terminal here is the whole cancellation; no process is
+    /// touched. A job already running its provider (or already finished) is
+    /// refused: CCCG never kills a provider process, and a running turn on a
+    /// shared session cannot be un-sent. Exists because a coordinator that
+    /// enqueued a duplicate instruction behind a busy Luna session had no
+    /// way to withdraw it and had to let it deliver.
+    /// </summary>
+    public DispatchJob Cancel(string jobId, string? reason = null, string? callerLabel = null)
+    {
+        return store.Update(jobId, current =>
+        {
+            if (current.Status != DispatchJobStatus.Queued)
+            {
+                throw new InvalidOperationException(
+                    current.Status == DispatchJobStatus.Running
+                        ? $"Job '{jobId}' is already running its provider turn (pid {current.Pid?.ToString(CultureInfo.InvariantCulture) ?? "?"}); CCCG never kills a provider process -- let it finish or wait for its timeout."
+                        : $"Job '{jobId}' is already {current.Status}; nothing to cancel.");
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            current.Status = DispatchJobStatus.Failed;
+            current.Error = CancelledMessage;
+            current.Reason = "Cancelled before delivery"
+                + (string.IsNullOrWhiteSpace(callerLabel) ? "" : " by " + callerLabel.Trim())
+                + (string.IsNullOrWhiteSpace(reason) ? "." : ": " + reason.Trim());
+            current.CancelledAt = now;
+            current.FinishedAt = now;
+        });
+    }
+
     public DispatchJob Run(string jobId)
     {
         var job = store.Update(jobId, current =>

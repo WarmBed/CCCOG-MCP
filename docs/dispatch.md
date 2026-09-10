@@ -33,6 +33,7 @@ resume/create still serialize on the workspace lease. Auto-pick (no
 | `cccg_dispatch_wait` | Dispatch with the same per-turn options and keep the tool call open until the peer responds, so the coordinator receives the answer without polling |
 | `cccg_job_status` | Read queued/running/succeeded/failed status |
 | `cccg_job_collect` | Collect normalized response and real provider session ID |
+| `cccg_job_cancel` | Withdraw a still-queued job so its provider turn never starts; refused once running or finished |
 | `cccg_inbox_post/list/ack` | Shared cross-process mailbox |
 | `cccg_runtime_status` | Show the active versioned Worker plus the Host version/executable this session is actually connected to |
 
@@ -72,6 +73,23 @@ remaining correlation is session age (every observed cancellation was in a
 session with thousands of recorded turns; every fresh-session reproduction
 succeeded). When it recurs, `providerStopReason`, `retryCount` and
 `peerTurnsBefore` on the job record are the first things to read.
+
+## Cancelling a queued job
+
+`cccg_job_cancel(jobId)` withdraws a job that is still `queued` -- typically
+a duplicate or superseded instruction waiting on a busy peer session's
+workspace lease. The detached worker holding that place in line re-reads
+the job when it acquires the lease and skips a terminal one, so the
+cancellation touches no process. The job is recorded as `failed` with
+`error: "Cancelled before delivery."` and a `cancelledAt` stamp; the state
+hook lists it as `[cancelled]`.
+
+A job whose provider turn has already started (`running`, `pid` set) or
+that has finished is refused: CCCG never kills a provider process, and a
+turn already delivered to a shared session cannot be un-sent. The only
+undo for a cancellation is to dispatch again (the original prompt is still
+in the job's `prompt.txt`). The dispatch quota consumed at enqueue time is
+not refunded.
 
 ## Housekeeping
 

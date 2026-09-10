@@ -189,6 +189,9 @@ var tests = new (string Name, Action Run)[]
     ("dispatch runners serialize the same managed peer across processes", DispatchRunnersSerializeManagedPeer),
     ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
     ("dispatch status treats a worker pid this user cannot open as dead", DispatchStatusTreatsInaccessiblePidAsDeadWorker),
+    ("job cancel withdraws a queued job and its worker never launches the provider", JobCancelWithdrawsQueuedJob),
+    ("job cancel refuses a job whose provider turn is already running", JobCancelRefusesRunningJob),
+    ("job cancel refuses a job that already finished", JobCancelRefusesFinishedJob),
     ("reconcile sweep survives one job whose stale pid now belongs to a protected process", ReconcileSweepSurvivesInaccessiblePid),
     ("dispatch runner records success before a post-success binding save can fail", DispatchRunnerRecordsSuccessBeforeBindingSaveCanFail),
     ("default job timeout is eight hours", DefaultJobTimeoutIsEightHours),
@@ -2101,6 +2104,96 @@ static void DispatchStatusFailsDeadWorker()
 /// stale pid 10484 hit exactly this and made every reconcile sweep throw
 /// for three weeks, leaving 11 dead-worker jobs unreconciled.
 /// </summary>
+static void JobCancelWithdrawsQueuedJob()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-cancel-queued-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var launcher = new SequencedGrokLauncher(new[] { """{"text":"never","stopReason":"end_turn"}""" });
+    var peers = new[]
+    {
+        new Peer("grok", "idle", PeerStatus.Resumable, "D:\\code\\app", "Idle", null, null, null, null, null, 4)
+    };
+    var runner = new DispatchRunner(
+        store,
+        _ => peers,
+        launcher,
+        owners: new OwnerRegistry(Path.Combine(root, "owners")));
+    try
+    {
+        var job = runner.Enqueue("grok", "duplicate instruction", "idle", "D:\\code\\app", allowNew: false);
+        Equal(DispatchJobStatus.Queued, job.Status);
+
+        var cancelled = runner.Cancel(job.JobId, reason: "duplicate of a running job", callerLabel: "doc1");
+        Equal(DispatchJobStatus.Failed, cancelled.Status);
+        Equal(DispatchRunner.CancelledMessage, cancelled.Error);
+        True(cancelled.CancelledAt is not null);
+        True(cancelled.Reason?.Contains("doc1", StringComparison.Ordinal) == true);
+        True(cancelled.Reason?.Contains("duplicate of a running job", StringComparison.Ordinal) == true);
+
+        // The detached worker that was waiting on the lease re-reads the job
+        // and must skip it without ever spawning the provider.
+        var afterRun = runner.Run(job.JobId);
+        Equal(DispatchJobStatus.Failed, afterRun.Status);
+        Equal(0, launcher.CallCount);
+        True(store.Require(job.JobId).CancelledAt is not null);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void JobCancelRefusesRunningJob()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-cancel-running-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var runner = new DispatchRunner(store, _ => Array.Empty<Peer>(), new FakeProcessLauncher("unused"));
+    try
+    {
+        store.Write(new DispatchJob
+        {
+            JobId = "running-job",
+            Provider = "codex",
+            Status = DispatchJobStatus.Running,
+            Pid = Environment.ProcessId,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+        var refused = Throws<InvalidOperationException>(() => runner.Cancel("running-job"));
+        True(refused.Message.Contains("never kills a provider process", StringComparison.Ordinal));
+        Equal(DispatchJobStatus.Running, store.Require("running-job").Status);
+        True(store.Require("running-job").CancelledAt is null);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void JobCancelRefusesFinishedJob()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-cancel-finished-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var runner = new DispatchRunner(store, _ => Array.Empty<Peer>(), new FakeProcessLauncher("unused"));
+    try
+    {
+        store.Write(new DispatchJob
+        {
+            JobId = "done-job",
+            Provider = "codex",
+            Status = DispatchJobStatus.Succeeded,
+            CreatedAt = DateTimeOffset.UtcNow,
+            FinishedAt = DateTimeOffset.UtcNow
+        });
+        var refused = Throws<InvalidOperationException>(() => runner.Cancel("done-job"));
+        True(refused.Message.Contains("already succeeded", StringComparison.Ordinal));
+        Equal(DispatchJobStatus.Succeeded, store.Require("done-job").Status);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
 static void DispatchStatusTreatsInaccessiblePidAsDeadWorker()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-protected-pid-{Guid.NewGuid():N}");

@@ -316,6 +316,10 @@ sealed class WorkerRuntime
             "dispatchWait" => Dispatch(request.Arguments, wait: true),
             "jobStatus" => Serialize(Runner.Status(Required(request.Arguments, "jobId"))),
             "jobCollect" => Serialize(Runner.Collect(Required(request.Arguments, "jobId"))),
+            "jobCancel" => Serialize(Runner.Cancel(
+                Required(request.Arguments, "jobId"),
+                String(request.Arguments, "reason"),
+                String(request.Arguments, "callerLabel"))),
             "reconcileStuckJobs" => Serialize(new
             {
                 reconciled = Runner.ReconcileStuckJobs()

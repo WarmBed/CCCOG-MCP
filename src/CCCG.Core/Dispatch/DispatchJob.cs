@@ -150,6 +150,15 @@ public sealed class DispatchJob
     /// </summary>
     [JsonPropertyName("providerCostUsd")]
     public double? ProviderCostUsd { get; set; }
+
+    /// <summary>
+    /// Set when the job was withdrawn by cccg_job_cancel before its provider
+    /// turn ever started. Such a job is recorded as Failed (so every consumer
+    /// that already understands terminal states keeps working) with this
+    /// stamp telling it apart from a job that ran and broke.
+    /// </summary>
+    [JsonPropertyName("cancelledAt")]
+    public DateTimeOffset? CancelledAt { get; set; }
 }
 
 public sealed record LaunchCommand(

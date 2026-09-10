@@ -104,7 +104,7 @@ try {
     if (job.status === 'failed' && job.error) extras.push(`error: ${String(job.error).slice(0, 160)}`);
     completed.push({
       sortMs: finishedMs,
-      text: `- [${job.status}] ${label(job)} · ${agoMin}m ago · job ${job.jobId}`
+      text: `- [${job.cancelledAt ? 'cancelled' : job.status}] ${label(job)} · ${agoMin}m ago · job ${job.jobId}`
         + (extras.length ? ` · ${extras.join(' · ')}` : '')
     });
   }

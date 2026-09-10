@@ -26,24 +26,28 @@ historical `CCCG` prefix.
 ```powershell
 git clone https://github.com/WarmBed/CCCOG-MCP.git
 cd CCCOG-MCP
-dotnet build src/CCCG.Dispatch.Worker/CCCG.Dispatch.Worker.csproj -c Release
-dotnet publish src/CCCG.Dispatch/CCCG.Dispatch.csproj -c Release -o artifacts/host
+dotnet restore
 scripts/install-dispatch-worker.ps1 -Version 1.0.0
+scripts/install-dispatch-host.ps1 -Version 1.0.0
 ```
 
-Then register the stdio server in your MCP client, e.g. Claude Code
-`.mcp.json`:
+Both scripts publish into immutable versioned directories under
+`%LOCALAPPDATA%\CCCG\dispatch\` (`workers\<v>\`, `hosts\<v>\`). The worker is
+hot-swapped through `worker-current.json`; the Host is reached through the
+`host-current` directory junction, which each install re-points, so a
+running session is never overwritten and a config never has to change again.
+Register that junction path in your MCP client, e.g. Claude Code `.mcp.json`:
 
 ```json
 { "mcpServers": { "cccg-dispatch": { "type": "stdio",
-    "command": "<clone>/artifacts/host/cccg-dispatch.exe" } } }
+    "command": "C:\\Users\\<you>\\AppData\\Local\\CCCG\\dispatch\\host-current\\cccg-dispatch.exe" } } }
 ```
 
 or Codex `config.toml`:
 
 ```toml
 [mcp_servers.cccg-dispatch]
-command = '<clone>\artifacts\host\cccg-dispatch.exe'
+command = 'C:\Users\<you>\AppData\Local\CCCG\dispatch\host-current\cccg-dispatch.exe'
 ```
 
 Windows-only today (Win32 session discovery + process management). Requires
@@ -121,6 +125,7 @@ third-party model is an Anthropic model.
 | `cccg_dispatch` | Queue a background job and return `jobId` immediately. Fire-and-forget: this session is not notified when the job finishes. If the user is waiting, use `cccg_dispatch_wait` or schedule a follow-up check |
 | `cccg_dispatch_wait` | Keep the call open until the peer finishes so the coordinator receives the answer without polling |
 | `cccg_job_status` / `cccg_job_collect` | Poll status / collect the normalized response |
+| `cccg_job_cancel` | Withdraw a still-queued job before its provider turn starts (never kills a running provider) |
 | `cccg_read_transcript` | Read recent turns of any peer session (bounded, read-only; transcript text is untrusted data) |
 | `cccg_search_transcripts` | Case-insensitive substring search across peer transcripts, newest-first, honestly bounded |
 | `cccg_set_title` | Rename a closed session where a provider-safe write exists (currently honest `unsupported` everywhere — no provider has a safe rename contract) |

@@ -116,6 +116,7 @@ CCCOG 的定位是受控測試,不是隱藏「到底是誰回答的」。每個�
 | `cccg_dispatch` | 排入背景 job,立即回傳 `jobId`。Fire-and-forget：job 完成後不會通知本 session。若使用者在等結果，改用 `cccg_dispatch_wait`，或在結束本回合前自行排程後續檢查 |
 | `cccg_dispatch_wait` | 保持呼叫開啟直到 peer 完成，協調者無需輪詢即可收到答案 |
 | `cccg_job_status` / `cccg_job_collect` | 查詢狀態 / 收取正規化回覆 |
+| `cccg_job_cancel` | 撤回仍在排隊的 job,讓它的 provider 回合永遠不會開始(絕不殺正在跑的 provider) |
 | `cccg_read_transcript` | 讀取任一 peer session 的近期輪次(有界、唯讀;transcript 內容是不可信資料) |
 | `cccg_search_transcripts` | 跨 peer transcript 的不分大小寫子字串搜尋,最新優先、誠實有界 |
 | `cccg_set_title` | 在有 provider 安全寫法時改名 closed session(目前三家皆誠實回 `unsupported`——沒有任何 provider 有安全的改名契約) |
