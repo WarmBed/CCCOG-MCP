@@ -190,6 +190,7 @@ var tests = new (string Name, Action Run)[]
     ("dispatch status fails a job whose worker exited", DispatchStatusFailsDeadWorker),
     ("dispatch status treats a worker pid this user cannot open as dead", DispatchStatusTreatsInaccessiblePidAsDeadWorker),
     ("job cancel withdraws a queued job and its worker never launches the provider", JobCancelWithdrawsQueuedJob),
+    ("reconcile sweep fails a queued job that never got a worker once past the grace window", ReconcileSweepFailsOrphanedQueuedJob),
     ("job cancel refuses a job whose provider turn is already running", JobCancelRefusesRunningJob),
     ("job cancel refuses a job that already finished", JobCancelRefusesFinishedJob),
     ("reconcile sweep survives one job whose stale pid now belongs to a protected process", ReconcileSweepSurvivesInaccessiblePid),
@@ -2104,6 +2105,44 @@ static void DispatchStatusFailsDeadWorker()
 /// stale pid 10484 hit exactly this and made every reconcile sweep throw
 /// for three weeks, leaving 11 dead-worker jobs unreconciled.
 /// </summary>
+static void ReconcileSweepFailsOrphanedQueuedJob()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-orphan-queued-{Guid.NewGuid():N}");
+    var store = new DispatchJobStore(Path.Combine(root, "jobs"));
+    var runner = new DispatchRunner(store, _ => Array.Empty<Peer>(), new FakeProcessLauncher("unused"));
+    try
+    {
+        store.Write(new DispatchJob
+        {
+            JobId = "orphan-old",
+            Provider = "codex",
+            Status = DispatchJobStatus.Queued,
+            CreatedAt = DateTimeOffset.UtcNow.AddHours(-20)
+        });
+        store.Write(new DispatchJob
+        {
+            JobId = "fresh-queued",
+            Provider = "codex",
+            Status = DispatchJobStatus.Queued,
+            CreatedAt = DateTimeOffset.UtcNow
+        });
+
+        var reconciled = runner.ReconcileStuckJobs();
+        Equal(1, reconciled.Count);
+        Equal("orphan-old", reconciled[0].JobId);
+        Equal(DispatchJobStatus.Failed, store.Require("orphan-old").Status);
+        Equal(DispatchRunner.OrphanedQueuedMessage, store.Require("orphan-old").Error);
+        // Inside the grace window a dispatch may still be about to record
+        // its worker pid: leave it alone.
+        Equal(DispatchJobStatus.Queued, store.Require("fresh-queued").Status);
+        Equal(0, runner.ReconcileStuckJobs().Count);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
 static void JobCancelWithdrawsQueuedJob()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-cancel-queued-{Guid.NewGuid():N}");

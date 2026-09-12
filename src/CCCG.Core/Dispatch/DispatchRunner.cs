@@ -664,6 +664,33 @@ public sealed class DispatchRunner
     public const string WorkerDiedMessage =
         "Dispatch worker exited before recording a terminal result.";
 
+    /// <summary>
+    /// A queued job whose dispatching worker never attached a run-job worker
+    /// pid (it died between Enqueue and MarkWorker). Nothing will ever start
+    /// it; the caller has to dispatch again.
+    /// </summary>
+    public const string OrphanedQueuedMessage =
+        "No dispatch worker was ever attached to this job, so it can never start; dispatch it again.";
+
+    /// <summary>Grace window (minutes) before an unattached queued job is failed; default 10.</summary>
+    public const string OrphanQueuedGraceEnvVariable = "CCCG_ORPHAN_QUEUED_GRACE_MINUTES";
+
+    public static TimeSpan ResolveOrphanQueuedGrace(Func<string, string?>? getEnvironmentVariable = null)
+    {
+        getEnvironmentVariable ??= Environment.GetEnvironmentVariable;
+        var raw = getEnvironmentVariable(OrphanQueuedGraceEnvVariable);
+        if (!string.IsNullOrWhiteSpace(raw)
+            && double.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var minutes)
+            && !double.IsNaN(minutes)
+            && minutes >= 0
+            && minutes <= TimeSpan.MaxValue.TotalMinutes)
+        {
+            return TimeSpan.FromMinutes(minutes);
+        }
+
+        return TimeSpan.FromMinutes(10);
+    }
+
     public DispatchJob Status(string jobId)
     {
         var job = store.Require(jobId);
@@ -705,9 +732,44 @@ public sealed class DispatchRunner
                 continue;
             }
 
-            if (!IsReconcilable(before)
-                || before.WorkerPid is not int workerPid
-                || ProcessIsAlive(workerPid))
+            if (!IsReconcilable(before))
+            {
+                continue;
+            }
+
+            if (before.WorkerPid is not int workerPid)
+            {
+                // A queued job that never had a worker attached: the one-shot
+                // worker died (or its detached launch failed) between
+                // Enqueue and MarkWorker, so nothing will ever pick it up.
+                // Give a fresh dispatch a grace window to record its worker,
+                // then fail it explicitly instead of leaving it "queued"
+                // forever -- one sat that way for 20 hours, flagged STUCK on
+                // every turn, invisible to a sweep that only looked at pids.
+                if (before.Status == DispatchJobStatus.Queued
+                    && DateTimeOffset.UtcNow - before.CreatedAt > ResolveOrphanQueuedGrace())
+                {
+                    var orphan = store.Update(jobId, current =>
+                    {
+                        if (current.Status != DispatchJobStatus.Queued || current.WorkerPid is not null)
+                        {
+                            return;
+                        }
+
+                        current.Status = DispatchJobStatus.Failed;
+                        current.Error = OrphanedQueuedMessage;
+                        current.FinishedAt = DateTimeOffset.UtcNow;
+                    });
+                    if (orphan.Status != before.Status)
+                    {
+                        reconciled.Add(orphan);
+                    }
+                }
+
+                continue;
+            }
+
+            if (ProcessIsAlive(workerPid))
             {
                 continue;
             }
