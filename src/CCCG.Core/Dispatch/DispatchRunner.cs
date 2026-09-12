@@ -157,7 +157,8 @@ public sealed class DispatchRunner
         bool allowNew = true,
         string? model = null,
         string? reasoningEffort = null,
-        string? callerLabel = null)
+        string? callerLabel = null,
+        string? callerSessionId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
         provider = NormalizeProvider(provider);
@@ -183,6 +184,7 @@ public sealed class DispatchRunner
             job.HopSource = recursion.HopSource;
             job.HopChain = recursion.HopChain;
             job.CallerLabel = callerLabel;
+            job.CallerSessionId = string.IsNullOrWhiteSpace(callerSessionId) ? null : callerSessionId.Trim();
             job.AffinityKey = BuildAffinityKey(
                 provider,
                 sessionId ?? binding?.SessionId,

@@ -92,7 +92,8 @@ public sealed class DispatchTools
             allowNew,
             model,
             reasoningEffort,
-            callerLabel
+            callerLabel,
+            callerSessionId = CallerSessionId
         });
 
     [McpServerTool(Name = "cccg_dispatch_wait"),
@@ -118,8 +119,20 @@ public sealed class DispatchTools
             allowNew,
             model,
             reasoningEffort,
-            callerLabel
+            callerLabel,
+            callerSessionId = CallerSessionId
         });
+
+    /// <summary>
+    /// The Claude session this Host serves, when the engine exposes it to
+    /// its MCP server processes (CLAUDE_CODE_SESSION_ID). Stamped on every
+    /// job so WakeNotifier can wake exactly this session when the job
+    /// finishes; null falls back to cwd-based routing.
+    /// </summary>
+    private static readonly string? CallerSessionId =
+        Environment.GetEnvironmentVariable("CLAUDE_CODE_SESSION_ID") is { Length: > 0 } value
+            ? value
+            : null;
 
     [McpServerTool(Name = "cccg_job_status"), Description("Read queued/running/succeeded/failed status.")]
     public string JobStatus([Description("Dispatch job id.")] string jobId) =>
@@ -173,7 +186,8 @@ public sealed class DispatchTools
         {
             ["hostVersion"] = HostVersion,
             ["hostExecutable"] = Environment.ProcessPath,
-            ["hostPid"] = Environment.ProcessId
+            ["hostPid"] = Environment.ProcessId,
+            ["hostSessionId"] = CallerSessionId
         };
         try
         {

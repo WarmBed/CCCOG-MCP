@@ -159,6 +159,14 @@ public sealed class DispatchJob
     /// </summary>
     [JsonPropertyName("cancelledAt")]
     public DateTimeOffset? CancelledAt { get; set; }
+
+    /// <summary>
+    /// Claude session id of the caller, when the caller supplied one (the
+    /// optional callerSessionId dispatch argument). Lets WakeNotifier wake
+    /// exactly that session instead of every session sharing the cwd.
+    /// </summary>
+    [JsonPropertyName("callerSessionId")]
+    public string? CallerSessionId { get; set; }
 }
 
 public sealed record LaunchCommand(

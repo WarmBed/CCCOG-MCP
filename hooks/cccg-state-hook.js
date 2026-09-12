@@ -109,6 +109,9 @@ try {
     });
   }
 
+  // A human prompt resets the wake budget (see cccg-wake-hook.js).
+  try { fs.unlinkSync(path.join(dispatchRoot, 'wake', sessionId, 'wakes')); } catch { /* none */ }
+
   // Advance the cursor before rendering so a crash below cannot re-announce.
   try {
     fs.mkdirSync(watchRoot, { recursive: true });

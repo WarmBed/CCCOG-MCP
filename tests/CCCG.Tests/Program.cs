@@ -191,6 +191,8 @@ var tests = new (string Name, Action Run)[]
     ("dispatch status treats a worker pid this user cannot open as dead", DispatchStatusTreatsInaccessiblePidAsDeadWorker),
     ("job cancel withdraws a queued job and its worker never launches the provider", JobCancelWithdrawsQueuedJob),
     ("reconcile sweep fails a queued job that never got a worker once past the grace window", ReconcileSweepFailsOrphanedQueuedJob),
+    ("wake notifier routes a terminal job to its caller session or to cwd-matching sessions exactly once", WakeNotifierRoutesAndIsIdempotent),
+    ("job store fires the terminal callback only on terminal writes", JobStoreFiresTerminalCallbackOnlyWhenTerminal),
     ("job cancel refuses a job whose provider turn is already running", JobCancelRefusesRunningJob),
     ("job cancel refuses a job that already finished", JobCancelRefusesFinishedJob),
     ("reconcile sweep survives one job whose stale pid now belongs to a protected process", ReconcileSweepSurvivesInaccessiblePid),
@@ -2105,6 +2107,86 @@ static void DispatchStatusFailsDeadWorker()
 /// stale pid 10484 hit exactly this and made every reconcile sweep throw
 /// for three weeks, leaving 11 dead-worker jobs unreconciled.
 /// </summary>
+static void WakeNotifierRoutesAndIsIdempotent()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-wake-{Guid.NewGuid():N}");
+    try
+    {
+        var wake = new WakeNotifier(root);
+        var project = Path.Combine(root, "proj");
+        var otherProject = Path.Combine(root, "other");
+        wake.Register("sess-A", project);
+        wake.Register("sess-B", project);
+        wake.Register("sess-C", otherProject);
+        Equal(3, wake.ListRegistrations().Count);
+
+        // Explicit caller session wins over cwd routing.
+        var explicitJob = new DispatchJob
+        {
+            JobId = "j-explicit",
+            Provider = "codex",
+            Status = DispatchJobStatus.Succeeded,
+            Cwd = Path.Combine(project, ".claude", "worktrees", "wt1"),
+            CallerSessionId = "sess-C"
+        };
+        var woken = wake.Notify(explicitJob);
+        Equal(1, woken.Count);
+        Equal("sess-C", woken[0]);
+        True(File.Exists(wake.WakeFilePath("sess-C")));
+        True(!File.Exists(wake.WakeFilePath("sess-A")));
+
+        // cwd routing: a job under the project wakes both project sessions.
+        var cwdJob = new DispatchJob
+        {
+            JobId = "j-cwd",
+            Provider = "grok",
+            Status = DispatchJobStatus.Failed,
+            Error = "boom",
+            Cwd = Path.Combine(project, ".claude", "worktrees", "wt2")
+        };
+        var wokenByCwd = wake.Notify(cwdJob);
+        Equal(2, wokenByCwd.Count);
+        True(wokenByCwd.Contains("sess-A"));
+        True(wokenByCwd.Contains("sess-B"));
+        var payload = File.ReadAllText(wake.WakeFilePath("sess-A"));
+        True(payload.Contains("\"jobId\": \"j-cwd\"", StringComparison.Ordinal));
+        True(payload.Contains("\"error\": \"boom\"", StringComparison.Ordinal));
+
+        // Idempotent per job, and non-terminal jobs never wake anyone.
+        Equal(0, wake.Notify(cwdJob).Count);
+        Equal(0, wake.Notify(new DispatchJob { JobId = "j-run", Status = DispatchJobStatus.Running, Cwd = project }).Count);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void JobStoreFiresTerminalCallbackOnlyWhenTerminal()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-terminal-cb-{Guid.NewGuid():N}");
+    try
+    {
+        var store = new DispatchJobStore(root);
+        var seen = new List<string>();
+        store.TerminalWritten = job => seen.Add(job.JobId + ":" + job.Status);
+        store.Write(new DispatchJob { JobId = "cb", Provider = "codex", Status = DispatchJobStatus.Queued, CreatedAt = DateTimeOffset.UtcNow });
+        store.Update("cb", job => job.Status = DispatchJobStatus.Running);
+        Equal(0, seen.Count);
+        store.Update("cb", job => job.Status = DispatchJobStatus.Succeeded);
+        Equal(1, seen.Count);
+        Equal("cb:succeeded", seen[0]);
+        // A throwing callback never breaks the write.
+        store.TerminalWritten = _ => throw new InvalidOperationException("wake exploded");
+        store.Update("cb", job => job.Error = "still fine");
+        Equal("still fine", store.Require("cb").Error);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
 static void ReconcileSweepFailsOrphanedQueuedJob()
 {
     var root = Path.Combine(Path.GetTempPath(), $"cccg-orphan-queued-{Guid.NewGuid():N}");

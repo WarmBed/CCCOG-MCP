@@ -25,6 +25,15 @@ public sealed class DispatchJobStore
 
     public string Root => root;
 
+    /// <summary>
+    /// Invoked after a Write/Update that leaves the job in a terminal
+    /// status, outside the status.json lock. Terminal transitions happen
+    /// from several call sites (run, cancel, reconcile, orphan sweep), so
+    /// the store is the one choke point that sees all of them; the callback
+    /// must be idempotent because a terminal job can be rewritten.
+    /// </summary>
+    public Action<DispatchJob>? TerminalWritten { get; set; }
+
     public DispatchJob Create(DispatchSelection selection, string prompt)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -67,25 +76,52 @@ public sealed class DispatchJobStore
     public void Write(DispatchJob job)
     {
         var path = StatusPath(job.JobId);
-        using var gate = CrossProcessFileGate.Acquire(path + ".lock", TimeSpan.FromSeconds(30));
-        CrossProcessFileGate.AtomicWriteAllText(path, JsonSerializer.Serialize(job, JsonOptions));
+        using (var gate = CrossProcessFileGate.Acquire(path + ".lock", TimeSpan.FromSeconds(30)))
+        {
+            CrossProcessFileGate.AtomicWriteAllText(path, JsonSerializer.Serialize(job, JsonOptions));
+        }
+
+        NotifyIfTerminal(job);
     }
 
     public DispatchJob Update(string jobId, Action<DispatchJob> update)
     {
         ArgumentNullException.ThrowIfNull(update);
         var path = StatusPath(jobId);
-        using var gate = CrossProcessFileGate.Acquire(path + ".lock", TimeSpan.FromSeconds(30));
-        if (!File.Exists(path))
+        DispatchJob job;
+        using (var gate = CrossProcessFileGate.Acquire(path + ".lock", TimeSpan.FromSeconds(30)))
         {
-            throw new InvalidOperationException($"Unknown job '{jobId}'.");
+            if (!File.Exists(path))
+            {
+                throw new InvalidOperationException($"Unknown job '{jobId}'.");
+            }
+
+            job = JsonSerializer.Deserialize<DispatchJob>(File.ReadAllText(path), JsonOptions)
+                ?? throw new InvalidDataException($"Job '{jobId}' is not valid JSON.");
+            update(job);
+            CrossProcessFileGate.AtomicWriteAllText(path, JsonSerializer.Serialize(job, JsonOptions));
         }
 
-        var job = JsonSerializer.Deserialize<DispatchJob>(File.ReadAllText(path), JsonOptions)
-            ?? throw new InvalidDataException($"Job '{jobId}' is not valid JSON.");
-        update(job);
-        CrossProcessFileGate.AtomicWriteAllText(path, JsonSerializer.Serialize(job, JsonOptions));
+        NotifyIfTerminal(job);
         return job;
+    }
+
+    private void NotifyIfTerminal(DispatchJob job)
+    {
+        if (TerminalWritten is null
+            || job.Status is not (DispatchJobStatus.Succeeded or DispatchJobStatus.Failed))
+        {
+            return;
+        }
+
+        try
+        {
+            TerminalWritten(job);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            // A wake is a courtesy on top of an outcome already on disk.
+        }
     }
 
     public string JobDirectory(string jobId) => Path.Combine(root, jobId);

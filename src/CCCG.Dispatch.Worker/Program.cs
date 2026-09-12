@@ -24,7 +24,7 @@ if (args is ["run-job", var jobId])
     // sweep failure.
     try
     {
-        runtime.Runner.Maintain();
+        runtime.Invoke(new DispatchBackendRequest { Operation = "maintain" });
     }
     catch (Exception exception) when (exception is not OutOfMemoryException)
     {
@@ -262,10 +262,15 @@ sealed class WorkerRuntime
     private readonly TranscriptService transcripts = new();
     private readonly PeerMutationService mutations = new();
     private readonly PeerArchiveService archives = new();
+    private readonly WakeNotifier wake = new();
 
     public WorkerRuntime()
     {
         var jobs = new DispatchJobStore();
+        // Push half of completion surfacing: every terminal write (run,
+        // cancel, reconcile, orphan sweep) wakes the registered Claude
+        // session(s) via the engine's FileChanged watcher. See WakeNotifier.
+        jobs.TerminalWritten = job => wake.Notify(job);
         Runner = new DispatchRunner(
             jobs,
             provider => provider switch
@@ -326,7 +331,10 @@ sealed class WorkerRuntime
                     .Select(job => new { job.JobId, job.Status, job.Error })
                     .ToArray()
             }),
-            "maintain" => Serialize(Runner.Maintain()),
+            "maintain" => Serialize(Maintain()),
+            "wakeRegister" => Serialize(RegisterWake(
+                Required(request.Arguments, "sessionId"),
+                String(request.Arguments, "cwd"))),
             "inboxPost" => Serialize(inbox.Post(
                 Required(request.Arguments, "fromRole"),
                 Required(request.Arguments, "toRole"),
@@ -356,6 +364,31 @@ sealed class WorkerRuntime
         };
     }
 
+    private object Maintain()
+    {
+        var summary = Runner.Maintain();
+        var prunedRegistrations = wake.Prune(TimeSpan.FromDays(7));
+        return new
+        {
+            summary.ReconciledJobs,
+            summary.PrunedJobs,
+            summary.PrunedInboxMessages,
+            prunedWakeRegistrations = prunedRegistrations
+        };
+    }
+
+    private object RegisterWake(string sessionId, string? cwd)
+    {
+        wake.Register(sessionId, cwd);
+        return new
+        {
+            sessionId,
+            cwd,
+            wakeFile = wake.WakeFilePath(sessionId),
+            registration = wake.RegistrationPath(sessionId)
+        };
+    }
+
     private string Dispatch(JsonElement arguments, bool wait)
     {
         var job = Runner.Enqueue(
@@ -366,7 +399,8 @@ sealed class WorkerRuntime
             Boolean(arguments, "allowNew", true),
             String(arguments, "model"),
             String(arguments, "reasoningEffort"),
-            String(arguments, "callerLabel"));
+            String(arguments, "callerLabel"),
+            String(arguments, "callerSessionId"));
         if (wait)
         {
             Runner.Run(job.JobId);

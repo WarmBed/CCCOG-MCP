@@ -49,6 +49,8 @@ status/error/exit code:
 | `providerStopReason` | Grok's own turn-ending marker (`end_turn`, `cancelled`, …) |
 | `retryCount` | How many automatic re-attempts were made (absent when none) |
 | `providerCostUsd` | Grok's `total_cost_usd` summed across every attempt |
+| `cancelledAt` | Set when the job was withdrawn by `cccg_job_cancel` before its provider turn started |
+| `callerSessionId` | The dispatching Claude session (from `CLAUDE_CODE_SESSION_ID` in the Host's environment, when present); wake routing target |
 
 These exist because the questions "which flags actually reached the
 process?", "which worker build ran this?", "did the turn really finish?"
@@ -115,14 +117,51 @@ Queued/running jobs are never touched.
 
 ## Completion surfacing
 
-`cccg_dispatch` is fire-and-forget and CCCG cannot wake an idle Claude
-session. What it does instead: the `UserPromptSubmit` state hook
-(`hooks/cccg-state-hook.js`) keeps a per-session cursor in
-`dispatch\watch\hook-<session>.json` and, on the session's next turn,
-lists every job that reached a terminal status since that cursor, plus any
-unread mailbox note addressed to `claude`. A session's first turn only
-sets the baseline. If the user is actively waiting on a result, still use
-`cccg_dispatch_wait`.
+Two layers, both driven by `hooks/`:
+
+**Wake (push).** CCCG itself cannot start a turn in an idle Claude session,
+but the Claude Code engine can: a `SessionStart` hook may return absolute
+`watchPaths`, the engine keeps a file watcher on them for the life of the
+session, and a `FileChanged` hook configured with `"asyncRewake": true`
+wakes the model on exit code 2 with the hook's stderr as a system reminder.
+So:
+
+1. `hooks/cccg-session-hook.js` (SessionStart) registers the session in
+   `dispatch\watch\session-<id>.json` (id + cwd) and returns
+   `watchPaths: [dispatch\wake\<id>\cccg_wake]`.
+2. When any job reaches a terminal status -- run, cancel, reconcile, orphan
+   sweep -- `WakeNotifier` writes that wake file for the target sessions:
+   the job's `callerSessionId` when the Host knew it, otherwise every
+   registered session whose cwd is the job's cwd or a parent of it. Once
+   per job.
+3. `hooks/cccg-wake-hook.js` (FileChanged, asyncRewake) reads the wake file,
+   announces each job once, and exits 2 with a one-screen summary. It is
+   capped at `CCCG_WAKE_CAP` (5) wakes between human prompts; the state
+   hook resets the budget on every prompt, so agents cannot volley.
+
+Register both in the user's `~/.claude/settings.json` hooks (the paths
+below assume this clone at `D:\code\CCCG`):
+
+```json
+"SessionStart": [{ "hooks": [
+  { "type": "command", "command": "node \"D:\\code\\CCCG\\hooks\\cccg-session-hook.js\"", "timeout": 5 }
+]}],
+"FileChanged": [{ "matcher": "cccg_wake", "hooks": [
+  { "type": "command", "command": "node \"D:\\code\\CCCG\\hooks\\cccg-wake-hook.js\"", "asyncRewake": true, "timeout": 5 }
+]}]
+```
+
+`FileChanged` matchers are literal filenames (letters, digits, `_`, `|`),
+hence the extension-less `cccg_wake`. Sessions started before the hooks
+were registered are not watched; restart them.
+
+**Catch-up (pull).** The `UserPromptSubmit` state hook keeps a per-session
+cursor in `dispatch\watch\hook-<session>.json` and, on the session's next
+turn, lists every job that reached a terminal status since that cursor,
+plus any unread mailbox note addressed to `claude`. A session's first turn
+only sets the baseline. This still covers sessions without the wake hooks
+and anything the wake cap suppressed. If the user is actively waiting on a
+result, still use `cccg_dispatch_wait`.
 
 ## Per-dispatch model
 
