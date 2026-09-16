@@ -164,7 +164,7 @@ try {
         // 2.1.237: verified 2026-08-21 (upstream fix landed; shim era over).
         // 2.1.246: verified 2026-08-27 by SEO1: single-shot send to Doc1 confirmed in recipient transcript.
         // 2.1.260: verified 2026-09-06 by nuclei-c0: single-shot send to Doc1 confirmed in recipient transcript (marker CCD-RECV-20260906-0121).
-        const STOCK_OK = ['2.1.237', '2.1.246', '2.1.260'];
+        const STOCK_OK = ['2.1.237', '2.1.246', '2.1.260', '2.1.270', '2.1.271'];
         if (!STOCK_OK.includes(v)) {
           const hasManifest = fs.existsSync(path.join(dir, '.bridge-shim-manifest.json'));
           const hasSidecar = fs.readdirSync(dir).some(n => n.startsWith('claude.anthropic-'));
