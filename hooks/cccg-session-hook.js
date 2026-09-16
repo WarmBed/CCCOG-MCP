@@ -14,6 +14,30 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
+
+// Resolve the Claude engine's pid: the first claude.exe ancestor of this
+// hook process. The Host records ITS parent pid (always the engine, see
+// WakeNotifier), so recording the same number here gives exact wake
+// routing. Hooks may be spawned through a shell on Windows, so the direct
+// parent is not necessarily the engine; walk up to four levels with one
+// PowerShell call (~0.5s, once per session start). Falls back to the
+// direct parent pid when the walk fails.
+function resolveEnginePid() {
+  const fallback = process.ppid || null;
+  if (process.platform !== 'win32') return fallback;
+  try {
+    // No double quotes inside the script: PowerShell's command-line parsing of
+    // escaped quotes is unreliable, single quotes are not.
+    const script = '$p=' + process.ppid + "; foreach ($i in 1..5) { $x = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $p); if (-not $x) { break }; Write-Output ($x.ProcessId.ToString() + ' ' + $x.Name); $p = $x.ParentProcessId }";
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 4000, windowsHide: true });
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)\s+(.+)$/);
+      if (m && /^claude(\.exe)?$/i.test(m[2].trim())) return Number(m[1]);
+    }
+  } catch { /* fall back */ }
+  return fallback;
+}
 
 try {
   const raw = process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8');
@@ -28,12 +52,10 @@ try {
 
   fs.mkdirSync(watchRoot, { recursive: true });
   fs.mkdirSync(wakeDir, { recursive: true });
-  // Same shape WakeNotifier.Register writes (session-<id>.json). enginePid is
-  // this hook's parent pid: the engine spawns hooks directly, and the Host
-  // records its own parent pid, so the two match for exact wake routing.
+  // Same shape WakeNotifier.Register writes (session-<id>.json).
   fs.writeFileSync(
     path.join(watchRoot, `session-${sessionId}.json`),
-    JSON.stringify({ sessionId, cwd: payload.cwd || process.cwd(), registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), enginePid: process.ppid || null }, null, 2),
+    JSON.stringify({ sessionId, cwd: payload.cwd || process.cwd(), registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), enginePid: resolveEnginePid() }, null, 2),
     'utf8'
   );
   // The watcher needs the file to exist to notice later changes reliably.
