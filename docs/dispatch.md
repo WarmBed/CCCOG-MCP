@@ -133,9 +133,13 @@ So:
    sweep -- `WakeNotifier` writes that wake file for the target sessions,
    most precise first: the job's `callerSessionId` (only if the engine ever
    exposes one to MCP servers); else the registration whose `enginePid`
-   equals the job's `callerEnginePid` (the Host records its parent pid, the
-   SessionStart hook records its own parent pid -- both are the engine of
-   the same session); else the cwd fallback: registered sessions whose cwd
+   equals the job's `callerEnginePid` (the Host records its parent pid,
+   which is always the engine; the SessionStart hook walks up to the first
+   `claude.exe` ancestor, because hooks may run under a shell -- both
+   resolve to the engine of the same session; verified 2026-09-16: a job
+   dispatched into an unrelated cwd woke exactly the registered session
+   whose enginePid matched, and nothing else); else the cwd fallback:
+   registered sessions whose cwd
    is the job's cwd or a parent of it, seen within 24h of the job's
    creation, newest first, at most 5. Once per job. The fallback's first
    live run woke every session sharing a project on one job, which is why
