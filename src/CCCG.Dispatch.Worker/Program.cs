@@ -334,7 +334,8 @@ sealed class WorkerRuntime
             "maintain" => Serialize(Maintain()),
             "wakeRegister" => Serialize(RegisterWake(
                 Required(request.Arguments, "sessionId"),
-                String(request.Arguments, "cwd"))),
+                String(request.Arguments, "cwd"),
+                Integer(request.Arguments, "enginePid", 0))),
             "inboxPost" => Serialize(inbox.Post(
                 Required(request.Arguments, "fromRole"),
                 Required(request.Arguments, "toRole"),
@@ -377,9 +378,9 @@ sealed class WorkerRuntime
         };
     }
 
-    private object RegisterWake(string sessionId, string? cwd)
+    private object RegisterWake(string sessionId, string? cwd, int enginePid)
     {
-        wake.Register(sessionId, cwd);
+        wake.Register(sessionId, cwd, enginePid: enginePid > 0 ? enginePid : null);
         return new
         {
             sessionId,
@@ -400,7 +401,8 @@ sealed class WorkerRuntime
             String(arguments, "model"),
             String(arguments, "reasoningEffort"),
             String(arguments, "callerLabel"),
-            String(arguments, "callerSessionId"));
+            String(arguments, "callerSessionId"),
+            Integer(arguments, "callerEnginePid", 0) is var enginePid && enginePid > 0 ? enginePid : null);
         if (wait)
         {
             Runner.Run(job.JobId);

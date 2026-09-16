@@ -109,6 +109,17 @@ try {
     });
   }
 
+  // Liveness for wake routing: mark this session as recently active so the
+  // cwd fallback in WakeNotifier prefers it over long-idle registrations.
+  try {
+    const regPath = path.join(watchRoot, `session-${sessionId}.json`);
+    let reg = {};
+    try { reg = JSON.parse(fs.readFileSync(regPath, 'utf8')); } catch { /* not registered (older session) */ }
+    if (reg && reg.sessionId) {
+      reg.lastSeenAt = new Date().toISOString();
+      fs.writeFileSync(regPath, JSON.stringify(reg, null, 2), 'utf8');
+    }
+  } catch { /* best effort */ }
   // A human prompt resets the wake budget (see cccg-wake-hook.js).
   try { fs.unlinkSync(path.join(dispatchRoot, 'wake', sessionId, 'wakes')); } catch { /* none */ }
 

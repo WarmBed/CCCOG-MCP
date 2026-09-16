@@ -12,6 +12,17 @@ public sealed class WakeRegistration
     public string SessionId { get; set; } = "";
     public string? Cwd { get; set; }
     public DateTimeOffset RegisteredAt { get; set; }
+
+    /// <summary>
+    /// Pid of the Claude engine process that owns the session, as seen by
+    /// the SessionStart hook (its parent pid). The Host records its own
+    /// parent pid on every job it dispatches; when the two match, the wake
+    /// goes to exactly that session without any cwd guessing.
+    /// </summary>
+    public int? EnginePid { get; set; }
+
+    /// <summary>Touched by the state hook on every human prompt; drives the recency filter.</summary>
+    public DateTimeOffset? LastSeenAt { get; set; }
 }
 
 /// <summary>
@@ -66,7 +77,7 @@ public sealed class WakeNotifier
     public string RegistrationPath(string sessionId) =>
         Path.Combine(watchRoot, "session-" + SafeSegment(sessionId) + ".json");
 
-    public void Register(string sessionId, string? cwd, DateTimeOffset? now = null)
+    public void Register(string sessionId, string? cwd, DateTimeOffset? now = null, int? enginePid = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
         Directory.CreateDirectory(watchRoot);
@@ -74,7 +85,9 @@ public sealed class WakeNotifier
         {
             SessionId = sessionId,
             Cwd = cwd,
-            RegisteredAt = now ?? DateTimeOffset.UtcNow
+            RegisteredAt = now ?? DateTimeOffset.UtcNow,
+            LastSeenAt = now ?? DateTimeOffset.UtcNow,
+            EnginePid = enginePid
         };
         CrossProcessFileGate.AtomicWriteAllText(
             RegistrationPath(sessionId),
@@ -107,12 +120,46 @@ public sealed class WakeNotifier
         return result;
     }
 
-    /// <summary>Which registered sessions a terminal job should wake.</summary>
-    public IReadOnlyList<string> Targets(DispatchJob job, IReadOnlyList<WakeRegistration> registrations)
+    /// <summary>
+    /// How far back a session's last human prompt may be for the cwd
+    /// fallback to still consider it a live coordinator. The dispatching
+    /// session prompted at dispatch time by definition, so anything older
+    /// than the job plus this slack is not the dispatcher.
+    /// </summary>
+    public static readonly TimeSpan FallbackRecency = TimeSpan.FromHours(24);
+
+    /// <summary>Upper bound on sessions a single cwd-fallback wake fans out to.</summary>
+    public const int FallbackMaxTargets = 5;
+
+    /// <summary>
+    /// Which registered sessions a terminal job should wake, most precise
+    /// first: the job's callerSessionId; else the registration whose
+    /// enginePid equals the job's callerEnginePid; else the cwd fallback --
+    /// registered sessions whose cwd is the job's cwd or a parent of it,
+    /// seen within FallbackRecency of the job's creation, newest first,
+    /// capped at FallbackMaxTargets. The fallback exists for Hosts that
+    /// predate pid stamping; the first live run of this feature woke every
+    /// session sharing a project on one job, which is what the recency
+    /// filter and cap are for.
+    /// </summary>
+    public IReadOnlyList<string> Targets(DispatchJob job, IReadOnlyList<WakeRegistration> registrations, DateTimeOffset? now = null)
     {
         if (!string.IsNullOrWhiteSpace(job.CallerSessionId))
         {
             return new[] { job.CallerSessionId };
+        }
+
+        if (job.CallerEnginePid is int enginePid)
+        {
+            var byPid = registrations
+                .Where(registration => registration.EnginePid == enginePid)
+                .OrderByDescending(registration => registration.LastSeenAt ?? registration.RegisteredAt)
+                .Select(registration => registration.SessionId)
+                .FirstOrDefault();
+            if (byPid is not null)
+            {
+                return new[] { byPid };
+            }
         }
 
         var jobCwd = Normalize(job.Cwd);
@@ -121,12 +168,17 @@ public sealed class WakeNotifier
             return Array.Empty<string>();
         }
 
+        var reference = job.CreatedAt == default ? (now ?? DateTimeOffset.UtcNow) : job.CreatedAt;
+        var cutoff = reference - FallbackRecency;
         return registrations
             .Where(registration => Normalize(registration.Cwd) is string sessionCwd
                 && (jobCwd == sessionCwd
                     || jobCwd.StartsWith(sessionCwd + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)))
+            .Where(registration => (registration.LastSeenAt ?? registration.RegisteredAt) >= cutoff)
+            .OrderByDescending(registration => registration.LastSeenAt ?? registration.RegisteredAt)
             .Select(registration => registration.SessionId)
             .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(FallbackMaxTargets)
             .ToList();
     }
 

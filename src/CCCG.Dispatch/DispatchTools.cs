@@ -93,7 +93,8 @@ public sealed class DispatchTools
             model,
             reasoningEffort,
             callerLabel,
-            callerSessionId = CallerSessionId
+            callerSessionId = CallerSessionId,
+            callerEnginePid = CallerEnginePid
         });
 
     [McpServerTool(Name = "cccg_dispatch_wait"),
@@ -120,8 +121,42 @@ public sealed class DispatchTools
             model,
             reasoningEffort,
             callerLabel,
-            callerSessionId = CallerSessionId
+            callerSessionId = CallerSessionId,
+            callerEnginePid = CallerEnginePid
         });
+
+    /// <summary>
+    /// Pid of the process that launched this Host -- the Claude engine of
+    /// the session it serves (MCP stdio servers are children of the engine).
+    /// The SessionStart hook records the same pid from its side, which gives
+    /// WakeNotifier an exact session match without any session id in the
+    /// environment. Resolved once via WMI; null when the lookup fails.
+    /// </summary>
+    private static readonly int? CallerEnginePid = ResolveParentPid();
+
+    private static int? ResolveParentPid()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        try
+        {
+            using var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = " + Environment.ProcessId);
+            foreach (var row in searcher.Get())
+            {
+                var parent = Convert.ToInt32(row["ParentProcessId"], System.Globalization.CultureInfo.InvariantCulture);
+                return parent > 0 ? parent : null;
+            }
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// The Claude session this Host serves, when the engine exposes it to
@@ -187,7 +222,8 @@ public sealed class DispatchTools
             ["hostVersion"] = HostVersion,
             ["hostExecutable"] = Environment.ProcessPath,
             ["hostPid"] = Environment.ProcessId,
-            ["hostSessionId"] = CallerSessionId
+            ["hostSessionId"] = CallerSessionId,
+            ["hostEnginePid"] = CallerEnginePid
         };
         try
         {

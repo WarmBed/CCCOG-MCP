@@ -58,7 +58,7 @@ try {
   ];
   if (job.retryCount > 0) lines.push(`retried ×${job.retryCount}`);
   if (job.error) lines.push(`error: ${String(job.error).slice(0, 200)}`);
-  lines.push(`Collect it with cccg_job_collect("${job.jobId}"), then act or report. (wake ${wakes + 1}/${WAKE_CAP} since your last prompt)`);
+  lines.push(`If this session dispatched it: collect with cccg_job_collect("${job.jobId}"), then act or report. If you did not dispatch it, ignore this wake. (wake ${wakes + 1}/${WAKE_CAP} since your last prompt)`);
   process.stderr.write(lines.join('\n'));
   process.exit(2);
 } catch {

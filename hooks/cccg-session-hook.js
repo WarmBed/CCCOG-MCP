@@ -28,10 +28,12 @@ try {
 
   fs.mkdirSync(watchRoot, { recursive: true });
   fs.mkdirSync(wakeDir, { recursive: true });
-  // Same shape WakeNotifier.Register writes (session-<id>.json).
+  // Same shape WakeNotifier.Register writes (session-<id>.json). enginePid is
+  // this hook's parent pid: the engine spawns hooks directly, and the Host
+  // records its own parent pid, so the two match for exact wake routing.
   fs.writeFileSync(
     path.join(watchRoot, `session-${sessionId}.json`),
-    JSON.stringify({ sessionId, cwd: payload.cwd || process.cwd(), registeredAt: new Date().toISOString() }, null, 2),
+    JSON.stringify({ sessionId, cwd: payload.cwd || process.cwd(), registeredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), enginePid: process.ppid || null }, null, 2),
     'utf8'
   );
   // The watcher needs the file to exist to notice later changes reliably.

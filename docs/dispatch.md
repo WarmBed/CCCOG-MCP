@@ -130,10 +130,16 @@ So:
    `dispatch\watch\session-<id>.json` (id + cwd) and returns
    `watchPaths: [dispatch\wake\<id>\cccg_wake]`.
 2. When any job reaches a terminal status -- run, cancel, reconcile, orphan
-   sweep -- `WakeNotifier` writes that wake file for the target sessions:
-   the job's `callerSessionId` when the Host knew it, otherwise every
-   registered session whose cwd is the job's cwd or a parent of it. Once
-   per job.
+   sweep -- `WakeNotifier` writes that wake file for the target sessions,
+   most precise first: the job's `callerSessionId` (only if the engine ever
+   exposes one to MCP servers); else the registration whose `enginePid`
+   equals the job's `callerEnginePid` (the Host records its parent pid, the
+   SessionStart hook records its own parent pid -- both are the engine of
+   the same session); else the cwd fallback: registered sessions whose cwd
+   is the job's cwd or a parent of it, seen within 24h of the job's
+   creation, newest first, at most 5. Once per job. The fallback's first
+   live run woke every session sharing a project on one job, which is why
+   it is now bounded; the wake text also tells a non-dispatcher to ignore it.
 3. `hooks/cccg-wake-hook.js` (FileChanged, asyncRewake) reads the wake file,
    announces each job once, and exits 2 with a one-screen summary. It is
    capped at `CCCG_WAKE_CAP` (5) wakes between human prompts; the state

@@ -167,6 +167,16 @@ public sealed class DispatchJob
     /// </summary>
     [JsonPropertyName("callerSessionId")]
     public string? CallerSessionId { get; set; }
+
+    /// <summary>
+    /// Pid of the process that launched the dispatching Host (the Claude
+    /// engine), recorded by the Host. Matched against the enginePid the
+    /// SessionStart hook recorded for its session, so a job can wake
+    /// exactly the session that dispatched it even when the engine exposes
+    /// no session id to MCP servers.
+    /// </summary>
+    [JsonPropertyName("callerEnginePid")]
+    public int? CallerEnginePid { get; set; }
 }
 
 public sealed record LaunchCommand(

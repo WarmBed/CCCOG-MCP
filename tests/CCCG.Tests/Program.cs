@@ -192,6 +192,7 @@ var tests = new (string Name, Action Run)[]
     ("job cancel withdraws a queued job and its worker never launches the provider", JobCancelWithdrawsQueuedJob),
     ("reconcile sweep fails a queued job that never got a worker once past the grace window", ReconcileSweepFailsOrphanedQueuedJob),
     ("wake notifier routes a terminal job to its caller session or to cwd-matching sessions exactly once", WakeNotifierRoutesAndIsIdempotent),
+    ("wake notifier prefers the engine-pid match and bounds the cwd fallback by recency and count", WakeNotifierEnginePidAndFallbackBounds),
     ("job store fires the terminal callback only on terminal writes", JobStoreFiresTerminalCallbackOnlyWhenTerminal),
     ("job cancel refuses a job whose provider turn is already running", JobCancelRefusesRunningJob),
     ("job cancel refuses a job that already finished", JobCancelRefusesFinishedJob),
@@ -2155,6 +2156,60 @@ static void WakeNotifierRoutesAndIsIdempotent()
         // Idempotent per job, and non-terminal jobs never wake anyone.
         Equal(0, wake.Notify(cwdJob).Count);
         Equal(0, wake.Notify(new DispatchJob { JobId = "j-run", Status = DispatchJobStatus.Running, Cwd = project }).Count);
+    }
+    finally
+    {
+        TryDelete(root);
+    }
+}
+
+static void WakeNotifierEnginePidAndFallbackBounds()
+{
+    var root = Path.Combine(Path.GetTempPath(), $"cccg-wake-pid-{Guid.NewGuid():N}");
+    try
+    {
+        var wake = new WakeNotifier(root);
+        var project = Path.Combine(root, "proj");
+        var now = DateTimeOffset.UtcNow;
+
+        // Engine-pid match wins over cwd, even for a session in another cwd.
+        wake.Register("sess-pid", Path.Combine(root, "elsewhere"), now, enginePid: 4242);
+        wake.Register("sess-cwd", project, now);
+        var pidJob = new DispatchJob
+        {
+            JobId = "j-pid",
+            Provider = "codex",
+            Status = DispatchJobStatus.Succeeded,
+            Cwd = project,
+            CallerEnginePid = 4242,
+            CreatedAt = now
+        };
+        var byPid = wake.Targets(pidJob, wake.ListRegistrations(), now);
+        Equal(1, byPid.Count);
+        Equal("sess-pid", byPid[0]);
+
+        // No pid match: fallback ignores registrations idle for longer than
+        // FallbackRecency before the job was created, and caps fan-out.
+        for (var index = 0; index < 8; index++)
+        {
+            wake.Register($"sess-recent-{index}", project, now.AddMinutes(-index));
+        }
+
+        wake.Register("sess-stale", project, now - WakeNotifier.FallbackRecency - TimeSpan.FromHours(1));
+        var cwdJob = new DispatchJob
+        {
+            JobId = "j-cwd",
+            Provider = "codex",
+            Status = DispatchJobStatus.Succeeded,
+            Cwd = Path.Combine(project, ".claude", "worktrees", "wt"),
+            CreatedAt = now
+        };
+        var targets = wake.Targets(cwdJob, wake.ListRegistrations(), now);
+        Equal(WakeNotifier.FallbackMaxTargets, targets.Count);
+        True(!targets.Contains("sess-stale"));
+        True(!targets.Contains("sess-pid"));
+        Equal("sess-cwd", targets[0]); // newest lastSeen first
+        Equal("sess-recent-0", targets[1]);
     }
     finally
     {
